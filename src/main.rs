@@ -12,7 +12,7 @@ mod ts;
 use csv::Reader;
 use dims::KeyMap;
 use group::{Cell, Grouper};
-use ids::tok;
+use ids::tok_pair;
 use links::LinkTable;
 use parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
 use scatter::{by_partition, part_of_key, Arena, Scatter};
@@ -230,8 +230,7 @@ unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
         reader.scan::<2>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
             let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
             if la != 0 && lb != 0 {
-                let a = tok(buf.add(s[0] as usize), la);
-                let b = tok(buf.add(s[1] as usize), lb);
+                let (a, b) = tok_pair(buf.add(s[0] as usize), la, buf.add(s[1] as usize), lb);
                 if a != b {
                     pairs.push((a, b));
                 }
@@ -278,7 +277,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
         if len(0) == 0 {
             return;
         }
-        let event = tok(at(0), len(0));
+        let (event, user) = tok_pair(at(0), len(0), at(1), len(1));
         let mut out = PendingEvent { event, user: 0, user_hash: 0, ingest: i32::MAX, ts: 0, payload: 0, valid: false };
         'valid: {
             let ts_u32 = if REL {
@@ -329,7 +328,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
                 }
                 _ => break 'valid,
             }
-            out.user = tok(at(1), len(1));
+            out.user = user;
             out.user_hash = mix(out.user);
             sh.links.prefetch_hashed(out.user_hash);
             out.ts = ts_u32;
@@ -388,11 +387,11 @@ unsafe fn parse_clicks_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
             (t - sh.base_ms) as u32
         };
         let Some(campaign) = sh.campaign_id(at(2), len(2)) else { return };
-        let user = tok(at(1), len(1));
+        let (click, user) = tok_pair(at(0), len(0), at(1), len(1));
         let user_hash = mix(user);
         sh.links.prefetch_hashed(user_hash);
         *batch.get_unchecked_mut(pending) =
-            PendingClick { click: tok(at(0), len(0)), user, user_hash, ts: ts_u32, campaign };
+            PendingClick { click, user, user_hash, ts: ts_u32, campaign };
         pending += 1;
         if pending == BATCH {
             flush_clicks(sh, c, &batch);
