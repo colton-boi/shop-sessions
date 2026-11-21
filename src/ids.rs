@@ -1,4 +1,4 @@
-use std::arch::x86_64::_pext_u64;
+use std::arch::x86_64::{_bzhi_u64, _pext_u64};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -29,17 +29,20 @@ fn intern(bytes: &[u8]) -> u64 {
 }
 
 /// `p` must be readable for 9 bytes whatever `len` is. Returns 0 when the ID does not pack.
+/// Branch-free: ID lengths 7 to 9 are mixed at random, so any branch on `len` mispredicts.
 #[inline(always)]
 unsafe fn pack(p: *const u8, len: usize) -> u64 {
-    let head = len.min(8);
-    let keep = u64::MAX >> (64 - 8 * head);
+    let bits = (len.min(8) * 8) as u32;
+    let keep = _bzhi_u64(u64::MAX, bits);
     let x = (p as *const u64).read_unaligned() & keep;
     let ninth = if len == 9 { *p.add(8) as u64 } else { 0 };
-    let filled = x | !keep;
+    // Bytes past `len` read as 1 here, so the zero test sees only real bytes; a
+    // ninth byte that is absent reads as 1 too.
+    let filled = x | (!keep & 0x0101_0101_0101_0101);
+    let n9 = if len == 9 { ninth } else { 1 };
     let has_zero = filled.wrapping_sub(0x0101_0101_0101_0101) & !filled & 0x8080_8080_8080_8080;
-    let high = x & 0x8080_8080_8080_8080;
-    let ninth_bad = (ninth >> 7) | ((len == 9) & (ninth == 0)) as u64;
-    if (has_zero | high | ninth_bad) != 0 {
+    let bad = has_zero | (x & 0x8080_8080_8080_8080) | (n9.wrapping_sub(1) & 0x80) | (n9 & 0x80);
+    if bad != 0 {
         return 0;
     }
     (_pext_u64(x.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F) << 7) | ninth
