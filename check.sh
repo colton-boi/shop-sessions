@@ -3,7 +3,7 @@
 # (word, buffer and extent boundaries), then every cached seed and p20 at defaults.
 set -euo pipefail
 C="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$C/../.." && pwd)"
+ROOT="$(cd "$C/.." && pwd)"
 B="$C/target/release/sessions"
 cd "$ROOT"
 for cfg in "192 1000 1" "192 4097 8" "4096 4097 3" "131072 2097152 8"; do

@@ -125,7 +125,6 @@ fn order9_free() -> u32 {
 
 fn probe_host(data_dir: &std::path::Path) -> HostProfile {
     let en = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
-    let df = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/defrag").unwrap_or_default();
     let o9 = order9_free();
     let thp = if std::env::var_os("SS_NOHUGE").is_some() {
         ThpPolicy::NoHuge
