@@ -229,7 +229,7 @@ unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
     }
 }
 
-#[inline(always)]
+#[inline(never)]
 unsafe fn flush_events(sh: &Shared, d: &mut Scatter<DRec, 4>, p: &mut Scatter<PRec, 4>, batch: &[PendingEvent]) {
     for e in batch {
         let payload = if e.valid {
@@ -333,7 +333,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
     flush_events(sh, d, p, &batch[..pending]);
 }
 
-#[inline(always)]
+#[inline(never)]
 unsafe fn flush_clicks(sh: &Shared, c: &mut Scatter<CRec, 8>, batch: &[PendingClick]) {
     for k in batch {
         let person = sh.links.person_hashed(k.user, k.user_hash);
