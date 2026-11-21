@@ -118,6 +118,14 @@ impl<T: Copy, const UNIT: usize> Scatter<T, UNIT> {
     }
 }
 
+/// The partition of a record keyed by `key`. Any fixed function works; this
+/// one is a multiply, where `sys::mix` is five operations. Its top bits are
+/// independent of the low `mix` bits that the per-partition hash tables use.
+#[inline(always)]
+pub fn part_of_key(key: u64, parts: usize) -> usize {
+    (((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) * parts as u64) >> 32) as usize
+}
+
 /// Every thread's chunk log, regrouped by partition.
 pub fn by_partition(logs: &[&Vec<(u32, u32, u32)>], parts: usize) -> Vec<Vec<(u32, u32)>> {
     let mut out = vec![Vec::new(); parts];

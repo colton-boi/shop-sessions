@@ -41,9 +41,10 @@ impl LinkTable {
         &*self.slots.add(i)
     }
 
+    /// Prefetches the slot of a token whose `mix` is `h`.
     #[inline(always)]
-    pub fn prefetch(&self, token: u64) {
-        unsafe { _mm_prefetch(self.slots.add(mix(token) as usize & self.mask) as *const i8, _MM_HINT_T0) }
+    pub fn prefetch_hashed(&self, h: u64) {
+        unsafe { _mm_prefetch(self.slots.add(h as usize & self.mask) as *const i8, _MM_HINT_T0) }
     }
 
     unsafe fn insert(&self, token: u64) -> usize {
@@ -102,8 +103,8 @@ impl LinkTable {
         const AHEAD: usize = 8;
         for (k, &(a, b)) in pairs.iter().enumerate() {
             if let Some(&(na, nb)) = pairs.get(k + AHEAD) {
-                self.prefetch(na);
-                self.prefetch(nb);
+                self.prefetch_hashed(mix(na));
+                self.prefetch_hashed(mix(nb));
             }
             self.link(a, b);
         }
@@ -146,10 +147,11 @@ impl LinkTable {
         }
     }
 
-    /// The person an ID belongs to; an ID no link mentions is its own person.
+    /// The person an ID belongs to, given `h = mix(token)`; an ID no link
+    /// mentions is its own person.
     #[inline(always)]
-    pub unsafe fn person(&self, token: u64) -> u64 {
-        let mut i = mix(token) as usize & self.mask;
+    pub unsafe fn person_hashed(&self, token: u64, h: u64) -> u64 {
+        let mut i = h as usize & self.mask;
         loop {
             let s = self.slot(i);
             let k = s.key.load(Relaxed);

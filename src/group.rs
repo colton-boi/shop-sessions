@@ -469,7 +469,7 @@ impl Grouper {
 
 #[inline(always)]
 fn slot_of(person: u64, mask: usize) -> usize {
-    (person.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask
+    (person.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 40) as usize & mask
 }
 
 const DIGIT: u32 = 11;
