@@ -323,11 +323,11 @@ impl Grouper {
         self.purchases = purchases;
     }
 
-    pub fn into_cells(mut self) -> Vec<Cell> {
+    pub fn take_cells(&mut self) -> Vec<Cell> {
         for (c, &a) in self.cells.iter_mut().zip(&self.assisted) {
             c.assisted = a;
         }
-        self.cells
+        std::mem::take(&mut self.cells)
     }
 
     fn flush_day(&mut self, sh: &Shared, day: u32, sessions: u32, events: u32, revenue: u64) {
