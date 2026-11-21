@@ -1,6 +1,5 @@
 use crate::ids::{tok_bytes, tok_less};
 use crate::parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
-use crate::sys::mix;
 use crate::ts::DAY_MS;
 use crate::{CRec, PRec, Shared, DEAD};
 use std::path::PathBuf;
@@ -114,11 +113,19 @@ pub struct Cell {
     pub assisted: u32,
 }
 
+/// A click in the sort: `key` is local person << 32 | ts << 1, `at` its CRec index.
 #[derive(Clone, Copy)]
 struct Click {
-    id: u64,
-    ts: u32,
+    key: u64,
     campaign: u32,
+    at: u32,
+}
+
+impl Click {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        self.key as u32 >> 1
+    }
 }
 
 struct DayRow {
@@ -134,12 +141,14 @@ pub struct Grouper {
     people: Vec<u64>,
     ev_count: Vec<u32>,
     ck_count: Vec<u32>,
-    ev_person: Vec<u32>,
-    ev_value: Vec<u64>,
-    ev_sorted: Vec<u64>,
-    ck_person: Vec<u32>,
-    ck_value: Vec<Click>,
-    ck_sorted: Vec<Click>,
+    /// Event sort keys: local person << 32 | ts << 1 | is_purchase.
+    ev_a: Vec<u64>,
+    ev_b: Vec<u64>,
+    ck_a: Vec<Click>,
+    ck_b: Vec<Click>,
+    /// (sort key, payload) of every purchase, in sort-key order once sorted.
+    purchases: Vec<(u64, u32)>,
+    hist: Box<[[u32; RADIX]; 4]>,
     starts: Vec<u32>,
     day_rows: Vec<DayRow>,
     sess_row: Vec<u32>,
@@ -157,17 +166,17 @@ pub struct Grouper {
 impl Grouper {
     pub fn new(path: PathBuf, cells: usize) -> Self {
         Grouper {
-            keys: vec![0; 1024],
-            ids: vec![0; 1024],
+            keys: vec![0; 4096],
+            ids: vec![0; 4096],
             people: Vec::new(),
             ev_count: Vec::new(),
             ck_count: Vec::new(),
-            ev_person: Vec::new(),
-            ev_value: Vec::new(),
-            ev_sorted: Vec::new(),
-            ck_person: Vec::new(),
-            ck_value: Vec::new(),
-            ck_sorted: Vec::new(),
+            ev_a: Vec::new(),
+            ev_b: Vec::new(),
+            ck_a: Vec::new(),
+            ck_b: Vec::new(),
+            purchases: Vec::new(),
+            hist: Box::new([[0; RADIX]; 4]),
             starts: Vec::new(),
             day_rows: Vec::new(),
             sess_row: Vec::new(),
@@ -187,7 +196,7 @@ impl Grouper {
         self.keys = vec![0; cap];
         self.ids = vec![0; cap];
         for (id, &person) in self.people.iter().enumerate() {
-            let mut at = mix(person) as usize & (cap - 1);
+            let mut at = slot_of(person, cap - 1);
             while self.keys[at] != 0 {
                 at = (at + 1) & (cap - 1);
             }
@@ -199,7 +208,7 @@ impl Grouper {
     #[inline(always)]
     unsafe fn person_id(&mut self, person: u64, insert: bool) -> u32 {
         let mask = self.keys.len() - 1;
-        let mut at = mix(person) as usize & mask;
+        let mut at = slot_of(person, mask);
         loop {
             let k = *self.keys.get_unchecked(at);
             if k == person {
@@ -218,13 +227,14 @@ impl Grouper {
         self.ids[at] = id;
         self.people.push(person);
         self.ev_count.push(0);
-        if self.people.len() * 2 > self.keys.len() {
+        if self.people.len() * 4 > self.keys.len() {
             self.grow();
         }
         id
     }
 
-    /// Group one partition's live events and clicks by person, then emit each person.
+    /// Group one partition's live events and clicks by person, sort each
+    /// person's records by ts, then emit each person.
     pub unsafe fn partition(&mut self, sh: &Shared, events: &[(u32, u32)], clicks: &[(u32, u32)]) {
         if self.covered.len() < sh.campaigns.len() {
             self.covered.resize(sh.campaigns.len(), 0);
@@ -232,8 +242,13 @@ impl Grouper {
         self.keys.fill(0);
         self.people.clear();
         self.ev_count.clear();
-        self.ev_person.clear();
-        self.ev_value.clear();
+        self.purchases.clear();
+        for h in self.hist.iter_mut() {
+            h.fill(0);
+        }
+        let total: usize = events.iter().map(|c| c.1 as usize).sum();
+        self.ev_a.clear();
+        self.ev_a.reserve(total);
         for &(first, count) in events {
             let recs: &[PRec] = std::slice::from_raw_parts(sh.p_arena.base.add(first as usize), count as usize);
             for r in recs {
@@ -242,60 +257,69 @@ impl Grouper {
                 }
                 let id = self.person_id(r.person, true);
                 *self.ev_count.get_unchecked_mut(id as usize) += 1;
-                self.ev_person.push(id);
-                self.ev_value.push((r.ts as u64) << 32 | r.payload as u64);
+                let key = (id as u64) << 32 | (r.ts as u64) << 1 | (r.payload != 0) as u64;
+                let n = self.ev_a.len();
+                *self.ev_a.as_mut_ptr().add(n) = key;
+                self.ev_a.set_len(n + 1);
+                *self.hist[0].get_unchecked_mut(digit0(key)) += 1;
+                *self.hist[1].get_unchecked_mut(digit1(key)) += 1;
+                if r.payload != 0 {
+                    self.purchases.push((key, r.payload));
+                }
             }
         }
         let people = self.people.len();
         if people == 0 {
             return;
         }
+        let total: usize = clicks.iter().map(|c| c.1 as usize).sum();
+        self.ck_a.clear();
+        self.ck_a.reserve(total);
         self.ck_count.clear();
         self.ck_count.resize(people, 0);
-        self.ck_person.clear();
-        self.ck_value.clear();
         for &(first, count) in clicks {
             let recs: &[CRec] = std::slice::from_raw_parts(sh.c_arena.base.add(first as usize), count as usize);
-            for r in recs {
+            for (k, r) in recs.iter().enumerate() {
                 let id = self.person_id(r.person, false);
                 if id == u32::MAX {
                     continue;
                 }
                 *self.ck_count.get_unchecked_mut(id as usize) += 1;
-                self.ck_person.push(id);
-                self.ck_value.push(Click { id: r.click, ts: r.ts, campaign: r.campaign });
+                let key = (id as u64) << 32 | (r.ts as u64) << 1;
+                let n = self.ck_a.len();
+                *self.ck_a.as_mut_ptr().add(n) = Click { key, campaign: r.campaign, at: first + k as u32 };
+                self.ck_a.set_len(n + 1);
+                *self.hist[2].get_unchecked_mut(digit0(key)) += 1;
+                *self.hist[3].get_unchecked_mut(digit1(key)) += 1;
             }
         }
-        // Counts become end offsets, and the scatter below walks them down to start offsets.
-        let (mut ev_total, mut ck_total) = (0u32, 0u32);
+        let [h0, h1, h2, h3] = &mut *self.hist;
+        radix3(&mut self.ev_a, &mut self.ev_b, h0, h1, &mut self.ev_count, |&k| k);
+        radix3(&mut self.ck_a, &mut self.ck_b, h2, h3, &mut self.ck_count, |c| c.key);
+        self.purchases.sort_unstable_by_key(|p| p.0);
+        let events = std::mem::take(&mut self.ev_b);
+        let mut clicks = std::mem::take(&mut self.ck_b);
+        let purchases = std::mem::take(&mut self.purchases);
+        let (mut ev_from, mut ck_from, mut pu_from) = (0usize, 0usize, 0usize);
         for id in 0..people {
-            ev_total += self.ev_count[id];
-            self.ev_count[id] = ev_total;
-            ck_total += self.ck_count[id];
-            self.ck_count[id] = ck_total;
+            // After the scatter each count slot holds its person's end offset.
+            let (ev_end, ck_end) = (self.ev_count[id] as usize, self.ck_count[id] as usize);
+            let ev = &events[ev_from..ev_end];
+            let pu_end = pu_from + ev.iter().filter(|&&k| k & 1 != 0).count();
+            let ck = &mut clicks[ck_from..ck_end];
+            fix_order(ck, |c| c.key);
+            if !ordered(ev) {
+                let mut own = ev.to_vec();
+                fix_order(&mut own, |&k| k);
+                self.person(sh, self.people[id], &own, &purchases[pu_from..pu_end], ck);
+            } else {
+                self.person(sh, self.people[id], ev, &purchases[pu_from..pu_end], ck);
+            }
+            (ev_from, ck_from, pu_from) = (ev_end, ck_end, pu_end);
         }
-        self.ev_sorted.resize(ev_total as usize, 0);
-        for i in 0..ev_total as usize {
-            let slot = self.ev_count.get_unchecked_mut(*self.ev_person.get_unchecked(i) as usize);
-            *slot -= 1;
-            *self.ev_sorted.get_unchecked_mut(*slot as usize) = *self.ev_value.get_unchecked(i);
-        }
-        self.ck_sorted.resize(ck_total as usize, Click { id: 0, ts: 0, campaign: 0 });
-        for i in 0..ck_total as usize {
-            let slot = self.ck_count.get_unchecked_mut(*self.ck_person.get_unchecked(i) as usize);
-            *slot -= 1;
-            *self.ck_sorted.get_unchecked_mut(*slot as usize) = *self.ck_value.get_unchecked(i);
-        }
-        let mut events = std::mem::take(&mut self.ev_sorted);
-        let mut clicks = std::mem::take(&mut self.ck_sorted);
-        for id in 0..people {
-            let ev_end = if id + 1 < people { self.ev_count[id + 1] } else { ev_total } as usize;
-            let ck_end = if id + 1 < people { self.ck_count[id + 1] } else { ck_total } as usize;
-            let (ev_from, ck_from) = (self.ev_count[id] as usize, self.ck_count[id] as usize);
-            self.person(sh, self.people[id], &mut events[ev_from..ev_end], &mut clicks[ck_from..ck_end]);
-        }
-        self.ev_sorted = events;
-        self.ck_sorted = clicks;
+        self.ev_b = events;
+        self.ck_b = clicks;
+        self.purchases = purchases;
     }
 
     pub fn into_cells(mut self) -> Vec<Cell> {
@@ -323,13 +347,10 @@ impl Grouper {
         self.cats.clear();
     }
 
-    unsafe fn person(&mut self, sh: &Shared, person: u64, events: &mut [u64], clicks: &mut [Click]) {
-        events.sort_unstable();
+    unsafe fn person(&mut self, sh: &Shared, person: u64, events: &[u64], purchases: &[(u64, u32)], clicks: &[Click]) {
         tok_bytes_fast(person, &mut self.name);
         let nck = clicks.len();
-        if nck > 0 {
-            clicks.sort_unstable_by_key(|c| c.ts);
-        }
+        let mut next_purchase = 0;
         self.starts.clear();
         self.sess_row.clear();
         self.day_rows.clear();
@@ -341,7 +362,7 @@ impl Grouper {
         let (mut day_sessions, mut day_events, mut day_revenue, mut day_first) = (0u32, 0u32, 0u64, 0u32);
         let mut session_index = 0u32;
         while i < n {
-            let start = (*events.get_unchecked(i) >> 32) as u32;
+            let start = *events.get_unchecked(i) as u32 >> 1;
             let start_day = ((sh.base_ms + start as i64).div_euclid(DAY_MS) - sh.first_day) as u32;
             if start_day != day {
                 if day != u32::MAX {
@@ -354,26 +375,27 @@ impl Grouper {
                 day_revenue = 0;
                 day_first = session_index;
             }
-            while next_click < nck && clicks.get_unchecked(next_click).ts <= start {
+            while next_click < nck && clicks.get_unchecked(next_click).ts() <= start {
                 next_click += 1;
             }
-            let campaign = if next_click > 0 && start - clicks.get_unchecked(next_click - 1).ts <= WEEK {
-                credit(&clicks[..next_click])
+            let campaign = if next_click > 0 && start - clicks.get_unchecked(next_click - 1).ts() <= WEEK {
+                credit(sh, &clicks[..next_click])
             } else {
                 organic
             };
             let (mut prev, mut count, mut revenue) = (start, 0u32, 0u64);
             while i < n {
                 let e = *events.get_unchecked(i);
-                let t = (e >> 32) as u32;
+                let t = e as u32 >> 1;
                 if t - prev > SESSION_GAP {
                     break;
                 }
                 prev = t;
                 count += 1;
                 i += 1;
-                let payload = e as u32;
-                if payload != 0 {
+                if e & 1 != 0 {
+                    let payload = purchases.get_unchecked(next_purchase).1;
+                    next_purchase += 1;
                     let (cat, price) = ((payload >> 24) as u8, (payload & 0xFF_FFFF) as u64);
                     revenue += price;
                     if self.cat_sum[cat as usize] == 0 {
@@ -413,10 +435,11 @@ impl Grouper {
         let ns = starts.len();
         let (mut lo, mut hi) = (0usize, 0usize);
         for c in clicks {
-            while lo < ns && starts[lo] < c.ts {
+            let ts = c.ts();
+            while lo < ns && starts[lo] < ts {
                 lo += 1;
             }
-            let reach = c.ts as u64 + WEEK as u64;
+            let reach = ts as u64 + WEEK as u64;
             while hi < ns && starts[hi] as u64 <= reach {
                 hi += 1;
             }
@@ -441,16 +464,107 @@ impl Grouper {
     }
 }
 
+#[inline(always)]
+fn slot_of(person: u64, mask: usize) -> usize {
+    (person.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask
+}
+
+const RADIX: usize = 2048;
+/// Sort keys hold ts << 1 in bits 1..32. The two ts digits skip its low
+/// TS_SKIP bits; `fix_order` repairs the rare inversions that leaves.
+const TS_SKIP: u32 = 9;
+
+#[inline(always)]
+fn digit0(key: u64) -> usize {
+    (key >> (1 + TS_SKIP)) as usize & (RADIX - 1)
+}
+
+#[inline(always)]
+fn digit1(key: u64) -> usize {
+    (key >> (1 + TS_SKIP + 11)) as usize & (RADIX - 1)
+}
+
+/// Stable LSD passes from `a` into `b`: two ts digits, then the local person
+/// (key >> 32) by its counts. `h0`/`h1` are digit histograms; on return
+/// `counts[p]` is person p's end offset in `b`.
+unsafe fn radix3<T: Copy>(a: &mut Vec<T>, b: &mut Vec<T>, h0: &mut [u32; RADIX], h1: &mut [u32; RADIX], counts: &mut [u32], key: impl Fn(&T) -> u64) {
+    let n = a.len();
+    b.clear();
+    b.reserve(n);
+    b.set_len(n);
+    for h in [&mut *h0, &mut *h1] {
+        let mut sum = 0;
+        for c in h.iter_mut() {
+            (*c, sum) = (sum, sum + *c);
+        }
+    }
+    let mut sum = 0;
+    for c in counts.iter_mut() {
+        (*c, sum) = (sum, sum + *c);
+    }
+    let (pa, pb) = (a.as_mut_ptr(), b.as_mut_ptr());
+    for i in 0..n {
+        let x = *pa.add(i);
+        let slot = h0.get_unchecked_mut(digit0(key(&x)));
+        *pb.add(*slot as usize) = x;
+        *slot += 1;
+    }
+    for i in 0..n {
+        let x = *pb.add(i);
+        let slot = h1.get_unchecked_mut(digit1(key(&x)));
+        *pa.add(*slot as usize) = x;
+        *slot += 1;
+    }
+    for i in 0..n {
+        let x = *pa.add(i);
+        let slot = counts.get_unchecked_mut((key(&x) >> 32) as usize);
+        *pb.add(*slot as usize) = x;
+        *slot += 1;
+    }
+}
+
+#[inline(always)]
+fn ordered(v: &[u64]) -> bool {
+    v.windows(2).all(|w| w[0] >> 1 <= w[1] >> 1)
+}
+
+/// Sorts by ts a slice already sorted by its radix digits: only runs that share
+/// those digits can be out of order, so each such run is sorted on its own.
+fn fix_order<T: Copy>(v: &mut [T], key: impl Fn(&T) -> u64) {
+    let ts = |x: &T| key(x) as u32 >> 1;
+    let bucket = |x: &T| key(x) as u32 >> (1 + TS_SKIP);
+    let n = v.len();
+    let mut i = 1;
+    while i < n {
+        if ts(&v[i]) >= ts(&v[i - 1]) {
+            i += 1;
+            continue;
+        }
+        let b = bucket(&v[i]);
+        let mut from = i - 1;
+        while from > 0 && bucket(&v[from - 1]) == b {
+            from -= 1;
+        }
+        let mut to = i + 1;
+        while to < n && bucket(&v[to]) == b {
+            to += 1;
+        }
+        v[from..to].sort_unstable_by_key(|x| ts(x));
+        i = to;
+    }
+}
+
 /// The campaign of the latest click; on a tie in ts, the smallest click_id.
 #[inline(always)]
-fn credit(clicks: &[Click]) -> usize {
+unsafe fn credit(sh: &Shared, clicks: &[Click]) -> usize {
     let last = clicks.len() - 1;
-    let ts = clicks[last].ts;
+    let ts = clicks[last].ts();
     let mut best = last;
     let mut k = last;
-    while k > 0 && clicks[k - 1].ts == ts {
+    let id = |c: &Click| (*sh.c_arena.base.add(c.at as usize)).click;
+    while k > 0 && clicks[k - 1].ts() == ts {
         k -= 1;
-        if tok_less(clicks[k].id, clicks[best].id) {
+        if tok_less(id(&clicks[k]), id(&clicks[best])) {
             best = k;
         }
     }
