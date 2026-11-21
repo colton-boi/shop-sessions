@@ -298,24 +298,19 @@ impl Grouper {
         radix3(&mut self.ev_a, &mut self.ev_b, h0, h1, &mut self.ev_count, |&k| k);
         radix3(&mut self.ck_a, &mut self.ck_b, h2, h3, &mut self.ck_count, |c| c.key);
         self.purchases.sort_unstable_by_key(|p| p.0);
-        let events = std::mem::take(&mut self.ev_b);
+        let mut events = std::mem::take(&mut self.ev_b);
         let mut clicks = std::mem::take(&mut self.ck_b);
         let purchases = std::mem::take(&mut self.purchases);
         let (mut ev_from, mut ck_from, mut pu_from) = (0usize, 0usize, 0usize);
         for id in 0..people {
             // After the scatter each count slot holds its person's end offset.
             let (ev_end, ck_end) = (self.ev_count[id] as usize, self.ck_count[id] as usize);
-            let ev = &events[ev_from..ev_end];
+            let ev = &mut events[ev_from..ev_end];
             let pu_end = pu_from + ev.iter().filter(|&&k| k & 1 != 0).count();
             let ck = &mut clicks[ck_from..ck_end];
             fix_order(ck, |c| c.key);
-            if !ordered(ev) {
-                let mut own = ev.to_vec();
-                fix_order(&mut own, |&k| k);
-                self.person(sh, self.people[id], &own, &purchases[pu_from..pu_end], ck);
-            } else {
-                self.person(sh, self.people[id], ev, &purchases[pu_from..pu_end], ck);
-            }
+            fix_order(ev, |&k| k);
+            self.person(sh, self.people[id], ev, &purchases[pu_from..pu_end], ck);
             (ev_from, ck_from, pu_from) = (ev_end, ck_end, pu_end);
         }
         self.ev_b = events;
@@ -525,11 +520,6 @@ unsafe fn radix3<T: Copy>(a: &mut Vec<T>, b: &mut Vec<T>, h0: &mut [u32; RADIX],
         *pb.add(*slot as usize) = x;
         *slot += 1;
     }
-}
-
-#[inline(always)]
-fn ordered(v: &[u64]) -> bool {
-    v.windows(2).all(|w| w[0] >> 1 <= w[1] >> 1)
 }
 
 /// Sorts by ts a slice already sorted by its radix digits: only runs that share
