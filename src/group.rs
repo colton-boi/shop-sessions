@@ -3,6 +3,7 @@ use crate::parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
 use crate::ts::DAY_MS;
 use crate::sys::mix;
 use crate::{CRec, DRec, PRec, Shared, DEAD, NONE};
+use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::path::PathBuf;
 
 const SESSION_GAP: u32 = 1_800_000;
@@ -609,16 +610,19 @@ impl Dedup {
             }
         }
         self.candidates.clear();
-        let mut k = 0;
+        self.candidates.reserve(total);
+        let cands = self.candidates.as_mut_ptr();
+        let (mut k, mut nc) = (0usize, 0usize);
         for &(first, count) in chunks {
             for at in first..first + count {
                 let b = *buckets.add(k) as usize;
                 k += 1;
-                if *twice.add(b / 64) & (1u64 << (b % 64)) != 0 {
-                    self.candidates.push(at);
-                }
+                // ~14% of records are candidates at random: a branch here mispredicts.
+                *cands.add(nc) = at;
+                nc += (*twice.add(b / 64) >> (b % 64)) as usize & 1;
             }
         }
+        self.candidates.set_len(nc);
         let cap = (self.candidates.len() * 2).next_power_of_two().max(16);
         self.table.clear();
         self.table.resize(cap, 0);
@@ -629,7 +633,13 @@ impl Dedup {
                 (*sh.p_arena.base.add(r.payload as usize)).person = DEAD;
             }
         };
-        for &at in &self.candidates {
+        const AHEAD: usize = 16;
+        let cands = &self.candidates;
+        for i in 0..nc {
+            if i + AHEAD < nc {
+                _mm_prefetch(base.add(*cands.get_unchecked(i + AHEAD) as usize) as *const i8, _MM_HINT_T0);
+            }
+            let at = *cands.get_unchecked(i);
             let r = &*base.add(at as usize);
             let h = mix(r.event).rotate_left(32);
             let tag = ((h >> 20) as u32 | 1) as u64;
