@@ -3,17 +3,21 @@ use std::os::raw::{c_int, c_void};
 
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+    fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
     fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+    #[cfg(target_env = "gnu")]
     fn mallopt(param: c_int, value: c_int) -> c_int;
     fn syscall(number: i64, ...) -> i64;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-    fn getrusage(who: c_int, usage: *mut [i64; 18]) -> c_int;
+    fn getrusage(who: c_int, usage: *mut [i64; 36]) -> c_int;
+    fn sched_getaffinity(pid: c_int, size: usize, mask: *mut u8) -> c_int;
+    fn sched_setaffinity(pid: c_int, size: usize, mask: *const u8) -> c_int;
 }
 
 /// Process user seconds, system seconds and minor faults.
 pub fn rusage() -> (f64, f64, u64) {
-    let mut r = [0i64; 18];
+    let mut r = [0i64; 36];
     unsafe { getrusage(0, &mut r) };
     (r[0] as f64 + r[1] as f64 * 1e-6, r[2] as f64 + r[3] as f64 * 1e-6, r[8] as u64)
 }
@@ -381,10 +385,109 @@ pub fn map_zeroed(bytes: usize) -> *mut u8 {
     p as *mut u8
 }
 
+/// Zero-filled 2 MiB-aligned anonymous hugepage arena (`MADV_HUGEPAGE` when supported).
+#[allow(dead_code)]
+pub fn map_zeroed_huge(bytes: usize) -> *mut u8 {
+    let len = (bytes.max(1) + HUGE - 1) & !(HUGE - 1);
+    // PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE
+    let p = unsafe { mmap(std::ptr::null_mut(), len, 3, 0x02 | 0x20 | 0x4000, -1, 0) };
+    if p as isize == -1 {
+        panic!("mmap of {len} bytes failed");
+    }
+    let aligned = if (p as usize) & (HUGE - 1) == 0 {
+        p as *mut u8
+    } else {
+        unsafe { munmap(p, len) };
+        let raw = unsafe { mmap(std::ptr::null_mut(), len + HUGE, 3, 0x02 | 0x20 | 0x4000, -1, 0) };
+        assert!(raw as isize != -1, "mmap of {} bytes failed", len + HUGE);
+        ((raw as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8
+    };
+    match host_profile().thp {
+        ThpPolicy::AdviseHuge => unsafe { madvise(aligned as *mut c_void, len, 14) },
+        ThpPolicy::NoHuge => unsafe { madvise(aligned as *mut c_void, len, 15) },
+        ThpPolicy::DefaultHuge => 0,
+    };
+    aligned
+}
+
+fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                for c in lo..=hi.min(1023) {
+                    out.push(c);
+                }
+            }
+        } else if let Ok(c) = part.parse::<usize>() {
+            if c < 1024 {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Allowed CPUs ordered so SMT siblings on the same physical core are paired consecutively:
+/// `(core0_t0, core0_t1, core1_t0, core1_t1, ...)`.
+pub fn cpu_order() -> Vec<usize> {
+    let mut mask = [0u8; 128];
+    let mut allowed = Vec::new();
+    if unsafe { sched_getaffinity(0, mask.len(), mask.as_mut_ptr()) } == 0 {
+        for cpu in 0..1024 {
+            if (mask[cpu / 8] >> (cpu % 8)) & 1 != 0 {
+                allowed.push(cpu);
+            }
+        }
+    }
+    if allowed.is_empty() {
+        let n = std::thread::available_parallelism().map_or(8, |n| n.get()).min(1024);
+        return (0..n).collect();
+    }
+    let mut in_mask = [false; 1024];
+    for &c in &allowed {
+        in_mask[c] = true;
+    }
+    let mut placed = [false; 1024];
+    let mut ordered = Vec::with_capacity(allowed.len());
+    for &cpu in &allowed {
+        if placed[cpu] {
+            continue;
+        }
+        placed[cpu] = true;
+        ordered.push(cpu);
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            let mut sibs = parse_cpu_list(&raw);
+            sibs.sort_unstable();
+            sibs.dedup();
+            for s in sibs {
+                if s < 1024 && in_mask[s] && !placed[s] {
+                    placed[s] = true;
+                    ordered.push(s);
+                }
+            }
+        }
+    }
+    ordered
+}
+
+fn pin_to_cpu(cpu: usize) {
+    if cpu < 1024 {
+        let mut mask = [0u8; 128];
+        mask[cpu / 8] |= 1u8 << (cpu % 8);
+        unsafe { sched_setaffinity(0, mask.len(), mask.as_ptr()) };
+    }
+}
+
 /// Persistent workers for `par`: spawning threads for every stage costs 0.1 to 0.2 ms each time plus wake-up
-/// latency, so the workers start once, spin briefly between stages and then sleep on a futex.
+/// latency, so the workers start once in a binary tree, spin briefly between stages and then sleep on a futex.
 mod pool {
-    use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering::*};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering::*};
     use std::sync::OnceLock;
 
     type Job<'a> = &'a (dyn Fn(usize) + Sync);
@@ -399,9 +502,15 @@ mod pool {
         /// Threads inside `futex_wait` or about to enter it; a wake is a syscall, skipped when none.
         sleepers: AtomicU32,
         spin: u32,
+        pin_caller: AtomicBool,
     }
 
     static POOL: OnceLock<Pool> = OnceLock::new();
+    static CPU_ORDER: OnceLock<Vec<usize>> = OnceLock::new();
+
+    pub fn cached_cpu_order() -> &'static [usize] {
+        CPU_ORDER.get_or_init(super::cpu_order)
+    }
 
     fn futex_wait(word: &AtomicU32, value: u32) {
         unsafe { super::syscall(202, word as *const AtomicU32, 128, value, std::ptr::null::<u8>()) };
@@ -441,9 +550,45 @@ mod pool {
         if intel { 2048 } else { 1 << 14 }
     }
 
-    /// Starts `workers` threads, once; later calls keep the first pool.
+    fn spawn_worker(t: usize, total: usize, pin: bool) {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let c1 = 2 * t + 1;
+                if c1 < total {
+                    spawn_worker(c1, total, pin);
+                }
+                let c2 = 2 * t + 2;
+                if c2 < total {
+                    spawn_worker(c2, total, pin);
+                }
+                if pin {
+                    if let Some(&cpu) = cached_cpu_order().get(t) {
+                        super::pin_to_cpu(cpu);
+                    }
+                }
+                let pool = POOL.wait();
+                let mut seen = 0;
+                loop {
+                    wait_change(pool, &pool.epoch, seen);
+                    seen = pool.epoch.load(Acquire);
+                    if (t as u32) < seen & 1023 {
+                        let job = unsafe { *pool.job.load(Acquire) };
+                        job(t);
+                        if pool.pending.fetch_sub(1, SeqCst) == 1 {
+                            futex_wake(pool, &pool.pending);
+                        }
+                    }
+                }
+            })
+            .unwrap();
+    }
+
+    /// Starts `workers` threads in a binary tree, once; later calls keep the first pool.
     pub fn start(workers: usize) -> &'static Pool {
         POOL.get_or_init(|| {
+            let pin = std::env::var_os("SS_NOPIN").is_none();
+            let has_cpus = pin && !cached_cpu_order().is_empty();
             let pool = Pool {
                 workers,
                 job: AtomicPtr::new(std::ptr::null_mut()),
@@ -451,26 +596,14 @@ mod pool {
                 pending: AtomicU32::new(0),
                 sleepers: AtomicU32::new(0),
                 spin: spin_count(),
+                pin_caller: AtomicBool::new(has_cpus),
             };
-            for t in 1..=workers {
-                std::thread::Builder::new()
-                    .stack_size(2 << 20)
-                    .spawn(move || {
-                        let pool = POOL.wait();
-                        let mut seen = 0;
-                        loop {
-                            wait_change(pool, &pool.epoch, seen);
-                            seen = pool.epoch.load(Acquire);
-                            if (t as u32) < seen & 1023 {
-                                let job = unsafe { *pool.job.load(Acquire) };
-                                job(t);
-                                if pool.pending.fetch_sub(1, SeqCst) == 1 {
-                                    futex_wake(pool, &pool.pending);
-                                }
-                            }
-                        }
-                    })
-                    .unwrap();
+            let total = workers + 1;
+            if 1 < total {
+                spawn_worker(1, total, pin);
+            }
+            if 2 < total {
+                spawn_worker(2, total, pin);
             }
             pool
         })
@@ -481,6 +614,11 @@ mod pool {
         let Some(pool) = POOL.get() else { return false };
         if n - 1 > pool.workers || n > 1023 {
             return false;
+        }
+        if pool.pin_caller.swap(false, Relaxed) {
+            if let Some(&cpu) = cached_cpu_order().first() {
+                super::pin_to_cpu(cpu);
+            }
         }
         let job: *const Job = &f;
         pool.job.store(job as *mut Job<'static>, Release);
@@ -515,13 +653,95 @@ pub fn par<F: Fn(usize) + Sync>(n: usize, f: F) {
     if pool::run(n, &f) {
         return;
     }
+    let pin = std::env::var_os("SS_NOPIN").is_none();
+    let cpus = pin.then(|| pool::cached_cpu_order());
     std::thread::scope(|s| {
         for t in 1..n {
             let f = &f;
-            std::thread::Builder::new().stack_size(1 << 20).spawn_scoped(s, move || f(t)).unwrap();
+            let cpu = cpus.and_then(|c| c.get(t).copied());
+            std::thread::Builder::new()
+                .stack_size(1 << 20)
+                .spawn_scoped(s, move || {
+                    if let Some(c) = cpu {
+                        pin_to_cpu(c);
+                    }
+                    f(t);
+                })
+                .unwrap();
         }
         f(0);
     });
+}
+
+struct SyncCell<T>(UnsafeCell<T>);
+unsafe impl<T: Send> Sync for SyncCell<T> {}
+impl<T> SyncCell<T> {
+    #[inline(always)]
+    fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+/// Runs two heterogeneous setup closures in parallel on the thread pool (must not nest `par`).
+#[allow(dead_code)]
+pub fn join2<A, B, RA, RB>(threads: usize, a: A, b: B) -> (RA, RB)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Send,
+    RB: Send,
+{
+    if threads <= 1 {
+        return (a(), b());
+    }
+    let fa = SyncCell(UnsafeCell::new(Some(a)));
+    let fb = SyncCell(UnsafeCell::new(Some(b)));
+    let ra: SyncCell<Option<RA>> = SyncCell(UnsafeCell::new(None));
+    let rb: SyncCell<Option<RB>> = SyncCell(UnsafeCell::new(None));
+    par(2, |t| unsafe {
+        if t == 0 {
+            *ra.get() = Some(((*fa.get()).take().unwrap())());
+        } else {
+            *rb.get() = Some(((*fb.get()).take().unwrap())());
+        }
+    });
+    (ra.0.into_inner().unwrap(), rb.0.into_inner().unwrap())
+}
+
+/// Runs three heterogeneous setup closures in parallel on the thread pool (must not nest `par`).
+#[allow(dead_code)]
+pub fn join3<A, B, C, RA, RB, RC>(threads: usize, a: A, b: B, c: C) -> (RA, RB, RC)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    C: FnOnce() -> RC + Send,
+    RA: Send,
+    RB: Send,
+    RC: Send,
+{
+    if threads <= 1 {
+        return (a(), b(), c());
+    }
+    let fa = SyncCell(UnsafeCell::new(Some(a)));
+    let fb = SyncCell(UnsafeCell::new(Some(b)));
+    let fc = SyncCell(UnsafeCell::new(Some(c)));
+    let ra: SyncCell<Option<RA>> = SyncCell(UnsafeCell::new(None));
+    let rb: SyncCell<Option<RB>> = SyncCell(UnsafeCell::new(None));
+    let rc: SyncCell<Option<RC>> = SyncCell(UnsafeCell::new(None));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    par(threads.min(3), |_| loop {
+        match next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+            0 => unsafe { *ra.get() = Some(((*fa.get()).take().unwrap())()) },
+            1 => unsafe { *rb.get() = Some(((*fb.get()).take().unwrap())()) },
+            2 => unsafe { *rc.get() = Some(((*fc.get()).take().unwrap())()) },
+            _ => break,
+        }
+    });
+    (
+        ra.0.into_inner().unwrap(),
+        rb.0.into_inner().unwrap(),
+        rc.0.into_inner().unwrap(),
+    )
 }
 
 /// One slot per worker thread; each worker only ever touches its own slot.
@@ -547,13 +767,16 @@ pub fn mix(x: u64) -> u64 {
 /// Large buffers come from the heap and stay there when freed, instead of a fresh mmap (faults,
 /// zeroing) and a munmap (TLB shootdown) each time a growing Vec moves.
 pub fn tune_malloc() {
-    if std::env::var_os("SS_MALLOC_DEFAULT").is_some() {
-        return;
-    }
-    unsafe {
-        mallopt(-3, 32 << 20); // M_MMAP_THRESHOLD, at its maximum
-        mallopt(-1, -1); // M_TRIM_THRESHOLD: never trim
-        mallopt(-2, 16 << 20); // M_TOP_PAD
+    #[cfg(target_env = "gnu")]
+    {
+        if std::env::var_os("SS_MALLOC_DEFAULT").is_some() {
+            return;
+        }
+        unsafe {
+            mallopt(-3, 32 << 20); // M_MMAP_THRESHOLD, at its maximum
+            mallopt(-1, -1); // M_TRIM_THRESHOLD: never trim
+            mallopt(-2, 16 << 20); // M_TOP_PAD
+        }
     }
 }
 
@@ -642,5 +865,80 @@ pub mod prof {
             out.push_str(&format!("{:x}\n", s.load(Relaxed)));
         }
         std::fs::write(path, out).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_cpu_list_and_cpu_order() {
+        assert_eq!(parse_cpu_list("0-1"), vec![0, 1]);
+        assert_eq!(parse_cpu_list("0,8"), vec![0, 8]);
+        assert_eq!(parse_cpu_list("0-1, 8-9, 12"), vec![0, 1, 8, 9, 12]);
+
+        let order = cpu_order();
+        assert!(!order.is_empty());
+        let mut uniq = order.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), order.len(), "cpu_order must not repeat CPUs");
+
+        // Verify consecutive SMT sibling pairing when siblings are both in the affinity mask.
+        if let Ok(raw) = std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
+            order[0]
+        )) {
+            let sibs: Vec<usize> = parse_cpu_list(&raw)
+                .into_iter()
+                .filter(|c| order.contains(c))
+                .collect();
+            if sibs.len() >= 2 {
+                assert!(sibs.contains(&order[1]), "expected sibling paired at index 1: {order:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_map_zeroed_huge_and_contiguous_padding() {
+        let p = map_zeroed_huge(4096);
+        assert_eq!((p as usize) & (HUGE - 1), 0, "map_zeroed_huge must be 2 MiB aligned");
+        unsafe {
+            assert_eq!(*p, 0);
+            *p = 0xAB;
+            assert_eq!(*p, 0xAB);
+        }
+        release(p, HUGE);
+
+        let dir = std::env::temp_dir().join(format!("ss_sys_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p1 = dir.join("exact_page.csv");
+        let p2 = dir.join("empty.csv");
+        let p3 = dir.join("tail.csv");
+        let exact = vec![b'x'; PAGE];
+        std::fs::write(&p1, &exact).unwrap();
+        std::fs::write(&p2, b"").unwrap();
+        std::fs::write(&p3, b"a,b\n1,2").unwrap();
+
+        let region = map_files_contiguous(&[p1.clone(), p2.clone(), p3.clone()]);
+        assert_eq!(region.files.len(), 3);
+        for f in &region.files {
+            assert_eq!((f.ptr as usize) & (HUGE - 1), 0);
+            // At least 64 bytes of readable zero padding after every file for SIMD over-reads.
+            let pad = unsafe { std::slice::from_raw_parts(f.ptr.add(f.size), 64) };
+            assert!(pad.iter().all(|&b| b == 0));
+        }
+        release(region.reserve_base, region.reserve_len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_join_helpers() {
+        assert_eq!(join2(1, || 10, || "ok"), (10, "ok"));
+        assert_eq!(join2(2, || 21, || 21 * 2), (21, 42));
+        assert_eq!(join3(1, || 1, || 2, || 3), (1, 2, 3));
+        assert_eq!(join3(2, || 10, || 20, || 30), (10, 20, 30));
+        assert_eq!(join3(4, || "a", || "b", || "c"), ("a", "b", "c"));
     }
 }

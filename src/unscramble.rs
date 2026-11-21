@@ -113,10 +113,34 @@ pub fn unscramble40_x8_scalar(y: [u64; 8], key: u64) -> [u64; 8] {
     ]
 }
 
-/// 8-way parallel `unscramble40` using the 2-phase ILP scalar implementation
-/// (avoids 512-bit AVX-512 turbo downclocking on Cascade Lake).
+static USE_AVX512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Returns `true` when AVX-512F/BW/VL/DQ are supported and `SS_NO_AVX512` is not set.
+#[inline(always)]
+pub fn use_avx512() -> bool {
+    *USE_AVX512.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512dq")
+                && std::env::var_os("SS_NO_AVX512").is_none()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
+/// 8-way parallel `unscramble40` dispatching to AVX-512DQ when `use_avx512()` is enabled,
+/// otherwise using the 2-phase ILP scalar implementation.
 #[inline(always)]
 pub fn unscramble40_x8(y: [u64; 8], key: u64) -> [u64; 8] {
+    if use_avx512() {
+        return unsafe { unscramble40_x8_avx512(y, key) };
+    }
     unscramble40_x8_scalar(y, key)
 }
 
@@ -343,14 +367,17 @@ pub unsafe fn decode_b36_x4(
     out
 }
 
-/// 8-way base36 decoder for 8 IDs via two AVX2 4-way calls
-/// (avoids 512-bit AVX-512 turbo downclocking).
+/// 8-way base36 decoder for 8 IDs, dispatching to AVX-512BW/VL when `use_avx512()` is enabled
+/// or running two AVX2 4-way calls.
 #[inline(always)]
 pub unsafe fn decode_b36_x8(
     ptrs: [*const u8; 8],
     lens: [usize; 8],
     prefixes: [u8; 8],
 ) -> [Option<u64>; 8] {
+    if use_avx512() {
+        return decode_b36_x8_avx512(ptrs, lens, prefixes);
+    }
     let lo = decode_b36_x4(
         [ptrs[0], ptrs[1], ptrs[2], ptrs[3]],
         [lens[0], lens[1], lens[2], lens[3]],

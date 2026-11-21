@@ -1,3 +1,4 @@
+use crate::group::Cell;
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -6,6 +7,7 @@ use std::path::Path;
 pub const NULL_CAT: u8 = 0xFF;
 
 const TYPE_INT32: i32 = 1;
+const TYPE_INT64: i32 = 2;
 const TYPE_BYTE_ARRAY: i32 = 6;
 
 const REP_REQUIRED: i32 = 0;
@@ -123,19 +125,21 @@ impl SplitScratch {
         self.nonz_revenue.clear();
         self.nonz_category.clear();
 
-        self.zero_person.reserve(cap);
-        self.zero_day.reserve(cap);
-        self.zero_sessions.reserve(cap);
-        self.zero_events.reserve(cap);
-        self.zero_revenue.reserve(cap);
-        self.zero_category.reserve(cap);
+        // +16 slack allows full 16-lane AVX-512 compressed stores without trailing bounds checks.
+        let rcap = cap + 16;
+        self.zero_person.reserve(rcap);
+        self.zero_day.reserve(rcap);
+        self.zero_sessions.reserve(rcap);
+        self.zero_events.reserve(rcap);
+        self.zero_revenue.reserve(rcap);
+        self.zero_category.reserve(rcap);
 
-        self.nonz_person.reserve(cap);
-        self.nonz_day.reserve(cap);
-        self.nonz_sessions.reserve(cap);
-        self.nonz_events.reserve(cap);
-        self.nonz_revenue.reserve(cap);
-        self.nonz_category.reserve(cap);
+        self.nonz_person.reserve(rcap);
+        self.nonz_day.reserve(rcap);
+        self.nonz_sessions.reserve(rcap);
+        self.nonz_events.reserve(rcap);
+        self.nonz_revenue.reserve(rcap);
+        self.nonz_category.reserve(rcap);
     }
 }
 
@@ -672,6 +676,87 @@ unsafe fn sub_min_to_u32_avx2(src: *const i32, base: i32, dst: *mut u32, n: usiz
     }
 }
 
+/// Fused `(src[i] - base)` + 8-lane SWAR bit-packing (`1 <= width <= 8`) directly into `out`,
+/// avoiding an intermediate `Vec<u32>` pass.
+fn encode_sub_min_bitpacked_u8(values: &[i32], base: i32, width: u8, out: &mut Vec<u8>) {
+    if values.is_empty() {
+        return;
+    }
+    let w = width as usize;
+    let num_groups = values.len().div_ceil(8);
+    push_varint(out, ((num_groups as u64) << 1) | 1);
+    if w == 0 {
+        return;
+    }
+    debug_assert!(w <= 8);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        encode_sub_min_bitpacked_avx2(values, base, w, out);
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let total_bytes = num_groups * w;
+        out.reserve(total_bytes + 8);
+        let start_len = out.len();
+        let mut dst = unsafe { out.as_mut_ptr().add(start_len) };
+        for g in 0..num_groups {
+            let off = g * 8;
+            let rem = (values.len() - off).min(8);
+            let mut x = 0u64;
+            for i in 0..rem {
+                let v = (values[off + i] - base) as u8 as u64;
+                x |= v << (i * 8);
+            }
+            let packed = swar_pack8_u8(x, w);
+            unsafe {
+                (dst as *mut u64).write_unaligned(packed.to_le());
+                dst = dst.add(w);
+            }
+        }
+        unsafe {
+            out.set_len(start_len + total_bytes);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi2,lzcnt")]
+unsafe fn encode_sub_min_bitpacked_avx2(values: &[i32], base: i32, width: usize, out: &mut Vec<u8>) {
+    let n = values.len();
+    let num_groups = n.div_ceil(8);
+    let total_bytes = num_groups * width;
+    out.reserve(total_bytes + 8);
+    let start_len = out.len();
+    let src = values.as_ptr();
+    let mut dst = out.as_mut_ptr().add(start_len);
+    let bvec = _mm256_set1_epi32(base);
+    let zero = _mm256_setzero_si256();
+    let zero128 = _mm_setzero_si128();
+    let full_groups = n / 8;
+    for g in 0..full_groups {
+        let v = _mm256_sub_epi32(_mm256_loadu_si256(src.add(g * 8) as *const __m256i), bvec);
+        let p16 = _mm256_packus_epi32(v, zero);
+        let p16_ord = _mm256_permute4x64_epi64(p16, 0xD8);
+        let p8 = _mm_packus_epi16(_mm256_castsi256_si128(p16_ord), zero128);
+        let x = (_mm_cvtsi128_si64(p8) as u64).to_le();
+        let packed = swar_pack8_u8(x, width);
+        (dst as *mut u64).write_unaligned(packed.to_le());
+        dst = dst.add(width);
+    }
+    let rem = n - full_groups * 8;
+    if rem > 0 {
+        let mut x = 0u64;
+        for i in 0..rem {
+            let d = (*src.add(full_groups * 8 + i) - base) as u8 as u64;
+            x |= d << (i * 8);
+        }
+        let packed = swar_pack8_u8(x, width);
+        (dst as *mut u64).write_unaligned(packed.to_le());
+    }
+    out.set_len(start_len + total_bytes);
+}
+
 /// Encodes `keys` (relative to `base_key`) using Parquet RLE/Bit-Packing Hybrid (`RLE_DICTIONARY`
 /// payload after the 1-byte bit-width). Chooses the smaller of pure RLE runs and pure bit-packing.
 pub fn encode_rle_or_bitpack_keys(keys: &[u32], base_key: u32, width: u8, out: &mut Vec<u8>) {
@@ -910,13 +995,53 @@ unsafe fn encode_top_category_defs_avx2(
     cat_u8_buf.set_len(cat_len);
 }
 
+/// Returns `true` when 512-bit AVX-512 should be used.
+/// When compiled with `-C target-cpu=cascadelake` (`avx512f+avx512bw+avx512vl`),
+/// this folds to a compile-time constant `true` with zero runtime overhead unless `SS_NO_AVX512` is set.
+#[inline(always)]
+fn use_avx512() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl"
+    ))]
+    {
+        true
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        ))
+    ))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+                && std::env::var_os("SS_NO_AVX512").is_none()
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Checks whether a slice of `i32` has identical min and max (and returns `(min, max)`).
-/// Uses 256-bit AVX2 on x86_64 (avoiding 512-bit `zmm` frequency downclocking).
+/// Uses AVX-512 when available (or compiled with AVX-512 target features), else AVX2.
 #[inline(always)]
 pub fn min_max_i32(slice: &[i32]) -> (i32, i32) {
     debug_assert!(!slice.is_empty());
     #[cfg(target_arch = "x86_64")]
     {
+        if use_avx512() {
+            return unsafe { min_max_i32_avx512(slice) };
+        }
         return unsafe { min_max_i32_avx2(slice) };
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -933,6 +1058,36 @@ pub fn min_max_i32(slice: &[i32]) -> (i32, i32) {
         }
         (lo, hi)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+unsafe fn min_max_i32_avx512(slice: &[i32]) -> (i32, i32) {
+    let n = slice.len();
+    let ptr = slice.as_ptr();
+    let mut i = 0usize;
+    let first = *ptr;
+    let mut vmin = _mm512_set1_epi32(first);
+    let mut vmax = vmin;
+    while i + 16 <= n {
+        let v = _mm512_loadu_si512(ptr.add(i) as *const _);
+        vmin = _mm512_min_epi32(vmin, v);
+        vmax = _mm512_max_epi32(vmax, v);
+        i += 16;
+    }
+    let mut lo = _mm512_reduce_min_epi32(vmin);
+    let mut hi = _mm512_reduce_max_epi32(vmax);
+    while i < n {
+        let v = *ptr.add(i);
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+        i += 1;
+    }
+    (lo, hi)
 }
 
 #[target_feature(enable = "avx2,bmi2,lzcnt")]
@@ -1034,14 +1189,33 @@ fn compact_person_dict(
 /// 1. `zero_rev`: rows where `revenue_cents == 0 && top_category == 0xFF`
 /// 2. `non_zero`: rows where `revenue_cents != 0 || top_category != 0xFF`
 ///
-/// Uses 256-bit AVX2 (avoiding 512-bit `zmm` frequency downclocking).
+/// Uses 512-bit AVX-512 `_mm512_maskz_compress_epi32` when available, else 256-bit AVX2.
 pub fn split_zero_revenue_chunks<'a>(
+    cols: &UserDailyCols<'a>,
+    scratch: &'a mut SplitScratch,
+) -> (UserDailyCols<'a>, UserDailyCols<'a>) {
+    split_zero_revenue_impl::<true>(cols, scratch)
+}
+
+#[inline(always)]
+fn split_zero_revenue_impl<'a, const FILL_ZERO_CONSTS: bool>(
     cols: &UserDailyCols<'a>,
     scratch: &'a mut SplitScratch,
 ) -> (UserDailyCols<'a>, UserDailyCols<'a>) {
     let n = cols.len();
     scratch.prepare(n);
-    unsafe { split_zero_revenue_avx2(cols, scratch) };
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx512() {
+            unsafe { split_zero_revenue_avx512::<FILL_ZERO_CONSTS>(cols, scratch) };
+        } else {
+            unsafe { split_zero_revenue_avx2::<FILL_ZERO_CONSTS>(cols, scratch) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        unsafe { split_zero_revenue_avx2::<FILL_ZERO_CONSTS>(cols, scratch) };
+    }
     compact_person_dict(
         cols.names_data,
         cols.names_offsets,
@@ -1083,8 +1257,122 @@ pub fn split_zero_revenue_chunks<'a>(
     (zero, nonz)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+unsafe fn split_zero_revenue_avx512<const FILL_ZERO_CONSTS: bool>(
+    cols: &UserDailyCols<'_>,
+    scratch: &mut SplitScratch,
+) {
+    let n = cols.len();
+    let mut i = 0usize;
+    let mut z_len = 0usize;
+    let mut nz_len = 0usize;
+
+    let zp = scratch.zero_person.as_mut_ptr();
+    let zd = scratch.zero_day.as_mut_ptr();
+    let zs = scratch.zero_sessions.as_mut_ptr();
+    let ze = scratch.zero_events.as_mut_ptr();
+
+    let nzp = scratch.nonz_person.as_mut_ptr();
+    let nzd = scratch.nonz_day.as_mut_ptr();
+    let nzs = scratch.nonz_sessions.as_mut_ptr();
+    let nze = scratch.nonz_events.as_mut_ptr();
+    let nzr = scratch.nonz_revenue.as_mut_ptr();
+    let nzc = scratch.nonz_category.as_mut_ptr();
+
+    let zero32 = _mm512_setzero_si512();
+    let null8 = _mm_set1_epi8(-1);
+
+    while i + 16 <= n {
+        let r = _mm512_loadu_si512(cols.revenue_cents.as_ptr().add(i) as *const _);
+        let r_zero = _mm512_cmpeq_epi32_mask(r, zero32);
+        let c = _mm_loadu_si128(cols.top_category.as_ptr().add(i) as *const __m128i);
+        let c_null = _mm_cmpeq_epi8_mask(c, null8);
+        let zmask: __mmask16 = r_zero & c_null;
+
+        let vp = _mm512_loadu_si512(cols.person_keys.as_ptr().add(i) as *const _);
+        let vd = _mm512_loadu_si512(cols.day.as_ptr().add(i) as *const _);
+        let vs = _mm512_loadu_si512(cols.sessions.as_ptr().add(i) as *const _);
+        let ve = _mm512_loadu_si512(cols.events.as_ptr().add(i) as *const _);
+
+        if zmask == 0xFFFF {
+            _mm512_storeu_si512(zp.add(z_len) as *mut _, vp);
+            _mm512_storeu_si512(zd.add(z_len) as *mut _, vd);
+            _mm512_storeu_si512(zs.add(z_len) as *mut _, vs);
+            _mm512_storeu_si512(ze.add(z_len) as *mut _, ve);
+            z_len += 16;
+        } else {
+            let z_cnt = zmask.count_ones() as usize;
+            let nz_cnt = 16 - z_cnt;
+            if z_cnt > 0 {
+                _mm512_storeu_si512(zp.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, vp));
+                _mm512_storeu_si512(zd.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, vd));
+                _mm512_storeu_si512(zs.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, vs));
+                _mm512_storeu_si512(ze.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, ve));
+                z_len += z_cnt;
+            }
+            let nzmask = !zmask;
+            _mm512_storeu_si512(nzp.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, vp));
+            _mm512_storeu_si512(nzd.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, vd));
+            _mm512_storeu_si512(nzs.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, vs));
+            _mm512_storeu_si512(nze.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, ve));
+            _mm512_storeu_si512(nzr.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, r));
+            let mut m = nzmask;
+            let mut dst_c = nzc.add(nz_len);
+            while m != 0 {
+                let bit = m.trailing_zeros() as usize;
+                *dst_c = *cols.top_category.get_unchecked(i + bit);
+                dst_c = dst_c.add(1);
+                m &= m - 1;
+            }
+            nz_len += nz_cnt;
+        }
+        i += 16;
+    }
+
+    while i < n {
+        let rev = *cols.revenue_cents.get_unchecked(i);
+        let cat = *cols.top_category.get_unchecked(i);
+        if rev == 0 && cat == NULL_CAT {
+            *zp.add(z_len) = *cols.person_keys.get_unchecked(i);
+            *zd.add(z_len) = *cols.day.get_unchecked(i);
+            *zs.add(z_len) = *cols.sessions.get_unchecked(i);
+            *ze.add(z_len) = *cols.events.get_unchecked(i);
+            z_len += 1;
+        } else {
+            *nzp.add(nz_len) = *cols.person_keys.get_unchecked(i);
+            *nzd.add(nz_len) = *cols.day.get_unchecked(i);
+            *nzs.add(nz_len) = *cols.sessions.get_unchecked(i);
+            *nze.add(nz_len) = *cols.events.get_unchecked(i);
+            *nzr.add(nz_len) = rev;
+            *nzc.add(nz_len) = cat;
+            nz_len += 1;
+        }
+        i += 1;
+    }
+
+    scratch.zero_person.set_len(z_len);
+    scratch.zero_day.set_len(z_len);
+    scratch.zero_sessions.set_len(z_len);
+    scratch.zero_events.set_len(z_len);
+    if FILL_ZERO_CONSTS {
+        scratch.zero_revenue.resize(z_len, 0);
+        scratch.zero_category.resize(z_len, NULL_CAT);
+    }
+
+    scratch.nonz_person.set_len(nz_len);
+    scratch.nonz_day.set_len(nz_len);
+    scratch.nonz_sessions.set_len(nz_len);
+    scratch.nonz_events.set_len(nz_len);
+    scratch.nonz_revenue.set_len(nz_len);
+    scratch.nonz_category.set_len(nz_len);
+}
+
 #[target_feature(enable = "avx2,bmi2,lzcnt")]
-unsafe fn split_zero_revenue_avx2(cols: &UserDailyCols<'_>, scratch: &mut SplitScratch) {
+unsafe fn split_zero_revenue_avx2<const FILL_ZERO_CONSTS: bool>(
+    cols: &UserDailyCols<'_>,
+    scratch: &mut SplitScratch,
+) {
     let n = cols.len();
     let mut i = 0usize;
     let mut z_len = 0usize;
@@ -1158,8 +1446,10 @@ unsafe fn split_zero_revenue_avx2(cols: &UserDailyCols<'_>, scratch: &mut SplitS
     scratch.zero_day.set_len(z_len);
     scratch.zero_sessions.set_len(z_len);
     scratch.zero_events.set_len(z_len);
-    scratch.zero_revenue.resize(z_len, 0);
-    scratch.zero_category.resize(z_len, NULL_CAT);
+    if FILL_ZERO_CONSTS {
+        scratch.zero_revenue.resize(z_len, 0);
+        scratch.zero_category.resize(z_len, NULL_CAT);
+    }
 
     scratch.nonz_person.set_len(nz_len);
     scratch.nonz_day.set_len(nz_len);
@@ -1186,8 +1476,8 @@ struct RowGroupMeta {
 /// High-speed columnar Parquet v1 writer for `user_daily` using `RLE_DICTIONARY`
 /// and optional zero-revenue row-group splitting.
 ///
-/// Accumulates the entire Parquet file in a single `Vec<u8>` buffer (pre-allocated to 4 MiB on the
-/// first non-empty row group) and flushes it in one `write_all` syscall in `finish()`.
+/// Accumulates the Parquet file in a single `Vec<u8>` buffer (tightly pre-reserved via `rows * 6`)
+/// and flushes it in one `write_all` syscall in `finish()`.
 pub struct FastUserDailyWriter {
     file: File,
     buf: Vec<u8>,
@@ -1198,6 +1488,49 @@ pub struct FastUserDailyWriter {
     idx_buf: Vec<u32>,
     cat_u8_buf: Vec<u8>,
     split_scratch: SplitScratch,
+}
+
+fn emit_dict_page_into(buf: &mut Vec<u8>, num_values: usize, payload: &[u8]) -> (u64, u64) {
+    let off = buf.len() as u64;
+    {
+        let mut t = ThriftWriter::new(buf);
+        t.i32(1, P_DICT);
+        t.i32(2, payload.len() as i32);
+        t.i32(3, payload.len() as i32);
+        t.begin_field(7); // DictionaryPageHeader
+        t.i32(1, num_values as i32);
+        t.i32(2, E_PLAIN);
+        t.end_struct();
+        buf.push(0);
+    }
+    buf.extend_from_slice(payload);
+    let written = buf.len() as u64 - off;
+    (off, written)
+}
+
+fn emit_data_page_into(
+    buf: &mut Vec<u8>,
+    num_values: usize,
+    encoding: i32,
+    payload: &[u8],
+) -> (u64, u64) {
+    let off = buf.len() as u64;
+    {
+        let mut t = ThriftWriter::new(buf);
+        t.i32(1, P_DATA);
+        t.i32(2, payload.len() as i32);
+        t.i32(3, payload.len() as i32);
+        t.begin_field(5); // DataPageHeader
+        t.i32(1, num_values as i32);
+        t.i32(2, encoding);
+        t.i32(3, E_RLE); // definition_level_encoding
+        t.i32(4, E_RLE); // repetition_level_encoding
+        t.end_struct();
+        buf.push(0);
+    }
+    buf.extend_from_slice(payload);
+    let written = buf.len() as u64 - off;
+    (off, written)
 }
 
 impl FastUserDailyWriter {
@@ -1221,15 +1554,21 @@ impl FastUserDailyWriter {
     /// Writes `cols` in chunks of `chunk_rows` (e.g. 4096), splitting each chunk into a
     /// zero-revenue row group (`rev == 0 && cat == 0xFF`) and a non-zero row group.
     pub fn write_batches_split(&mut self, cols: &UserDailyCols<'_>, chunk_rows: usize) {
+        let rows = cols.len();
+        if rows == 0 {
+            return;
+        }
+        self.buf.reserve(rows.saturating_mul(6));
         let step = chunk_rows.max(1);
         let mut from = 0usize;
-        while from < cols.len() {
-            let to = (from + step).min(cols.len());
+        while from < rows {
+            let to = (from + step).min(rows);
             let sub = cols.slice(from, to);
             let mut scratch = std::mem::take(&mut self.split_scratch);
-            let (zero_rg, nonz_rg) = split_zero_revenue_chunks(&sub, &mut scratch);
-            if !zero_rg.is_empty() {
-                self.write_row_group(&zero_rg);
+            let (zero_rg, nonz_rg) = split_zero_revenue_impl::<false>(&sub, &mut scratch);
+            let z_n = zero_rg.day.len();
+            if z_n > 0 {
+                self.write_zero_rev_row_group(&zero_rg, z_n);
             }
             if !nonz_rg.is_empty() {
                 self.write_row_group(&nonz_rg);
@@ -1239,15 +1578,28 @@ impl FastUserDailyWriter {
         }
     }
 
+    fn write_zero_rev_row_group(&mut self, cols: &UserDailyCols<'_>, n: usize) {
+        let c0 = self.write_user_id_col(cols);
+        let c1 = self.write_day_col(cols.day);
+        let c2 = self.write_sessions_col(cols.sessions);
+        let c3 = self.write_events_col(cols.events);
+        let c4 = self.write_const_i32_col(n, 0);
+        let c5 = self.write_all_null_category_col(n);
+
+        self.total_rows += n as u64;
+        self.groups.push(RowGroupMeta {
+            num_rows: n as u64,
+            cols: [c0, c1, c2, c3, c4, c5],
+        });
+    }
+
     /// Writes `cols` directly as a single Parquet row group without splitting.
     pub fn write_row_group(&mut self, cols: &UserDailyCols<'_>) {
         let n = cols.len();
         if n == 0 {
             return;
         }
-        if self.buf.capacity() < (4 << 20) {
-            self.buf.reserve((4 << 20) - self.buf.len());
-        }
+        self.buf.reserve(n.saturating_mul(6));
         let c0 = self.write_user_id_col(cols);
         let c1 = self.write_day_col(cols.day);
         let c2 = self.write_sessions_col(cols.sessions);
@@ -1260,44 +1612,6 @@ impl FastUserDailyWriter {
             num_rows: n as u64,
             cols: [c0, c1, c2, c3, c4, c5],
         });
-    }
-
-    fn emit_dict_page(&mut self, num_values: usize, payload: &[u8]) -> (u64, u64) {
-        let off = self.buf.len() as u64;
-        {
-            let mut t = ThriftWriter::new(&mut self.buf);
-            t.i32(1, P_DICT);
-            t.i32(2, payload.len() as i32);
-            t.i32(3, payload.len() as i32);
-            t.begin_field(7); // DictionaryPageHeader
-            t.i32(1, num_values as i32);
-            t.i32(2, E_PLAIN);
-            t.end_struct();
-            self.buf.push(0);
-        }
-        self.buf.extend_from_slice(payload);
-        let written = self.buf.len() as u64 - off;
-        (off, written)
-    }
-
-    fn emit_data_page(&mut self, num_values: usize, encoding: i32, payload: &[u8]) -> (u64, u64) {
-        let off = self.buf.len() as u64;
-        {
-            let mut t = ThriftWriter::new(&mut self.buf);
-            t.i32(1, P_DATA);
-            t.i32(2, payload.len() as i32);
-            t.i32(3, payload.len() as i32);
-            t.begin_field(5); // DataPageHeader
-            t.i32(1, num_values as i32);
-            t.i32(2, encoding);
-            t.i32(3, E_RLE); // definition_level_encoding
-            t.i32(4, E_RLE); // repetition_level_encoding
-            t.end_struct();
-            self.buf.push(0);
-        }
-        self.buf.extend_from_slice(payload);
-        let written = self.buf.len() as u64 - off;
-        (off, written)
     }
 
     /// 1. `user_id` (`BYTE_ARRAY`, `REQUIRED`):
@@ -1316,6 +1630,8 @@ impl FastUserDailyWriter {
         }
         let dict_count = (hi - lo + 1) as usize;
         self.dict_buf.clear();
+        let data_span = cols.names_offsets[hi as usize + 1] - cols.names_offsets[lo as usize];
+        self.dict_buf.reserve(dict_count * 4 + data_span as usize);
         for p in lo..=hi {
             let start = cols.names_offsets[p as usize] as usize;
             let end = cols.names_offsets[p as usize + 1] as usize;
@@ -1323,16 +1639,13 @@ impl FastUserDailyWriter {
             self.dict_buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
             self.dict_buf.extend_from_slice(name);
         }
-        let dict_payload = std::mem::take(&mut self.dict_buf);
-        let (dict_off, dict_sz) = self.emit_dict_page(dict_count, &dict_payload);
-        self.dict_buf = dict_payload;
+        let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, dict_count, &self.dict_buf);
 
         let w = bit_width(hi - lo);
-        let mut page_payload = std::mem::take(&mut self.page_buf);
-        page_payload.clear();
-        encode_rle_or_bitpack_keys(keys, lo, w, &mut page_payload);
-        let (data_off, data_sz) = self.emit_data_page(keys.len(), E_RLE_DICT, &page_payload);
-        self.page_buf = page_payload;
+        self.page_buf.clear();
+        encode_rle_or_bitpack_keys(keys, lo, w, &mut self.page_buf);
+        let (data_off, data_sz) =
+            emit_data_page_into(&mut self.buf, keys.len(), E_RLE_DICT, &self.page_buf);
 
         ColChunkMeta {
             file_offset: dict_off,
@@ -1355,26 +1668,24 @@ impl FastUserDailyWriter {
     ) -> ColChunkMeta {
         let span = (max_v as i64 - min_v as i64) as u32;
         let dict_count = (span + 1) as usize;
-        let mut dict_payload = std::mem::take(&mut self.dict_buf);
-        dict_payload.clear();
+        self.dict_buf.clear();
+        self.dict_buf.reserve(dict_count * 4);
         for v in min_v..=max_v {
-            dict_payload.extend_from_slice(&v.to_le_bytes());
+            self.dict_buf.extend_from_slice(&v.to_le_bytes());
         }
-        let (dict_off, dict_sz) = self.emit_dict_page(dict_count, &dict_payload);
-        self.dict_buf = dict_payload;
+        let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, dict_count, &self.dict_buf);
 
         let w = bit_width(span).max(min_bit_width);
-        let mut page_payload = std::mem::take(&mut self.page_buf);
-        page_payload.clear();
-        page_payload.push(w);
-        sub_min_to_u32(values, min_v, &mut self.idx_buf);
+        self.page_buf.clear();
+        self.page_buf.push(w);
         if use_rle {
-            encode_rle_u32(&self.idx_buf, w, &mut page_payload);
+            sub_min_to_u32(values, min_v, &mut self.idx_buf);
+            encode_rle_u32(&self.idx_buf, w, &mut self.page_buf);
         } else {
-            encode_bitpacked_u32(&self.idx_buf, w, &mut page_payload);
+            encode_sub_min_bitpacked_u8(values, min_v, w, &mut self.page_buf);
         }
-        let (data_off, data_sz) = self.emit_data_page(values.len(), E_RLE_DICT, &page_payload);
-        self.page_buf = page_payload;
+        let (data_off, data_sz) =
+            emit_data_page_into(&mut self.buf, values.len(), E_RLE_DICT, &self.page_buf);
 
         ColChunkMeta {
             file_offset: dict_off,
@@ -1391,7 +1702,7 @@ impl FastUserDailyWriter {
         let (min_d, max_d) = min_max_i32(days);
         let span = (max_d as i64 - min_d as i64) as u64;
         if span == 0 {
-            self.write_int32_const_or_plain(days)
+            self.write_const_i32_col(days.len(), min_d)
         } else if span < 256 {
             self.write_dense_i32_dict_col(days, min_d, max_d, 4, false)
         } else {
@@ -1406,7 +1717,7 @@ impl FastUserDailyWriter {
         let (min_s, max_s) = min_max_i32(sessions);
         let span = (max_s as i64 - min_s as i64) as u64;
         if span == 0 {
-            self.write_int32_const_or_plain(sessions)
+            self.write_const_i32_col(sessions.len(), min_s)
         } else if span < 256 {
             self.write_dense_i32_dict_col(sessions, min_s, max_s, 1, true)
         } else {
@@ -1422,11 +1733,31 @@ impl FastUserDailyWriter {
         let (min_v, max_v) = min_max_i32(values);
         let span = (max_v as i64 - min_v as i64) as u64;
         if span == 0 {
-            self.write_int32_const_or_plain(values)
+            self.write_const_i32_col(values.len(), min_v)
         } else if span < 256 {
             self.write_dense_i32_dict_col(values, min_v, max_v, 1, true)
         } else {
             self.write_plain_i32(values)
+        }
+    }
+
+    fn write_const_i32_col(&mut self, n: usize, val: i32) -> ColChunkMeta {
+        let dict_bytes = val.to_le_bytes();
+        let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, 1, &dict_bytes);
+
+        self.page_buf.clear();
+        self.page_buf.push(1); // bit-width = 1
+        push_varint(&mut self.page_buf, (n as u64) << 1);
+        self.page_buf.push(0); // dictionary index 0
+        let (data_off, data_sz) =
+            emit_data_page_into(&mut self.buf, n, E_RLE_DICT, &self.page_buf);
+
+        ColChunkMeta {
+            file_offset: dict_off,
+            total_size: dict_sz + data_sz,
+            data_page_offset: data_off,
+            dict_page_offset: Some(dict_off),
+            uses_dict: true,
         }
     }
 
@@ -1436,24 +1767,7 @@ impl FastUserDailyWriter {
     fn write_int32_const_or_plain(&mut self, values: &[i32]) -> ColChunkMeta {
         let (min_v, max_v) = min_max_i32(values);
         if min_v == max_v {
-            let dict_bytes = min_v.to_le_bytes();
-            let (dict_off, dict_sz) = self.emit_dict_page(1, &dict_bytes);
-
-            let mut page_payload = std::mem::take(&mut self.page_buf);
-            page_payload.clear();
-            page_payload.push(1); // bit-width = 1
-            push_varint(&mut page_payload, (values.len() as u64) << 1);
-            page_payload.push(0); // dictionary index 0
-            let (data_off, data_sz) = self.emit_data_page(values.len(), E_RLE_DICT, &page_payload);
-            self.page_buf = page_payload;
-
-            ColChunkMeta {
-                file_offset: dict_off,
-                total_size: dict_sz + data_sz,
-                data_page_offset: data_off,
-                dict_page_offset: Some(dict_off),
-                uses_dict: true,
-            }
+            self.write_const_i32_col(values.len(), min_v)
         } else {
             self.write_plain_i32(values)
         }
@@ -1463,7 +1777,27 @@ impl FastUserDailyWriter {
         let raw_bytes = unsafe {
             std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
         };
-        let (data_off, data_sz) = self.emit_data_page(values.len(), E_PLAIN, raw_bytes);
+        let (data_off, data_sz) =
+            emit_data_page_into(&mut self.buf, values.len(), E_PLAIN, raw_bytes);
+        ColChunkMeta {
+            file_offset: data_off,
+            total_size: data_sz,
+            data_page_offset: data_off,
+            dict_page_offset: None,
+            uses_dict: false,
+        }
+    }
+
+    fn write_all_null_category_col(&mut self, n: usize) -> ColChunkMeta {
+        self.page_buf.clear();
+        let hdr = (n as u64) << 1;
+        let def_len = varint_len(hdr) + 1;
+        self.page_buf.extend_from_slice(&(def_len as u32).to_le_bytes());
+        push_varint(&mut self.page_buf, hdr);
+        self.page_buf.push(0); // def level 0 (NULL) repeated n times
+        let (data_off, data_sz) =
+            emit_data_page_into(&mut self.buf, n, E_PLAIN, &self.page_buf);
+
         ColChunkMeta {
             file_offset: data_off,
             total_size: data_sz,
@@ -1483,45 +1817,26 @@ impl FastUserDailyWriter {
         let n = cats.len();
 
         if !has_non_null_u8(cats) {
-            let mut page_payload = std::mem::take(&mut self.page_buf);
-            page_payload.clear();
-            let hdr = (n as u64) << 1;
-            let def_len = varint_len(hdr) + 1;
-            page_payload.extend_from_slice(&(def_len as u32).to_le_bytes());
-            push_varint(&mut page_payload, hdr);
-            page_payload.push(0); // def level 0 (NULL) repeated n times
-            let (data_off, data_sz) = self.emit_data_page(n, E_PLAIN, &page_payload);
-            self.page_buf = page_payload;
-
-            ColChunkMeta {
-                file_offset: data_off,
-                total_size: data_sz,
-                data_page_offset: data_off,
-                dict_page_offset: None,
-                uses_dict: false,
-            }
+            self.write_all_null_category_col(n)
         } else {
             let num_cats = cols.cat_dict_offsets.len().saturating_sub(1);
-            let mut dict_payload = std::mem::take(&mut self.dict_buf);
-            dict_payload.clear();
+            self.dict_buf.clear();
+            self.dict_buf
+                .reserve(num_cats * 4 + cols.cat_dict_data.len());
             for c in 0..num_cats {
                 let s = cols.cat_dict_offsets[c] as usize;
                 let e = cols.cat_dict_offsets[c + 1] as usize;
                 let bytes = &cols.cat_dict_data[s..e];
-                dict_payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                dict_payload.extend_from_slice(bytes);
+                self.dict_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                self.dict_buf.extend_from_slice(bytes);
             }
-            let (dict_off, dict_sz) = self.emit_dict_page(num_cats, &dict_payload);
-            self.dict_buf = dict_payload;
+            let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, num_cats, &self.dict_buf);
 
-            let mut page_payload = std::mem::take(&mut self.page_buf);
-            page_payload.clear();
-            let mut cat_u8_buf = std::mem::take(&mut self.cat_u8_buf);
-            encode_top_category_chunk(cats, num_cats, &mut cat_u8_buf, &mut page_payload);
-            self.cat_u8_buf = cat_u8_buf;
+            self.page_buf.clear();
+            encode_top_category_chunk(cats, num_cats, &mut self.cat_u8_buf, &mut self.page_buf);
 
-            let (data_off, data_sz) = self.emit_data_page(n, E_RLE_DICT, &page_payload);
-            self.page_buf = page_payload;
+            let (data_off, data_sz) =
+                emit_data_page_into(&mut self.buf, n, E_RLE_DICT, &self.page_buf);
 
             ColChunkMeta {
                 file_offset: dict_off,
@@ -1629,6 +1944,224 @@ impl FastUserDailyWriter {
         self.buf.extend_from_slice(&footer_len.to_le_bytes());
         self.buf.extend_from_slice(b"PAR1");
         self.file.write_all(&self.buf).expect("write Parquet output");
+    }
+}
+
+/// Reduces `per_thread` campaign-day `Cell` slices for shard `shard_idx` of `num_shards`
+/// (covering campaigns `c0..c1` out of `campaigns.len() + 1` including `"organic"`) and writes
+/// `out_dir/part-{shard_idx:03}.parquet` in a single `write_all` syscall.
+pub fn write_campaigns_shard<S: AsRef<[Cell]>>(
+    campaigns: &[(Vec<u8>, Vec<u8>)],
+    first_day: i32,
+    days: usize,
+    out_dir: &Path,
+    per_thread: &[S],
+    shard_idx: usize,
+    num_shards: usize,
+) {
+    let total_campaigns = campaigns.len() + 1;
+    let c0 = shard_idx * total_campaigns / num_shards;
+    let c1 = (shard_idx + 1) * total_campaigns / num_shards;
+
+    let mut cols: [Vec<u8>; 7] = Default::default();
+    let est_rows = (c1 - c0) * days;
+    cols[0].reserve(est_rows * 16);
+    cols[1].reserve(est_rows * 12);
+    cols[2].reserve(est_rows * 4);
+    cols[3].reserve(est_rows * 8);
+    cols[4].reserve(est_rows * 8);
+    cols[5].reserve(est_rows * 8);
+    cols[6].reserve(est_rows * 8);
+
+    let need_cells = total_campaigns * days;
+    for cells in per_thread {
+        assert!(cells.as_ref().len() >= need_cells);
+    }
+
+    let mut rows = 0usize;
+    for campaign in c0..c1 {
+        let (id, channel): (&[u8], &[u8]) = match campaigns.get(campaign) {
+            Some((id, ch)) => (id.as_slice(), ch.as_slice()),
+            None => (b"organic", b"organic"),
+        };
+        let camp_base = campaign * days;
+        for day in 0..days {
+            let idx = camp_base + day;
+            let (mut sessions, mut purchasing, mut assisted, mut revenue) = (0u64, 0u64, 0u64, 0u64);
+            for cells in per_thread {
+                let c = unsafe { cells.as_ref().get_unchecked(idx) };
+                sessions += c.sessions as u64;
+                purchasing += c.purchasing as u64;
+                assisted += c.assisted as u64;
+                revenue += c.revenue;
+            }
+            if sessions == 0 && assisted == 0 {
+                continue;
+            }
+            cols[0].extend_from_slice(&(id.len() as u32).to_le_bytes());
+            cols[0].extend_from_slice(id);
+            cols[1].extend_from_slice(&(channel.len() as u32).to_le_bytes());
+            cols[1].extend_from_slice(channel);
+            cols[2].extend_from_slice(&(first_day + day as i32).to_le_bytes());
+            cols[3].extend_from_slice(&sessions.to_le_bytes());
+            cols[4].extend_from_slice(&purchasing.to_le_bytes());
+            cols[5].extend_from_slice(&revenue.to_le_bytes());
+            cols[6].extend_from_slice(&assisted.to_le_bytes());
+            rows += 1;
+        }
+    }
+
+    if rows == 0 && shard_idx > 0 {
+        return;
+    }
+
+    let total_payload: usize = cols.iter().map(|c| c.len()).sum();
+    let mut buf = Vec::with_capacity(total_payload + 1024);
+    buf.extend_from_slice(b"PAR1");
+
+    let mut chunks: [(u64, u64); 7] = [(0, 0); 7];
+    if rows > 0 {
+        let mut levels = [0u8; 16];
+        let mut lvl_len = 0usize;
+        let mut v = (rows as u64) << 1;
+        while v >= 0x80 {
+            levels[lvl_len] = (v as u8) | 0x80;
+            lvl_len += 1;
+            v >>= 7;
+        }
+        levels[lvl_len] = v as u8;
+        lvl_len += 1;
+        levels[lvl_len] = 1; // all values present (def_level = 1)
+        lvl_len += 1;
+
+        for (i, col_bytes) in cols.iter().enumerate() {
+            let off = buf.len() as u64;
+            let page_len = 4 + lvl_len + col_bytes.len();
+            {
+                let mut t = ThriftWriter::new(&mut buf);
+                t.i32(1, P_DATA);
+                t.i32(2, page_len as i32);
+                t.i32(3, page_len as i32);
+                t.begin_field(5);
+                t.i32(1, rows as i32);
+                t.i32(2, E_PLAIN);
+                t.i32(3, E_RLE);
+                t.i32(4, E_RLE);
+                t.end_struct();
+                buf.push(0);
+            }
+            buf.extend_from_slice(&(lvl_len as u32).to_le_bytes());
+            buf.extend_from_slice(&levels[..lvl_len]);
+            buf.extend_from_slice(col_bytes);
+            let sz = buf.len() as u64 - off;
+            chunks[i] = (off, sz);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CampSpec {
+        name: &'static [u8],
+        ty: i32,
+        converted: Option<i32>,
+        logical_tag: Option<i16>,
+    }
+
+    const CAMP_SPECS: [CampSpec; 7] = [
+        CampSpec { name: b"campaign_id", ty: TYPE_BYTE_ARRAY, converted: Some(0), logical_tag: Some(1) },
+        CampSpec { name: b"channel", ty: TYPE_BYTE_ARRAY, converted: Some(0), logical_tag: Some(1) },
+        CampSpec { name: b"day", ty: TYPE_INT32, converted: Some(6), logical_tag: Some(6) },
+        CampSpec { name: b"sessions", ty: TYPE_INT64, converted: None, logical_tag: None },
+        CampSpec { name: b"purchasing_sessions", ty: TYPE_INT64, converted: None, logical_tag: None },
+        CampSpec { name: b"revenue_cents", ty: TYPE_INT64, converted: None, logical_tag: None },
+        CampSpec { name: b"assisted_sessions", ty: TYPE_INT64, converted: None, logical_tag: None },
+    ];
+
+    let footer_start = buf.len();
+    {
+        let mut t = ThriftWriter::new(&mut buf);
+        t.i32(1, 1);
+        t.list(2, T_STRUCT, CAMP_SPECS.len() + 1);
+        t.begin_struct();
+        t.binary(4, b"schema");
+        t.i32(5, CAMP_SPECS.len() as i32);
+        t.end_struct();
+        for spec in &CAMP_SPECS {
+            t.begin_struct();
+            t.i32(1, spec.ty);
+            t.i32(3, REP_OPTIONAL);
+            t.binary(4, spec.name);
+            if let Some(conv) = spec.converted {
+                t.i32(6, conv);
+            }
+            if let Some(ltag) = spec.logical_tag {
+                t.begin_field(10);
+                t.begin_field(ltag);
+                t.end_struct();
+                t.end_struct();
+            }
+            t.end_struct();
+        }
+        t.i64(3, rows as i64);
+        let num_rg = usize::from(rows > 0);
+        t.list(4, T_STRUCT, num_rg);
+        if rows > 0 {
+            t.begin_struct();
+            t.list(1, T_STRUCT, CAMP_SPECS.len());
+            let mut rg_bytes = 0u64;
+            for (spec, &(off, sz)) in CAMP_SPECS.iter().zip(&chunks) {
+                rg_bytes += sz;
+                t.begin_struct();
+                t.i64(2, off as i64);
+                t.begin_field(3);
+                t.i32(1, spec.ty);
+                t.list(2, T_I32, 2);
+                t.zigzag(E_PLAIN as i64);
+                t.zigzag(E_RLE as i64);
+                t.list(3, T_BINARY, 1);
+                t.varint(spec.name.len() as u64);
+                t.buf.extend_from_slice(spec.name);
+                t.i32(4, 0);
+                t.i64(5, rows as i64);
+                t.i64(6, sz as i64);
+                t.i64(7, sz as i64);
+                t.i64(9, off as i64);
+                t.end_struct();
+                t.end_struct();
+            }
+            t.i64(2, rg_bytes as i64);
+            t.i64(3, rows as i64);
+            t.end_struct();
+        }
+        buf.push(0);
+    }
+    let footer_len = (buf.len() - footer_start) as u32;
+    buf.extend_from_slice(&footer_len.to_le_bytes());
+    buf.extend_from_slice(b"PAR1");
+
+    let part_path = out_dir.join(format!("part-{shard_idx:03}.parquet"));
+    let mut file = File::create(&part_path).expect("create campaign_daily shard");
+    file.write_all(&buf).expect("write campaign_daily shard");
+}
+
+/// Reduces `per_thread` `Cell` slices in parallel across `threads` shards, writing
+/// `out_dir/part-{t:03}.parquet` for disjoint campaign slices `c0..c1`.
+pub fn write_campaigns_sharded<S: AsRef<[Cell]> + Sync>(
+    campaigns: &[(Vec<u8>, Vec<u8>)],
+    first_day: i32,
+    days: usize,
+    out_dir: &Path,
+    per_thread: &[S],
+    threads: usize,
+) {
+    let _ = std::fs::create_dir_all(out_dir);
+    let total_campaigns = campaigns.len() + 1;
+    let num_shards = threads.max(1).min(total_campaigns);
+    if num_shards <= 1 {
+        write_campaigns_shard(campaigns, first_day, days, out_dir, per_thread, 0, 1);
+    } else {
+        crate::sys::par(num_shards, |t| {
+            write_campaigns_shard(campaigns, first_day, days, out_dir, per_thread, t, num_shards);
+        });
     }
 }
 
@@ -2134,5 +2667,163 @@ print(f"OK rows={df.height} nulls={null_cats} rev={rev_sum} sess={sess_sum} ev={
         eprintln!("100k split write: {:?}, size={} bytes ({:.2} B/row)", elapsed, sz, sz as f64 / n as f64);
         verify_with_polars_and_duckdb(&bench_path, &cols, &[]);
         let _ = std::fs::remove_file(&bench_path);
+    }
+
+    #[test]
+    fn test_split_zero_revenue_and_min_max_parity() {
+        for &len in &[1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 513] {
+            let vals: Vec<i32> = (0..len).map(|i| ((i as i32 * 37) % 199) - 99).collect();
+            let exp_min = *vals.iter().min().unwrap();
+            let exp_max = *vals.iter().max().unwrap();
+            assert_eq!(min_max_i32(&vals), (exp_min, exp_max));
+
+            let (nd, no, pk, day, sess, ev, rev, cat, cd, co) = build_sample_dataset(len);
+            let cols = UserDailyCols {
+                names_data: &nd,
+                names_offsets: &no,
+                person_keys: &pk,
+                day: &day,
+                sessions: &sess,
+                events: &ev,
+                revenue_cents: &rev,
+                top_category: &cat,
+                cat_dict_data: &cd,
+                cat_dict_offsets: &co,
+            };
+            let mut scratch = SplitScratch::new();
+            let (z, nz) = split_zero_revenue_chunks(&cols, &mut scratch);
+            assert_eq!(z.len() + nz.len(), len);
+            assert!(z.revenue_cents.iter().all(|&r| r == 0));
+            assert!(z.top_category.iter().all(|&c| c == NULL_CAT));
+            for i in 0..nz.len() {
+                assert!(nz.revenue_cents[i] != 0 || nz.top_category[i] != NULL_CAT);
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_campaigns_sharded_pyarrow_polars_duckdb() {
+        let campaigns: Vec<(Vec<u8>, Vec<u8>)> = (0..53)
+            .map(|c| {
+                let ch = match c % 4 {
+                    0 => b"paid_search".to_vec(),
+                    1 => b"social".to_vec(),
+                    2 => b"email".to_vec(),
+                    _ => b"display".to_vec(),
+                };
+                (format!("camp_{c:03}").into_bytes(), ch)
+            })
+            .collect();
+        let days = 15usize;
+        let first_day = 20727i32;
+        let total_campaigns = campaigns.len() + 1;
+        let threads = 6usize;
+
+        let mut per_thread = vec![vec![Cell::default(); total_campaigns * days]; threads];
+        for t in 0..threads {
+            for c in 0..total_campaigns {
+                // Leave some campaigns completely empty to exercise empty-shard/row skipping
+                if c % 11 == 3 {
+                    continue;
+                }
+                for d in 0..days {
+                    if (c + d + t) % 3 == 0 {
+                        continue;
+                    }
+                    let cell = &mut per_thread[t][c * days + d];
+                    cell.sessions = ((c + 1) * (t + 1) + d) as u32;
+                    cell.purchasing = ((c + t) % 5) as u32;
+                    cell.assisted = ((c * 3 + d + t) % 7) as u32;
+                    cell.revenue = ((c * 1000 + d * 100 + t * 17) as u64) * 10;
+                }
+            }
+        }
+
+        let tmp_dir = std::env::temp_dir().join("fast_pq_campaigns_sharded_test");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let sharded_dir = tmp_dir.join("sharded");
+        let single_dir = tmp_dir.join("single");
+
+        write_campaigns_sharded(&campaigns, first_day, days, &sharded_dir, &per_thread, 8);
+        write_campaigns_sharded(&campaigns, first_day, days, &single_dir, &per_thread, 1);
+
+        let part_count = std::fs::read_dir(&sharded_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+            .count();
+        assert!(part_count >= 2, "expected multiple shards, got {part_count}");
+
+        // Compute exact expected aggregates in Rust
+        let mut exp_rows = 0usize;
+        let mut exp_sess = 0i64;
+        let mut exp_purch = 0i64;
+        let mut exp_rev = 0i64;
+        let mut exp_assist = 0i64;
+        for c in 0..total_campaigns {
+            for d in 0..days {
+                let (mut s, mut p, mut a, mut r) = (0u64, 0u64, 0u64, 0u64);
+                for cells in &per_thread {
+                    let cell = cells[c * days + d];
+                    s += cell.sessions as u64;
+                    p += cell.purchasing as u64;
+                    a += cell.assisted as u64;
+                    r += cell.revenue;
+                }
+                if s == 0 && a == 0 {
+                    continue;
+                }
+                exp_rows += 1;
+                exp_sess += s as i64;
+                exp_purch += p as i64;
+                exp_rev += r as i64;
+                exp_assist += a as i64;
+            }
+        }
+
+        let venv_py = Path::new("/home/colton/Documents/Projects/Builders/#3/.venv/bin/python");
+        if venv_py.exists() {
+            let script = r#"
+import glob, sys
+import pyarrow.parquet as pq
+import polars as pl
+import duckdb
+
+sharded_glob = sys.argv[1] + "/*.parquet"
+single_path = sys.argv[2] + "/part-000.parquet"
+
+pa_sh = pq.read_table(sys.argv[1])
+pa_sg = pq.read_table(single_path)
+assert pa_sh.schema.equals(pa_sg.schema), f"schema mismatch: {pa_sh.schema} vs {pa_sg.schema}"
+
+df_sh = pl.read_parquet(sharded_glob).sort(["campaign_id", "day"])
+df_sg = pl.read_parquet(single_path).sort(["campaign_id", "day"])
+assert df_sh.equals(df_sg), "sharded != single"
+assert str(df_sh.schema["day"]) == "Date"
+
+duck_rows = duckdb.sql(f"SELECT COUNT(*), SUM(sessions), SUM(purchasing_sessions), SUM(revenue_cents), SUM(assisted_sessions) FROM read_parquet('{sharded_glob}')").fetchall()[0]
+print(f"OK rows={duck_rows[0]} sess={duck_rows[1]} purch={duck_rows[2]} rev={duck_rows[3]} assist={duck_rows[4]}")
+"#;
+            let out = Command::new(venv_py)
+                .arg("-c")
+                .arg(script)
+                .arg(sharded_dir.to_str().unwrap())
+                .arg(single_dir.to_str().unwrap())
+                .output()
+                .expect("run python verifier for campaign_daily");
+            assert!(
+                out.status.success(),
+                "Campaign verifier failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let expected = format!(
+                "OK rows={exp_rows} sess={exp_sess} purch={exp_purch} rev={exp_rev} assist={exp_assist}"
+            );
+            assert_eq!(stdout.trim(), expected);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

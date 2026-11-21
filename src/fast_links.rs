@@ -23,8 +23,8 @@ pub const HAS_EXTRA_EVENTS: u16 = 0x4000;
 /// cross-user links (e.g. kiosks), `alias >= 14` (chain users), or non-canonical IDs.
 pub const IS_COMPLEX: u16 = 0x8000;
 
-/// User bucket shift (`1024` users per bucket = 2 KiB of `alias_masks`, L1-resident).
-pub const UB_SHIFT: usize = 10;
+/// User bucket shift (`4096` users per bucket = 8 KiB of `alias_masks` / 16 KiB click counts, L1-resident).
+pub const UB_SHIFT: usize = 12;
 pub const UB_USERS: usize = 1 << UB_SHIFT;
 pub const UB_MASK: usize = UB_USERS - 1;
 
@@ -707,20 +707,26 @@ impl ClickSlot {
     }
 }
 
-/// Direct Click CSR indexed by `click_index = unscramble40(cid, ckey)`.
-/// Eliminates click hash-dedup and scatter streams by placing clicks directly at `csr[click_idx]`,
-/// then compacting valid clicks in-place into per-user slices `csr[csr_off[u]..csr_end[u]]`.
+/// Direct Click CSR indexed by `user_idx` with a single `csr_off` (`len = user_cap + 1`).
+/// User `u`'s sorted clicks live in `csr[csr_off[u]..csr_off[u + 1]]`.
 pub struct ClickCsr {
     pub csr: Vec<ClickSlot>,
     data_ptr: *mut ClickSlot,
     data_len: usize,
     pub csr_off: Vec<u32>,
-    pub csr_end: Vec<u32>,
     pub user_cap: usize,
 }
 
 unsafe impl Send for ClickCsr {}
 unsafe impl Sync for ClickCsr {}
+
+pub struct ClickBucketPrep {
+    pub ck_chunks: Vec<Vec<(u32, u32)>>,
+    pub bucket_base: Vec<u32>,
+    pub bucket_order: Vec<(usize, usize)>,
+    pub total_clicks: usize,
+    pub csr_off: Vec<u32>,
+}
 
 impl ClickCsr {
     pub fn with_capacity(user_cap: usize, click_cap: usize) -> Self {
@@ -731,8 +737,23 @@ impl ClickCsr {
             csr,
             data_ptr,
             data_len,
-            csr_off: vec![0u32; user_cap],
-            csr_end: vec![0u32; user_cap],
+            csr_off: vec![0u32; user_cap + 1],
+            user_cap,
+        }
+    }
+
+    pub fn with_hugepages(user_cap: usize, click_cap: usize) -> Self {
+        let data_ptr = if click_cap == 0 {
+            std::ptr::null_mut()
+        } else {
+            crate::sys::map_zeroed_huge(click_cap * std::mem::size_of::<ClickSlot>())
+                as *mut ClickSlot
+        };
+        Self {
+            csr: Vec::new(),
+            data_ptr,
+            data_len: click_cap,
+            csr_off: vec![0u32; user_cap + 1],
             user_cap,
         }
     }
@@ -779,7 +800,7 @@ impl ClickCsr {
         cid_b36: u64,
         is_upper_k: bool,
     ) {
-        if click_idx < self.csr.len()
+        if click_idx < self.data_len
             && (user_idx as usize) < self.user_cap
             && (user_idx as usize) < (1 << 23)
             && (alias as usize) < MAX_FAST_ALIASES
@@ -791,18 +812,17 @@ impl ClickCsr {
                 | ((alias as u64) & 0xF);
             let user_or_cid =
                 VALID_BIT | (((user_idx as u64) & 0x7F_FFFF) << 40) | (cid_b36 & MASK40);
-            let p = self.csr.as_ptr().add(click_idx) as *const AtomicU64;
+            let p = self.data_ptr.add(click_idx) as *const AtomicU64;
             (*p).store(key_and_alias, Relaxed);
             (*p.add(1)).store(user_or_cid, Relaxed);
         }
     }
 
     /// Verifies that `u` is non-decreasing across occupied slots in `csr`, replaces `user_or_cid`
-    /// with `scramble40(click_idx, click_key)`, builds `csr_off`/`csr_end` (compacting any
+    /// with `scramble40(click_idx, click_key)`, builds `csr_off` (compacting any
     /// unoccupied gaps in-place), and sorts every user's click slice using the fast bitonic sorter.
     pub fn finalize_and_sort(&mut self, click_key: u64) -> bool {
         self.csr_off.fill(0);
-        self.csr_end.fill(0);
         let mut prev_u_opt: Option<usize> = None;
         let mut u_start = 0usize;
         let mut write_idx = 0usize;
@@ -818,6 +838,7 @@ impl ClickCsr {
             }
             match prev_u_opt {
                 None => {
+                    self.csr_off[..=u].fill(0);
                     prev_u_opt = Some(u);
                 }
                 Some(pu) if u != pu => {
@@ -825,10 +846,10 @@ impl ClickCsr {
                         return false;
                     }
                     self.csr_off[pu] = u_start as u32;
-                    self.csr_end[pu] = write_idx as u32;
                     if write_idx - u_start > 1 {
                         sort_click_slice(&mut self.csr[u_start..write_idx]);
                     }
+                    self.csr_off[(pu + 1)..=u].fill(write_idx as u32);
                     u_start = write_idx;
                     prev_u_opt = Some(u);
                 }
@@ -842,24 +863,23 @@ impl ClickCsr {
         }
         if let Some(last_u) = prev_u_opt {
             self.csr_off[last_u] = u_start as u32;
-            self.csr_end[last_u] = write_idx as u32;
             if write_idx - u_start > 1 {
                 sort_click_slice(&mut self.csr[u_start..write_idx]);
             }
+            self.csr_off[(last_u + 1)..=self.user_cap].fill(write_idx as u32);
         }
         true
     }
 
-    /// Single-pass in-place parallel compaction, `csr_off`/`csr_end` construction, and L1-hot
+    /// Single-pass in-place parallel compaction, single `csr_off` construction, and L1-hot
     /// click slice sorting across `threads` (zero extra `ClickSlot` allocation).
     /// Reads `(user_idx, cid_b36)` directly from `user_or_cid` (`VALID_BIT | (user_idx << 40) | cid_b36`).
     pub fn finalize_and_sort_par(&mut self, _click_key: u64, threads: usize) -> bool {
         use std::sync::atomic::AtomicU32;
-        let n = self.csr.len();
+        let n = self.data_len;
         let user_cap = self.user_cap;
         if user_cap == 0 || n == 0 {
             self.csr_off.fill(0);
-            self.csr_end.fill(0);
             self.csr.clear();
             self.data_ptr = self.csr.as_mut_ptr();
             self.data_len = 0;
@@ -871,41 +891,45 @@ impl ClickCsr {
         // 1. Find user-aligned cut points in parallel so no user's clicks span two ranges.
         let cuts_atomic: Vec<AtomicUsize> = (0..=num_ranges).map(|_| AtomicUsize::new(0)).collect();
         cuts_atomic[num_ranges].store(n, Relaxed);
-        let csr_ref = &self.csr;
+        let csr_ro_ptr = self.data_ptr as usize;
         let next_cut = AtomicUsize::new(1);
-        crate::sys::par(threads, |_| loop {
-            let p = next_cut.fetch_add(1, Relaxed);
-            if p >= num_ranges {
-                break;
-            }
-            let start = p * n / num_ranges;
-            let mut idx = start;
-            while idx < n && !csr_ref[idx].is_valid_parsed() {
-                idx += 1;
-            }
-            if idx >= n {
-                cuts_atomic[p].store(n, Relaxed);
-                continue;
-            }
-            let u0 = ((csr_ref[idx].user_or_cid >> 40) & 0x7F_FFFF) as usize;
-            idx += 1;
-            while idx < n {
-                let s = csr_ref[idx];
-                if s.is_valid_parsed() && (((s.user_or_cid >> 40) & 0x7F_FFFF) as usize) != u0 {
+        crate::sys::par(threads, |_| {
+            let csr_ref = unsafe { std::slice::from_raw_parts(csr_ro_ptr as *const ClickSlot, n) };
+            loop {
+                let p = next_cut.fetch_add(1, Relaxed);
+                if p >= num_ranges {
                     break;
                 }
+                let start = p * n / num_ranges;
+                let mut idx = start;
+                while idx < n && !csr_ref[idx].is_valid_parsed() {
+                    idx += 1;
+                }
+                if idx >= n {
+                    cuts_atomic[p].store(n, Relaxed);
+                    continue;
+                }
+                let u0 = ((csr_ref[idx].user_or_cid >> 40) & 0x7F_FFFF) as usize;
                 idx += 1;
+                while idx < n {
+                    let s = csr_ref[idx];
+                    if s.is_valid_parsed() && (((s.user_or_cid >> 40) & 0x7F_FFFF) as usize) != u0 {
+                        break;
+                    }
+                    idx += 1;
+                }
+                cuts_atomic[p].store(idx, Relaxed);
             }
-            cuts_atomic[p].store(idx, Relaxed);
         });
         let cuts: Vec<usize> = cuts_atomic.iter().map(|a| a.load(Relaxed)).collect();
 
-        // 2. Single-pass in-place compaction + `csr_off`/`csr_end` + L1-hot sort in disjoint ranges.
+        // 2. Single-pass in-place compaction + `csr_off` + L1-hot sort in disjoint ranges.
         //    Whales (`len > 2048`) are deferred to a parallel sort step right below.
         #[derive(Clone, Copy, Default)]
         struct RangeCheck {
             first_u: usize,
             last_u: usize,
+            end_write: usize,
             has_any: bool,
             ok: bool,
         }
@@ -913,16 +937,14 @@ impl ClickCsr {
         let mut range_whales: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_ranges];
         let checks_ptr = checks.as_mut_ptr() as usize;
         let range_whales_ptr = range_whales.as_mut_ptr() as usize;
-        let csr_ptr = self.csr.as_mut_ptr() as usize;
+        let csr_ptr = self.data_ptr as usize;
         let off_ptr = self.csr_off.as_mut_ptr() as usize;
-        let end_ptr = self.csr_end.as_mut_ptr() as usize;
         let cuts_ref = &cuts;
         let next_r = AtomicUsize::new(0);
 
         crate::sys::par(threads, |_| {
             let csr_base = csr_ptr as *mut ClickSlot;
             let off_base = off_ptr as *const AtomicU32;
-            let end_base = end_ptr as *const AtomicU32;
             loop {
                 let r = next_r.fetch_add(1, Relaxed);
                 if r >= num_ranges {
@@ -950,16 +972,13 @@ impl ClickCsr {
                     match prev_u_opt {
                         None => {
                             first_u = u;
+                            unsafe { (*off_base.add(u)).store(u_start as u32, Relaxed) };
                             prev_u_opt = Some(u);
                         }
                         Some(pu) if u != pu => {
                             if u < pu {
                                 ok = false;
                                 break;
-                            }
-                            unsafe {
-                                (*off_base.add(pu)).store(u_start as u32, Relaxed);
-                                (*end_base.add(pu)).store(write_idx as u32, Relaxed);
                             }
                             let len = write_idx - u_start;
                             if len > 2048 {
@@ -969,6 +988,9 @@ impl ClickCsr {
                                     std::slice::from_raw_parts_mut(csr_base.add(u_start), len)
                                 };
                                 sort_click_slice(slice);
+                            }
+                            for gap_u in (pu + 1)..=u {
+                                unsafe { (*off_base.add(gap_u)).store(write_idx as u32, Relaxed) };
                             }
                             u_start = write_idx;
                             prev_u_opt = Some(u);
@@ -985,11 +1007,7 @@ impl ClickCsr {
                 }
 
                 if ok {
-                    if let Some(last_u) = prev_u_opt {
-                        unsafe {
-                            (*off_base.add(last_u)).store(u_start as u32, Relaxed);
-                            (*end_base.add(last_u)).store(write_idx as u32, Relaxed);
-                        }
+                    if let Some(_last_u) = prev_u_opt {
                         let len = write_idx - u_start;
                         if len > 2048 {
                             local_whales.push((u_start, write_idx));
@@ -1006,6 +1024,7 @@ impl ClickCsr {
                     *(checks_ptr as *mut RangeCheck).add(r) = RangeCheck {
                         first_u,
                         last_u: prev_u_opt.unwrap_or(0),
+                        end_write: write_idx,
                         has_any: prev_u_opt.is_some(),
                         ok,
                     };
@@ -1017,7 +1036,9 @@ impl ClickCsr {
         });
 
         let mut prev_last_u: Option<usize> = None;
-        for &c in &checks {
+        let mut compact_pos = 0usize;
+        let mut all_whales: Vec<(usize, usize)> = Vec::new();
+        for (r, &c) in checks.iter().enumerate() {
             if !c.ok {
                 return false;
             }
@@ -1026,18 +1047,41 @@ impl ClickCsr {
                     if c.first_u <= pl {
                         return false;
                     }
+                    self.csr_off[(pl + 1)..c.first_u].fill(compact_pos as u32);
+                } else {
+                    self.csr_off[..c.first_u].fill(0);
                 }
+                let raw_start = cuts[r];
+                let len = c.end_write - raw_start;
+                if compact_pos != raw_start {
+                    let delta = raw_start - compact_pos;
+                    unsafe {
+                        std::ptr::copy(
+                            self.data_ptr.add(raw_start),
+                            self.data_ptr.add(compact_pos),
+                            len,
+                        );
+                    }
+                    for u in c.first_u..=c.last_u {
+                        self.csr_off[u] -= delta as u32;
+                    }
+                    for (s, e) in &mut range_whales[r] {
+                        *s -= delta;
+                        *e -= delta;
+                    }
+                }
+                all_whales.extend_from_slice(&range_whales[r]);
                 prev_last_u = Some(c.last_u);
+                compact_pos += len;
             }
+        }
+        if let Some(pl) = prev_last_u {
+            self.csr_off[(pl + 1)..=user_cap].fill(compact_pos as u32);
+        } else {
+            self.csr_off.fill(0);
         }
 
         // 3. Parallel sort for any whale user slices (`len > 2048`).
-        let mut all_whales: Vec<(usize, usize)> = Vec::new();
-        for rw in &mut range_whales {
-            if !rw.is_empty() {
-                all_whales.append(rw);
-            }
-        }
         if !all_whales.is_empty() {
             let next_w = AtomicUsize::new(0);
             let whales_ref = &all_whales;
@@ -1058,9 +1102,7 @@ impl ClickCsr {
 
     fn finalize_offsets(&mut self, click_key: u64) -> bool {
         self.csr_off.fill(0);
-        self.csr_end.fill(0);
         let mut prev_u_opt: Option<usize> = None;
-        let mut u_start = 0usize;
         let mut write_idx = 0usize;
         for click_idx in 0..self.csr.len() {
             let slot = self.csr[click_idx];
@@ -1072,14 +1114,15 @@ impl ClickCsr {
                 return false;
             }
             match prev_u_opt {
-                None => prev_u_opt = Some(u),
+                None => {
+                    self.csr_off[..=u].fill(0);
+                    prev_u_opt = Some(u);
+                }
                 Some(pu) if u != pu => {
                     if u < pu {
                         return false;
                     }
-                    self.csr_off[pu] = u_start as u32;
-                    self.csr_end[pu] = write_idx as u32;
-                    u_start = write_idx;
+                    self.csr_off[(pu + 1)..=u].fill(write_idx as u32);
                     prev_u_opt = Some(u);
                 }
                 _ => {}
@@ -1091,8 +1134,7 @@ impl ClickCsr {
             write_idx += 1;
         }
         if let Some(last_u) = prev_u_opt {
-            self.csr_off[last_u] = u_start as u32;
-            self.csr_end[last_u] = write_idx as u32;
+            self.csr_off[(last_u + 1)..=self.user_cap].fill(write_idx as u32);
         }
         true
     }
@@ -1100,15 +1142,279 @@ impl ClickCsr {
     #[inline(always)]
     pub fn csr_slice(&self, user_idx: usize) -> &[ClickSlot] {
         let start = self.csr_off[user_idx] as usize;
-        let end = self.csr_end[user_idx] as usize;
+        let end = self.csr_off[user_idx + 1] as usize;
         unsafe { &std::slice::from_raw_parts(self.data_ptr, self.data_len)[start..end] }
     }
 
-    /// Builds a sorted `ClickCsr` in one parallel counting-sort pass over 128 cache-line-aligned
-    /// cyclic user buckets (`bucket = (user_idx >> 4) & 127`) scattered into `ck_arena`, allocating its own `Vec`.
-    pub unsafe fn from_bucketed_arena_par(
+    pub fn prepare_contiguous_buckets_linked(
+        ck_arena: &crate::fast_arena::LinkedChunkArena<ClickSlot>,
+        ck_shift: u32,
+        user_cap: usize,
+        out_cap: usize,
+    ) -> ClickBucketPrep {
+        let num_buckets = ck_arena.num_parts();
+        let mut bucket_base = Vec::with_capacity(num_buckets + 1);
+        let mut bucket_order: Vec<(usize, usize)> = Vec::with_capacity(num_buckets);
+        let mut csr_off = vec![0u32; user_cap + 1];
+        let mut total_clicks = 0usize;
+        for b in 0..num_buckets {
+            let base_u32 = total_clicks as u32;
+            bucket_base.push(base_u32);
+            let mut cnt = 0usize;
+            for chunk in ck_arena.chunks(b) {
+                cnt += chunk.len();
+            }
+            total_clicks += cnt;
+            if cnt > 0 {
+                bucket_order.push((cnt, b));
+            } else {
+                let u0 = b << ck_shift;
+                if u0 < user_cap {
+                    let u1 = ((b + 1) << ck_shift).min(user_cap);
+                    csr_off[u0..u1].fill(base_u32);
+                }
+            }
+        }
+        bucket_base.push(total_clicks as u32);
+        csr_off[user_cap] = total_clicks as u32;
+        if total_clicks > 0 && user_cap > 0 {
+            assert!(total_clicks <= out_cap, "ClickCsr output buffer overflow");
+            bucket_order.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        } else {
+            bucket_order.clear();
+        }
+        ClickBucketPrep {
+            ck_chunks: Vec::new(),
+            bucket_base,
+            bucket_order,
+            total_clicks,
+            csr_off,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn sort_bucket_users(
+        off_base: *const std::sync::atomic::AtomicU32,
+        out_base: *mut ClickSlot,
+        u0: usize,
+        u_len: usize,
+        counts: &[u32],
+        local_whales: &mut Vec<(usize, usize)>,
+    ) {
+        for lu in 0..u_len {
+            let start = (*off_base.add(u0 + lu)).load(Relaxed) as usize;
+            let end = counts[lu] as usize;
+            let len = end - start;
+            if len > 2048 {
+                local_whales.push((start, end));
+            } else if len > 1 {
+                let slice = std::slice::from_raw_parts_mut(out_base.add(start), len);
+                sort_click_slice(slice);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub unsafe fn process_contiguous_bucket_linked(
+        prep: &ClickBucketPrep,
+        job_idx: usize,
+        ck_arena: &crate::fast_arena::LinkedChunkArena<ClickSlot>,
+        out_base: *mut ClickSlot,
+        ck_shift: u32,
+        user_cap: usize,
+        counts: &mut [u32],
+        local_whales: &mut Vec<(usize, usize)>,
+    ) {
+        use std::sync::atomic::AtomicU32;
+        let b = prep.bucket_order[job_idx].1;
+        let u0 = b << ck_shift;
+        if u0 >= user_cap {
+            return;
+        }
+        let max_u_len = 1usize << ck_shift;
+        let u_len = (user_cap - u0).min(max_u_len);
+        let off_base = prep.csr_off.as_ptr() as *const AtomicU32;
+
+        counts[..u_len].fill(0);
+        for chunk in ck_arena.chunks(b) {
+            for slot in chunk.as_slice() {
+                let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
+                counts[u - u0] += 1;
+            }
+        }
+
+        let mut pos = prep.bucket_base[b];
+        for lu in 0..u_len {
+            let c = counts[lu];
+            (*off_base.add(u0 + lu)).store(pos, Relaxed);
+            counts[lu] = pos;
+            pos += c;
+        }
+
+        for chunk in ck_arena.chunks(b) {
+            for slot in chunk.as_slice() {
+                let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
+                let lu = u - u0;
+                let dst = counts[lu] as usize;
+                counts[lu] = (dst + 1) as u32;
+                *out_base.add(dst) = ClickSlot {
+                    key_and_alias: slot.key_and_alias,
+                    user_or_cid: slot.user_or_cid & MASK40,
+                };
+            }
+        }
+
+        Self::sort_bucket_users(off_base, out_base, u0, u_len, counts, local_whales);
+    }
+
+    pub fn prepare_contiguous_buckets(
+        ck_chunks: Vec<Vec<(u32, u32)>>,
+        ck_shift: u32,
+        user_cap: usize,
+        out_cap: usize,
+    ) -> ClickBucketPrep {
+        let num_buckets = ck_chunks.len();
+        let mut bucket_base = Vec::with_capacity(num_buckets + 1);
+        let mut bucket_order: Vec<(usize, usize)> = Vec::with_capacity(num_buckets);
+        let mut csr_off = vec![0u32; user_cap + 1];
+        let mut total_clicks = 0usize;
+        for (b, chunks) in ck_chunks.iter().enumerate() {
+            let base_u32 = total_clicks as u32;
+            bucket_base.push(base_u32);
+            let cnt: usize = chunks.iter().map(|c| c.1 as usize).sum();
+            total_clicks += cnt;
+            if cnt > 0 {
+                bucket_order.push((cnt, b));
+            } else {
+                let u0 = b << ck_shift;
+                if u0 < user_cap {
+                    let u1 = ((b + 1) << ck_shift).min(user_cap);
+                    csr_off[u0..u1].fill(base_u32);
+                }
+            }
+        }
+        bucket_base.push(total_clicks as u32);
+        csr_off[user_cap] = total_clicks as u32;
+        if total_clicks > 0 && user_cap > 0 {
+            assert!(total_clicks <= out_cap, "ClickCsr output buffer overflow");
+            bucket_order.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        } else {
+            bucket_order.clear();
+        }
+        ClickBucketPrep {
+            ck_chunks,
+            bucket_base,
+            bucket_order,
+            total_clicks,
+            csr_off,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub unsafe fn process_contiguous_bucket(
+        prep: &ClickBucketPrep,
+        job_idx: usize,
         arena_base: *const ClickSlot,
-        ck_chunks: &[Vec<(u32, u32)>],
+        out_base: *mut ClickSlot,
+        ck_shift: u32,
+        user_cap: usize,
+        counts: &mut [u32],
+        local_whales: &mut Vec<(usize, usize)>,
+    ) {
+        use std::sync::atomic::AtomicU32;
+        let b = prep.bucket_order[job_idx].1;
+        let u0 = b << ck_shift;
+        if u0 >= user_cap {
+            return;
+        }
+        let max_u_len = 1usize << ck_shift;
+        let u_len = (user_cap - u0).min(max_u_len);
+        let chunks = &prep.ck_chunks[b];
+        let off_base = prep.csr_off.as_ptr() as *const AtomicU32;
+
+        counts[..u_len].fill(0);
+        for &(first, count) in chunks {
+            let sl = std::slice::from_raw_parts(arena_base.add(first as usize), count as usize);
+            for slot in sl {
+                let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
+                counts[u - u0] += 1;
+            }
+        }
+
+        let mut pos = prep.bucket_base[b];
+        for lu in 0..u_len {
+            let c = counts[lu];
+            (*off_base.add(u0 + lu)).store(pos, Relaxed);
+            counts[lu] = pos;
+            pos += c;
+        }
+
+        for &(first, count) in chunks {
+            let sl = std::slice::from_raw_parts(arena_base.add(first as usize), count as usize);
+            for slot in sl {
+                let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
+                let lu = u - u0;
+                let dst = counts[lu] as usize;
+                counts[lu] = (dst + 1) as u32;
+                *out_base.add(dst) = ClickSlot {
+                    key_and_alias: slot.key_and_alias,
+                    user_or_cid: slot.user_or_cid & MASK40,
+                };
+            }
+        }
+
+        Self::sort_bucket_users(off_base, out_base, u0, u_len, counts, local_whales);
+    }
+
+    pub unsafe fn finish_contiguous_buckets(
+        mut prep: ClickBucketPrep,
+        out_base: *mut ClickSlot,
+        user_cap: usize,
+        all_whales: &[(usize, usize)],
+        threads: usize,
+    ) -> Self {
+        if prep.total_clicks == 0 || user_cap == 0 {
+            return Self {
+                csr: Vec::new(),
+                data_ptr: out_base,
+                data_len: 0,
+                csr_off: prep.csr_off,
+                user_cap,
+            };
+        }
+        if !all_whales.is_empty() {
+            let csr_ptr = out_base as usize;
+            let next_w = AtomicUsize::new(0);
+            crate::sys::par(threads.max(1), |_| {
+                let csr_base = csr_ptr as *mut ClickSlot;
+                loop {
+                    let wi = next_w.fetch_add(1, Relaxed);
+                    let Some(&(s, e)) = all_whales.get(wi) else {
+                        break;
+                    };
+                    let slice = std::slice::from_raw_parts_mut(csr_base.add(s), e - s);
+                    sort_click_slice(slice);
+                }
+            });
+        }
+        prep.csr_off[user_cap] = prep.total_clicks as u32;
+        Self {
+            csr: Vec::new(),
+            data_ptr: out_base,
+            data_len: prep.total_clicks,
+            csr_off: prep.csr_off,
+            user_cap,
+        }
+    }
+
+    /// Builds a sorted `ClickCsr` in one parallel counting-sort pass over contiguous user
+    /// buckets (`bucket = user_idx >> ck_shift`) scattered into `ck_arena`, allocating its own `Vec`.
+    pub unsafe fn from_contiguous_arena_par(
+        arena_base: *const ClickSlot,
+        ck_chunks: Vec<Vec<(u32, u32)>>,
+        ck_shift: u32,
         user_cap: usize,
         threads: usize,
     ) -> Self {
@@ -1119,9 +1425,10 @@ impl ClickCsr {
         let mut csr: Vec<ClickSlot> = Vec::with_capacity(total_clicks);
         csr.set_len(total_clicks);
         let ptr = csr.as_mut_ptr();
-        let mut res = Self::from_bucketed_arena_into(
+        let mut res = Self::from_contiguous_arena_into(
             arena_base,
             ck_chunks,
+            ck_shift,
             user_cap,
             threads,
             ptr,
@@ -1131,140 +1438,58 @@ impl ClickCsr {
         res
     }
 
-    /// Builds a sorted `ClickCsr` in one parallel counting-sort pass over 128 cache-line-aligned
-    /// cyclic user buckets (`bucket = (user_idx >> 4) & 127`, `lu = ((user_idx >> 11) << 4) | (user_idx & 15)`)
-    /// into caller-provided pre-populated hugepage memory.
-    pub unsafe fn from_bucketed_arena_into(
+    /// Builds a sorted `ClickCsr` in one parallel counting-sort pass over contiguous user
+    /// buckets (`bucket = user_idx >> ck_shift`) scattered into `ck_arena`, writing into
+    /// pre-populated hugepage memory using a single `csr_off` (`user_cap + 1`).
+    pub unsafe fn from_contiguous_arena_into(
         arena_base: *const ClickSlot,
-        ck_chunks: &[Vec<(u32, u32)>],
+        ck_chunks: Vec<Vec<(u32, u32)>>,
+        ck_shift: u32,
         user_cap: usize,
         threads: usize,
         out_base: *mut ClickSlot,
         out_cap: usize,
     ) -> Self {
-        use std::sync::atomic::AtomicU32;
-        let num_buckets = ck_chunks.len();
-        debug_assert_eq!(num_buckets, 128);
-        let mut bucket_base = Vec::with_capacity(num_buckets + 1);
-        let mut bucket_sizes: Vec<(usize, usize)> = Vec::with_capacity(num_buckets);
-        let mut total_clicks = 0usize;
-        for (b, chunks) in ck_chunks.iter().enumerate() {
-            bucket_base.push(total_clicks as u32);
-            let cnt: usize = chunks.iter().map(|c| c.1 as usize).sum();
-            total_clicks += cnt;
-            if cnt > 0 {
-                bucket_sizes.push((cnt, b));
-            }
-        }
-        bucket_base.push(total_clicks as u32);
-
-        let mut csr_off = vec![0u32; user_cap];
-        let mut csr_end = vec![0u32; user_cap];
-        if total_clicks == 0 || user_cap == 0 {
+        let prep = Self::prepare_contiguous_buckets(ck_chunks, ck_shift, user_cap, out_cap);
+        if prep.total_clicks == 0 || user_cap == 0 {
             return Self {
                 csr: Vec::new(),
                 data_ptr: out_base,
                 data_len: 0,
-                csr_off,
-                csr_end,
+                csr_off: prep.csr_off,
                 user_cap,
             };
         }
-        assert!(total_clicks <= out_cap, "ClickCsr output buffer overflow");
-
-        bucket_sizes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-
-        let arena_ptr = arena_base as usize;
-        let csr_ptr = out_base as usize;
-        let off_ptr = csr_off.as_mut_ptr() as usize;
-        let end_ptr = csr_end.as_mut_ptr() as usize;
-        let base_ref = &bucket_base;
-        let order_ref = &bucket_sizes;
         let threads = threads.max(1);
-        let max_u_len = (user_cap.div_ceil(16 * 128) + 1) * 16;
+        let max_u_len = 1usize << ck_shift;
         let next_job = AtomicUsize::new(0);
         let worker_whales: Vec<std::sync::Mutex<Vec<(usize, usize)>>> =
             (0..threads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        let prep_ref = &prep;
+        let arena_ptr = arena_base as usize;
+        let out_ptr = out_base as usize;
+        let n_jobs = prep.bucket_order.len();
 
         crate::sys::par(threads, |tid| {
             let arena_base = arena_ptr as *const ClickSlot;
-            let csr_base = csr_ptr as *mut ClickSlot;
-            let off_base = off_ptr as *const AtomicU32;
-            let end_base = end_ptr as *const AtomicU32;
+            let out_base = out_ptr as *mut ClickSlot;
             let mut counts = vec![0u32; max_u_len];
             let mut local_whales: Vec<(usize, usize)> = Vec::new();
             loop {
                 let ji = next_job.fetch_add(1, Relaxed);
-                let Some(&(_, b)) = order_ref.get(ji) else {
+                if ji >= n_jobs {
                     break;
-                };
-                if (b << 4) >= user_cap {
-                    continue;
                 }
-                let max_local_chunk = ((user_cap - 1 - (b << 4)) >> 11) + 1;
-                let u_len = max_local_chunk << 4;
-                let chunks = &ck_chunks[b];
-
-                counts[..u_len].fill(0);
-                for &(first, count) in chunks {
-                    let sl = std::slice::from_raw_parts(arena_base.add(first as usize), count as usize);
-                    for slot in sl {
-                        let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
-                        let lu = ((u >> 11) << 4) | (u & 15);
-                        counts[lu] += 1;
-                    }
-                }
-
-                let mut pos = base_ref[b];
-                for lc in 0..max_local_chunk {
-                    let chunk_u0 = (lc << 11) | (b << 4);
-                    let chunk_n = (user_cap - chunk_u0).min(16);
-                    let lu_base = lc << 4;
-                    for lo in 0..chunk_n {
-                        let c = counts[lu_base + lo];
-                        if c != 0 {
-                            let u = chunk_u0 + lo;
-                            (*off_base.add(u)).store(pos, Relaxed);
-                            (*end_base.add(u)).store(pos + c, Relaxed);
-                            counts[lu_base + lo] = pos;
-                            pos += c;
-                        }
-                    }
-                }
-
-                for &(first, count) in chunks {
-                    let sl = std::slice::from_raw_parts(arena_base.add(first as usize), count as usize);
-                    for slot in sl {
-                        let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
-                        let lu = ((u >> 11) << 4) | (u & 15);
-                        let dst = counts[lu] as usize;
-                        counts[lu] = (dst + 1) as u32;
-                        *csr_base.add(dst) = ClickSlot {
-                            key_and_alias: slot.key_and_alias,
-                            user_or_cid: slot.user_or_cid & MASK40,
-                        };
-                    }
-                }
-
-                for lc in 0..max_local_chunk {
-                    let chunk_u0 = (lc << 11) | (b << 4);
-                    let chunk_n = (user_cap - chunk_u0).min(16);
-                    let lu_base = lc << 4;
-                    for lo in 0..chunk_n {
-                        let end = counts[lu_base + lo] as usize;
-                        if end == 0 {
-                            continue;
-                        }
-                        let start = (*off_base.add(chunk_u0 + lo)).load(Relaxed) as usize;
-                        let len = end - start;
-                        if len > 2048 {
-                            local_whales.push((start, end));
-                        } else if len > 1 {
-                            let slice = std::slice::from_raw_parts_mut(csr_base.add(start), len);
-                            sort_click_slice(slice);
-                        }
-                    }
-                }
+                Self::process_contiguous_bucket(
+                    prep_ref,
+                    ji,
+                    arena_base,
+                    out_base,
+                    ck_shift,
+                    user_cap,
+                    &mut counts,
+                    &mut local_whales,
+                );
             }
             if !local_whales.is_empty() {
                 *worker_whales[tid].lock().unwrap() = local_whales;
@@ -1275,30 +1500,7 @@ impl ClickCsr {
         for w in worker_whales {
             all_whales.extend(w.into_inner().unwrap());
         }
-        if !all_whales.is_empty() {
-            let next_w = AtomicUsize::new(0);
-            let whales_ref = &all_whales;
-            crate::sys::par(threads, |_| {
-                let csr_base = csr_ptr as *mut ClickSlot;
-                loop {
-                    let wi = next_w.fetch_add(1, Relaxed);
-                    let Some(&(s, e)) = whales_ref.get(wi) else {
-                        break;
-                    };
-                    let slice = std::slice::from_raw_parts_mut(csr_base.add(s), e - s);
-                    sort_click_slice(slice);
-                }
-            });
-        }
-
-        Self {
-            csr: Vec::new(),
-            data_ptr: out_base,
-            data_len: total_clicks,
-            csr_off,
-            csr_end,
-            user_cap,
-        }
+        Self::finish_contiguous_buckets(prep, out_base, user_cap, &all_whales, threads)
     }
 }
 
@@ -1377,13 +1579,17 @@ fn cas_slot(slice: &mut [ClickSlot], i: usize, j: usize) {
     }
 }
 
+#[inline(always)]
+fn use_avx512_sort() -> bool {
+    crate::unscramble::use_avx512()
+}
+
 /// Ultra-fast click slice sorter:
-/// - `n == 2, 3, 4`: optimal register comparison networks on `key_and_alias >> 4`.
-/// - `n <= 8` and `n <= 16`: SIMD bitonic sorting network (AVX-512 on Cascade Lake, AVX2 on Zen 3)
-///   packing `orig_idx (0..16)` into the low 4 bits of `(key_and_alias & !0xF) | orig_idx`.
-/// - `n > 16`: unstable sort on `key_and_alias >> 4`.
-/// - Post-pass: only invokes `fix_same_ts_ties` (base36 `click_id` comparison) when adjacent
-///   sorted clicks have identical `ts` and different `camp`.
+/// - `n == 2, 3, 4`: optimal register comparison networks on `sort_key60`.
+/// - `n <= 8`, `16`, `32`, `64`, `128`: SIMD bitonic sorting/merge networks (AVX-512 on Cascade Lake
+///   unless `SS_NO_AVX512`, AVX2 fallback).
+/// - `n > 128`: unstable sort on `sort_key60`.
+/// - Post-pass: single sequential pass in `fix_same_ts_ties` resolves any equal-`ts` campaign ties.
 #[inline(always)]
 pub fn sort_click_slice(slice: &mut [ClickSlot]) {
     let n = slice.len();
@@ -1417,7 +1623,11 @@ pub fn sort_click_slice(slice: &mut [ClickSlot]) {
         5..=8 => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                sort_clicks_le8_avx2(slice);
+                if use_avx512_sort() {
+                    sort_clicks_le8_avx512(slice);
+                } else {
+                    sort_clicks_le8_avx2(slice);
+                }
             }
             #[cfg(not(target_arch = "x86_64"))]
             slice.sort_unstable_by_key(|s| s.sort_key60());
@@ -1427,7 +1637,53 @@ pub fn sort_click_slice(slice: &mut [ClickSlot]) {
         9..=16 => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                sort_clicks_le16_avx2(slice);
+                if use_avx512_sort() {
+                    sort_clicks_le16_avx512(slice);
+                } else {
+                    sort_clicks_le16_avx2(slice);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            slice.sort_unstable_by_key(|s| s.sort_key60());
+            fix_same_ts_ties(slice);
+            return;
+        }
+        17..=32 => {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                if use_avx512_sort() {
+                    sort_clicks_le32_avx512(slice);
+                } else {
+                    sort_clicks_le32_avx2(slice);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            slice.sort_unstable_by_key(|s| s.sort_key60());
+            fix_same_ts_ties(slice);
+            return;
+        }
+        33..=64 => {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                if use_avx512_sort() {
+                    sort_clicks_le64_avx512(slice);
+                } else {
+                    sort_clicks_le64_avx2(slice);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            slice.sort_unstable_by_key(|s| s.sort_key60());
+            fix_same_ts_ties(slice);
+            return;
+        }
+        65..=128 => {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                if use_avx512_sort() {
+                    sort_clicks_le128_avx512(slice);
+                } else {
+                    sort_clicks_le128_avx2(slice);
+                }
             }
             #[cfg(not(target_arch = "x86_64"))]
             slice.sort_unstable_by_key(|s| s.sort_key60());
@@ -1661,6 +1917,324 @@ mod simd_bitonic {
             *slice.get_unchecked_mut(i) = orig[idx];
         }
     }
+
+    #[inline]
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    unsafe fn cas4_pair_kv_avx2(
+        k0: __m256i,
+        v0: __m256i,
+        k1: __m256i,
+        v1: __m256i,
+    ) -> (__m256i, __m256i, __m256i, __m256i) {
+        let sign = _mm256_set1_epi64x(SIGN64);
+        let gt = _mm256_cmpgt_epi64(_mm256_xor_si256(k0, sign), _mm256_xor_si256(k1, sign));
+        (
+            _mm256_blendv_epi8(k0, k1, gt),
+            _mm256_blendv_epi8(v0, v1, gt),
+            _mm256_blendv_epi8(k1, k0, gt),
+            _mm256_blendv_epi8(v1, v0, gt),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    unsafe fn cas4_kv_avx2(
+        k: __m256i,
+        v: __m256i,
+        perm_k: __m256i,
+        perm_v: __m256i,
+        max_mask: __m256i,
+    ) -> (__m256i, __m256i) {
+        let sign = _mm256_set1_epi64x(SIGN64);
+        let ks = _mm256_xor_si256(k, sign);
+        let pks = _mm256_xor_si256(perm_k, sign);
+        let gt = _mm256_cmpgt_epi64(ks, pks);
+        let lt = _mm256_cmpgt_epi64(pks, ks);
+        let take_p = _mm256_blendv_epi8(gt, lt, max_mask);
+        (
+            _mm256_blendv_epi8(k, perm_k, take_p),
+            _mm256_blendv_epi8(v, perm_v, take_p),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    unsafe fn sort4_kv_avx2(mut k: __m256i, mut v: __m256i) -> (__m256i, __m256i) {
+        let m13 = _mm256_setr_epi64x(0, -1, 0, -1);
+        let m23 = _mm256_setr_epi64x(0, 0, -1, -1);
+        let pk1 = _mm256_permute4x64_epi64::<0xB1>(k);
+        let pv1 = _mm256_permute4x64_epi64::<0xB1>(v);
+        (k, v) = cas4_kv_avx2(k, v, pk1, pv1, m13);
+        let pk2 = _mm256_permute4x64_epi64::<0x1B>(k);
+        let pv2 = _mm256_permute4x64_epi64::<0x1B>(v);
+        (k, v) = cas4_kv_avx2(k, v, pk2, pv2, m23);
+        let pk3 = _mm256_permute4x64_epi64::<0xB1>(k);
+        let pv3 = _mm256_permute4x64_epi64::<0xB1>(v);
+        cas4_kv_avx2(k, v, pk3, pv3, m13)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    unsafe fn merge4_kv_avx2(mut k: __m256i, mut v: __m256i) -> (__m256i, __m256i) {
+        let m13 = _mm256_setr_epi64x(0, -1, 0, -1);
+        let m23 = _mm256_setr_epi64x(0, 0, -1, -1);
+        let pk1 = _mm256_permute4x64_epi64::<0x4E>(k);
+        let pv1 = _mm256_permute4x64_epi64::<0x4E>(v);
+        (k, v) = cas4_kv_avx2(k, v, pk1, pv1, m23);
+        let pk2 = _mm256_permute4x64_epi64::<0xB1>(k);
+        let pv2 = _mm256_permute4x64_epi64::<0xB1>(v);
+        cas4_kv_avx2(k, v, pk2, pv2, m13)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    unsafe fn bitonic_sort_regs_avx2<const R: usize>(k: &mut [__m256i; R], v: &mut [__m256i; R]) {
+        for r in 0..R {
+            (k[r], v[r]) = sort4_kv_avx2(k[r], v[r]);
+        }
+        let mut half = 1usize;
+        while half < R {
+            let block = half * 2;
+            let mut base = 0usize;
+            while base < R {
+                for i in 0..half {
+                    let j = base + block - 1 - i;
+                    let kr = _mm256_permute4x64_epi64::<0x1B>(k[j]);
+                    let vr = _mm256_permute4x64_epi64::<0x1B>(v[j]);
+                    let (lo_k, lo_v, hi_k, hi_v) = cas4_pair_kv_avx2(k[base + i], v[base + i], kr, vr);
+                    k[base + i] = lo_k;
+                    v[base + i] = lo_v;
+                    k[j] = _mm256_permute4x64_epi64::<0x1B>(hi_k);
+                    v[j] = _mm256_permute4x64_epi64::<0x1B>(hi_v);
+                }
+                let mut stride = half >> 1;
+                while stride > 0 {
+                    let mut sub = base;
+                    while sub < base + block {
+                        for i in 0..stride {
+                            let (lo_k, lo_v, hi_k, hi_v) = cas4_pair_kv_avx2(
+                                k[sub + i],
+                                v[sub + i],
+                                k[sub + i + stride],
+                                v[sub + i + stride],
+                            );
+                            k[sub + i] = lo_k;
+                            v[sub + i] = lo_v;
+                            k[sub + i + stride] = hi_k;
+                            v[sub + i + stride] = hi_v;
+                        }
+                        sub += stride * 2;
+                    }
+                    stride >>= 1;
+                }
+                for r in base..(base + block) {
+                    (k[r], v[r]) = merge4_kv_avx2(k[r], v[r]);
+                }
+                base += block;
+            }
+            half = block;
+        }
+    }
+
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    unsafe fn sort_clicks_pow2_avx2<const N: usize, const R: usize>(slice: &mut [ClickSlot]) {
+        let n = slice.len();
+        let mut keys = [u64::MAX; N];
+        let mut idxs = [0u64; N];
+        let mut orig = [ClickSlot::default(); N];
+        for i in 0..n {
+            let s = *slice.get_unchecked(i);
+            orig[i] = s;
+            keys[i] = s.sort_key60();
+            idxs[i] = i as u64;
+        }
+        let mut kv = [_mm256_setzero_si256(); R];
+        let mut vv = [_mm256_setzero_si256(); R];
+        for r in 0..R {
+            kv[r] = _mm256_loadu_si256(keys.as_ptr().add(r * 4) as *const __m256i);
+            vv[r] = _mm256_loadu_si256(idxs.as_ptr().add(r * 4) as *const __m256i);
+        }
+        bitonic_sort_regs_avx2::<R>(&mut kv, &mut vv);
+        for r in 0..R {
+            _mm256_storeu_si256(idxs.as_mut_ptr().add(r * 4) as *mut __m256i, vv[r]);
+        }
+        for i in 0..n {
+            *slice.get_unchecked_mut(i) = orig[idxs[i] as usize];
+        }
+    }
+
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    pub unsafe fn sort_clicks_le32_avx2(slice: &mut [ClickSlot]) {
+        sort_clicks_pow2_avx2::<32, 8>(slice);
+    }
+
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    pub unsafe fn sort_clicks_le64_avx2(slice: &mut [ClickSlot]) {
+        sort_clicks_pow2_avx2::<64, 16>(slice);
+    }
+
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    pub unsafe fn sort_clicks_le128_avx2(slice: &mut [ClickSlot]) {
+        sort_clicks_pow2_avx2::<128, 32>(slice);
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn cas8_kv_avx512(
+        k: __m512i,
+        v: __m512i,
+        perm: __m512i,
+        max_mask: __mmask8,
+    ) -> (__m512i, __m512i) {
+        let pk = _mm512_permutexvar_epi64(perm, k);
+        let pv = _mm512_permutexvar_epi64(perm, v);
+        let gt = _mm512_cmp_epu64_mask(k, pk, _MM_CMPINT_NLE);
+        let lt = _mm512_cmp_epu64_mask(k, pk, _MM_CMPINT_LT);
+        let take_p = (!max_mask & gt) | (max_mask & lt);
+        (
+            _mm512_mask_mov_epi64(k, take_p, pk),
+            _mm512_mask_mov_epi64(v, take_p, pv),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn cas8_pair_kv_avx512(
+        k0: __m512i,
+        v0: __m512i,
+        k1: __m512i,
+        v1: __m512i,
+    ) -> (__m512i, __m512i, __m512i, __m512i) {
+        let gt = _mm512_cmp_epu64_mask(k0, k1, _MM_CMPINT_NLE);
+        (
+            _mm512_mask_mov_epi64(k0, gt, k1),
+            _mm512_mask_mov_epi64(v0, gt, v1),
+            _mm512_mask_mov_epi64(k1, gt, k0),
+            _mm512_mask_mov_epi64(v1, gt, v0),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn sort8_kv_avx512(mut k: __m512i, mut v: __m512i) -> (__m512i, __m512i) {
+        let p_d1 = _mm512_setr_epi64(1, 0, 3, 2, 5, 4, 7, 6);
+        let p_rev4 = _mm512_setr_epi64(3, 2, 1, 0, 7, 6, 5, 4);
+        let p_rev8 = _mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0);
+        let p_d2 = _mm512_setr_epi64(2, 3, 0, 1, 6, 7, 4, 5);
+
+        (k, v) = cas8_kv_avx512(k, v, p_d1, 0xAA);
+        (k, v) = cas8_kv_avx512(k, v, p_rev4, 0xCC);
+        (k, v) = cas8_kv_avx512(k, v, p_d1, 0xAA);
+        (k, v) = cas8_kv_avx512(k, v, p_rev8, 0xF0);
+        (k, v) = cas8_kv_avx512(k, v, p_d2, 0xCC);
+        cas8_kv_avx512(k, v, p_d1, 0xAA)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn merge8_kv_avx512(mut k: __m512i, mut v: __m512i) -> (__m512i, __m512i) {
+        let p_d4 = _mm512_setr_epi64(4, 5, 6, 7, 0, 1, 2, 3);
+        let p_d2 = _mm512_setr_epi64(2, 3, 0, 1, 6, 7, 4, 5);
+        let p_d1 = _mm512_setr_epi64(1, 0, 3, 2, 5, 4, 7, 6);
+
+        (k, v) = cas8_kv_avx512(k, v, p_d4, 0xF0);
+        (k, v) = cas8_kv_avx512(k, v, p_d2, 0xCC);
+        cas8_kv_avx512(k, v, p_d1, 0xAA)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn bitonic_sort_regs_avx512<const R: usize>(k: &mut [__m512i; R], v: &mut [__m512i; R]) {
+        for r in 0..R {
+            (k[r], v[r]) = sort8_kv_avx512(k[r], v[r]);
+        }
+        let p_rev8 = _mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0);
+        let mut half = 1usize;
+        while half < R {
+            let block = half * 2;
+            let mut base = 0usize;
+            while base < R {
+                for i in 0..half {
+                    let j = base + block - 1 - i;
+                    let kr = _mm512_permutexvar_epi64(p_rev8, k[j]);
+                    let vr = _mm512_permutexvar_epi64(p_rev8, v[j]);
+                    let (lo_k, lo_v, hi_k, hi_v) =
+                        cas8_pair_kv_avx512(k[base + i], v[base + i], kr, vr);
+                    k[base + i] = lo_k;
+                    v[base + i] = lo_v;
+                    k[j] = _mm512_permutexvar_epi64(p_rev8, hi_k);
+                    v[j] = _mm512_permutexvar_epi64(p_rev8, hi_v);
+                }
+                let mut stride = half >> 1;
+                while stride > 0 {
+                    let mut sub = base;
+                    while sub < base + block {
+                        for i in 0..stride {
+                            let (lo_k, lo_v, hi_k, hi_v) = cas8_pair_kv_avx512(
+                                k[sub + i],
+                                v[sub + i],
+                                k[sub + i + stride],
+                                v[sub + i + stride],
+                            );
+                            k[sub + i] = lo_k;
+                            v[sub + i] = lo_v;
+                            k[sub + i + stride] = hi_k;
+                            v[sub + i + stride] = hi_v;
+                        }
+                        sub += stride * 2;
+                    }
+                    stride >>= 1;
+                }
+                for r in base..(base + block) {
+                    (k[r], v[r]) = merge8_kv_avx512(k[r], v[r]);
+                }
+                base += block;
+            }
+            half = block;
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn sort_clicks_pow2_avx512<const N: usize, const R: usize>(slice: &mut [ClickSlot]) {
+        let n = slice.len();
+        let mut keys = [u64::MAX; N];
+        let mut idxs = [0u64; N];
+        let mut orig = [ClickSlot::default(); N];
+        for i in 0..n {
+            let s = *slice.get_unchecked(i);
+            orig[i] = s;
+            keys[i] = s.sort_key60();
+            idxs[i] = i as u64;
+        }
+        let mut kv = [_mm512_setzero_si512(); R];
+        let mut vv = [_mm512_setzero_si512(); R];
+        for r in 0..R {
+            kv[r] = _mm512_loadu_si512(keys.as_ptr().add(r * 8) as *const __m512i);
+            vv[r] = _mm512_loadu_si512(idxs.as_ptr().add(r * 8) as *const __m512i);
+        }
+        bitonic_sort_regs_avx512::<R>(&mut kv, &mut vv);
+        for r in 0..R {
+            _mm512_storeu_si512(idxs.as_mut_ptr().add(r * 8) as *mut __m512i, vv[r]);
+        }
+        for i in 0..n {
+            *slice.get_unchecked_mut(i) = orig[idxs[i] as usize];
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    pub unsafe fn sort_clicks_le32_avx512(slice: &mut [ClickSlot]) {
+        sort_clicks_pow2_avx512::<32, 4>(slice);
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    pub unsafe fn sort_clicks_le64_avx512(slice: &mut [ClickSlot]) {
+        sort_clicks_pow2_avx512::<64, 8>(slice);
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    pub unsafe fn sort_clicks_le128_avx512(slice: &mut [ClickSlot]) {
+        sort_clicks_pow2_avx512::<128, 16>(slice);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1739,9 +2313,9 @@ mod tests {
             rng
         };
 
-        // Test every click slice length from 0 to 25 across many random trials, including same-ts ties!
-        for len in 0..=25 {
-            for trial in 0..200 {
+        // Test every click slice length from 0 to 140 across random trials, including same-ts ties!
+        for len in (0..=40).chain([48, 63, 64, 65, 96, 127, 128, 129, 140]) {
+            for trial in 0..100 {
                 let mut slice = Vec::with_capacity(len);
                 for k in 0..len {
                     // Force timestamp ties frequently on even trials
@@ -1904,9 +2478,10 @@ mod tests {
             assert_eq!(tok_to_vec(actual_winner_tok), expected_winner_cid);
         }
 
-        // Test 128 cyclic bucketed arena counting-sort CSR builder across whales and 'K...' ties
+        // Test contiguous 4,096-user bucketed arena counting-sort CSR builder across whales and 'K...' ties
         let ck_user_cap = 20_000usize;
-        let num_ck_buckets = 128usize;
+        let ck_shift = 12u32;
+        let num_ck_buckets = ck_user_cap.div_ceil(1 << ck_shift);
         let ck_arena = crate::scatter::Arena::<ClickSlot>::new(16_384, 512);
         let mut sc0 = crate::scatter::Scatter::<ClickSlot, 4>::new();
         let mut sc1 = crate::scatter::Scatter::<ClickSlot, 4>::new();
@@ -1930,17 +2505,17 @@ mod tests {
                     sc1.push(&ck_arena, 0, slot);
                 }
             }
-            // User 17,000 in cyclic bucket (17_000 & 127) with tied ts between 'k' and 'K'
+            // User 17,000 in contiguous bucket (17_000 >> 12) with tied ts between 'k' and 'K'
             let s_low = ClickSlot::new_parsed_cased(500, 1, 0, 17_000, k_low, false);
             let s_up = ClickSlot::new_parsed_cased(500, 2, 0, 17_000, k_up, true);
-            sc0.push(&ck_arena, (17_000 >> 4) & 127, s_low);
-            sc1.push(&ck_arena, (17_000 >> 4) & 127, s_up);
+            sc0.push(&ck_arena, 17_000 >> ck_shift, s_low);
+            sc1.push(&ck_arena, 17_000 >> ck_shift, s_up);
             sc0.finish(&ck_arena);
             sc1.finish(&ck_arena);
         }
         let ck_chunks = crate::scatter::by_partition(&[&sc0.log, &sc1.log], num_ck_buckets);
         let b_csr = unsafe {
-            ClickCsr::from_bucketed_arena_par(ck_arena.base, &ck_chunks, ck_user_cap, 2)
+            ClickCsr::from_contiguous_arena_par(ck_arena.base, ck_chunks, ck_shift, ck_user_cap, 2)
         };
         assert_eq!(b_csr.csr_slice(0).len(), 2500);
         assert!(b_csr.csr_slice(0).windows(2).all(|w| w[0].ts() <= w[1].ts()));

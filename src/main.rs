@@ -1,6 +1,8 @@
 mod csv;
 mod diag;
 mod dims;
+pub mod fast_arena;
+pub mod fast_b36;
 pub mod fast_links;
 pub mod fast_parquet;
 pub mod fast_parse;

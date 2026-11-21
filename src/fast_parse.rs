@@ -12,7 +12,9 @@ use crate::dims;
 use crate::fast_links::encode_base36_token;
 use crate::ids::tok_pair;
 use crate::ts::{self, DateCache, DateLut, BAD, DAY_MS};
-use crate::unscramble::{unscramble40, unscramble40_x8_scalar, MASK40};
+use crate::unscramble::{
+    unscramble40, unscramble40_x8_avx512, unscramble40_x8_scalar, use_avx512, MASK40,
+};
 use crate::Shared;
 use std::arch::x86_64::*;
 
@@ -248,6 +250,38 @@ const UNQUOTED_ID_SHUF_HI: [u64; 10] = {
     t
 };
 
+/// Fast branchless SIMD dual-ID base36 decoder for unquoted canonical IDs of width `2..=9`.
+/// Both `p0` and `p1` must be readable for 16 bytes.
+#[inline(always)]
+pub unsafe fn decode_id_pair_unquoted(
+    p0: *const u8,
+    raw_w0: usize,
+    pref0: u8,
+    p1: *const u8,
+    raw_w1: usize,
+    pref1: u8,
+) -> Option<(u64, u64)> {
+    if raw_w0.wrapping_sub(2) > 7 || raw_w1.wrapping_sub(2) > 7 {
+        return None;
+    }
+    let raw0 = (p0.add(1) as *const u64).read_unaligned();
+    let raw1 = (p1.add(1) as *const u64).read_unaligned();
+    if (*p0 != pref0)
+        | (*p1 != pref1)
+        | ((raw_w0 > 2) & ((raw0 as u8) == b'0'))
+        | ((raw_w1 > 2) & ((raw1 as u8) == b'0'))
+    {
+        return None;
+    }
+    let v = _mm_set_epi64x(raw1 as i64, raw0 as i64);
+    let s0 = *UNQUOTED_ID_SHUF_LO.get_unchecked(raw_w0);
+    let s1 = *UNQUOTED_ID_SHUF_HI.get_unchecked(raw_w1);
+    let shuf = _mm_set_epi64x(s1 as i64, s0 as i64);
+    let is_pad = _mm_cmpgt_epi8(_mm_setzero_si128(), shuf);
+    let aligned = _mm_shuffle_epi8(v, shuf);
+    decode_b36_x2_aligned(aligned, is_pad)
+}
+
 /// Fast SIMD dual-ID base36 decoder using a branchless unquoted path (`2..=9` bytes)
 /// and `ID_SHUFFLE_LUT` fallback for quoted fields.
 /// Takes two raw field pointers `(p0, raw_w0, q0)` and `(p1, raw_w1, q1)` (either stripped or unstripped;
@@ -265,27 +299,8 @@ pub unsafe fn decode_id_pair_wq(
     q1: usize,
     pref1: u8,
 ) -> Option<(u64, u64)> {
-    // Fast branchless path for unquoted canonical IDs of width 2..=9 (eliminates length-8/9 mispredictions).
     if q0 == 0 && q1 == 0 {
-        if raw_w0.wrapping_sub(2) > 7 || raw_w1.wrapping_sub(2) > 7 {
-            return None;
-        }
-        if (*p0 != pref0)
-            | (*p1 != pref1)
-            | ((raw_w0 > 2) & (*p0.add(1) == b'0'))
-            | ((raw_w1 > 2) & (*p1.add(1) == b'0'))
-        {
-            return None;
-        }
-        let raw0 = (p0.add(1) as *const u64).read_unaligned();
-        let raw1 = (p1.add(1) as *const u64).read_unaligned();
-        let v = _mm_set_epi64x(raw1 as i64, raw0 as i64);
-        let s0 = *UNQUOTED_ID_SHUF_LO.get_unchecked(raw_w0);
-        let s1 = *UNQUOTED_ID_SHUF_HI.get_unchecked(raw_w1);
-        let shuf = _mm_set_epi64x(s1 as i64, s0 as i64);
-        let is_pad = _mm_cmpgt_epi8(_mm_setzero_si128(), shuf);
-        let aligned = _mm_shuffle_epi8(v, shuf);
-        return decode_b36_x2_aligned(aligned, is_pad);
+        return decode_id_pair_unquoted(p0, raw_w0, pref0, p1, raw_w1, pref1);
     }
 
     let idx0 = (raw_w0.min(15) << 1) | (q0 & 1);
@@ -534,27 +549,106 @@ unsafe fn parse_f3_13(p: *const u8) -> Option<u64> {
     Some((q & 0xFFFF_FFFF) * 100_000_000 + (q >> 32))
 }
 
-/// Looks up the 11-byte `YYYY-MM-DDT` prefix in the 1-entry register cache or `DateLut`.
-#[inline(always)]
-unsafe fn lookup_ymdt_cached(
-    p: *const u8,
-    lut: &DateLut,
-    cache: &mut (u64, u32, i32),
-) -> Option<i32> {
-    let d8 = (p as *const u64).read_unaligned();
-    let d4 = (p.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF;
-    if ((d8 ^ cache.0) | ((d4 ^ cache.1) as u64)) == 0 {
-        return Some(cache.2);
+#[inline]
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y, m as u32, d as u32)
+}
+
+/// Compact 512-byte (8 L1D cache lines) branchless date lookup table for up to 2 calendar
+/// `YYYY-MM-` prefixes across shuffled multi-week datasets.
+/// Unpopulated/invalid day slots hold `i32::MIN`.
+#[repr(C, align(64))]
+pub struct FastDateLut {
+    pub day_sec: [i32; 128],
+    pub ym0: u64,
+    pub ym1: u64,
+}
+
+impl FastDateLut {
+    pub fn new(window_start: i64, window_end: i64, base_s: i64) -> Self {
+        let mut lut = Self {
+            day_sec: [i32::MIN; 128],
+            ym0: u64::MAX,
+            ym1: u64::MAX,
+        };
+        let mut insert_range = |first_day: i64, last_day: i64, allow_new_month: bool| {
+            for day in first_day..=last_day {
+                let (y, m, d) = civil_from_days(day);
+                if !(0..=9999).contains(&y) {
+                    continue;
+                }
+                let rel = day * 86_400 - base_s;
+                if rel < i32::MIN as i64 + 1 || rel + 86_399 >= i32::MAX as i64 {
+                    continue;
+                }
+                let y = y as u32;
+                let ym = u64::from_le_bytes([
+                    b'0' + (y / 1000) as u8,
+                    b'0' + ((y / 100) % 10) as u8,
+                    b'0' + ((y / 10) % 10) as u8,
+                    b'0' + (y % 10) as u8,
+                    b'-',
+                    b'0' + (m / 10) as u8,
+                    b'0' + (m % 10) as u8,
+                    b'-',
+                ]);
+                let half = if ym == lut.ym0 {
+                    0usize
+                } else if ym == lut.ym1 {
+                    64usize
+                } else if allow_new_month && lut.ym0 == u64::MAX {
+                    lut.ym0 = ym;
+                    0usize
+                } else if allow_new_month && lut.ym1 == u64::MAX {
+                    lut.ym1 = ym;
+                    64usize
+                } else {
+                    continue;
+                };
+                let day_idx = (((d / 10) << 4) | (d % 10)) as usize;
+                lut.day_sec[half | day_idx] = rel as i32;
+            }
+        };
+
+        // Populate the active click+event window first so those months always claim ym0/ym1.
+        let p_first = (window_start - WEEK_MS).div_euclid(DAY_MS) - 1;
+        let p_last = (window_end - 1).div_euclid(DAY_MS) + 2;
+        insert_range(p_first, p_last, true);
+
+        let e_first = window_start.div_euclid(DAY_MS) - 9;
+        let e_last = (window_end - 1).div_euclid(DAY_MS) + 9;
+        insert_range(e_first, e_last, true);
+        lut
     }
-    let slot = _pext_u32((p.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
-    let entry = lut.0.get_unchecked(slot);
-    let e8 = (entry.ymdt.as_ptr() as *const u64).read_unaligned();
-    let e4 = (entry.ymdt.as_ptr().add(8) as *const u32).read_unaligned();
-    if ((d8 ^ e8) | ((d4 ^ e4) as u64)) != 0 {
-        return None;
+
+    /// Branchless lookup of 11-byte `YYYY-MM-DDT` prefix at `p`, returning `sec_rel` or `None`.
+    /// Requires at least 12 readable bytes at `p`.
+    #[inline(always)]
+    pub unsafe fn lookup_ymdt(&self, p: *const u8) -> Option<i32> {
+        let ym8 = (p as *const u64).read_unaligned();
+        let m0 = (ym8 == self.ym0) as usize;
+        let m1 = (ym8 == self.ym1) as usize;
+        let dt = (p.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF;
+        let z = dt ^ 0x0054_3030;
+        let bad_dt = (z | z.wrapping_add(0x0000_060C)) & 0x00FF_F0F0;
+        if ((m0 | m1) == 0) | (bad_dt != 0) {
+            return None;
+        }
+        let day_idx = (((z & 3) << 4) | ((z >> 8) & 0xF)) as usize;
+        let slot = (m1 << 6) | day_idx;
+        let sec_rel = *self.day_sec.get_unchecked(slot);
+        (sec_rel != i32::MIN).then_some(sec_rel)
     }
-    *cache = (d8, d4, entry.sec_rel);
-    Some(entry.sec_rel)
 }
 
 /// Parses 20-byte `YYYY-MM-DDTHH:MM:SSZ` via `DateLut` and SWAR `HH:MM:SS`.
@@ -573,36 +667,51 @@ unsafe fn parse_f1_swar_lut(p: *const u8, lut: &DateLut) -> Option<i32> {
     Some(entry.sec_rel + tod)
 }
 
-/// Parses 20-byte `YYYY-MM-DDTHH:MM:SSZ` with a 1-entry register-held date-prefix cache `(d8, d4, sec_rel)`.
-#[inline(always)]
-unsafe fn parse_f1_swar_lut_cached(
-    p: *const u8,
-    lut: &DateLut,
-    cache: &mut (u64, u32, i32),
-) -> Option<i32> {
-    let base_sec_rel = lookup_ymdt_cached(p, lut, cache)?;
-    let tod = parse_f1_swar_hms(p)?;
-    Some(base_sec_rel + tod)
-}
-
-/// Unified `F1 (20) / F2 (25) / F3 (13)` timestamp parser using the 1-entry `YYYY-MM-DDT` cache
-/// for both `F1` and `F2`, and direct `parse_f3_13` for 13-digit epoch ms, with cold `ts::parse_ts_rel` fallback.
-#[inline(always)]
-unsafe fn parse_ts_cached(
+#[cold]
+#[inline(never)]
+unsafe fn parse_f1_rel_fallback(
     p: *const u8,
     len: usize,
     lut: &DateLut,
     dc: &mut DateCache,
-    cache: &mut (u64, u32, i32),
+    base_s: i64,
+) -> i32 {
+    ts::parse_f1_rel(p, len, lut, dc, base_s)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn parse_ts_rel_fallback(
+    p: *const u8,
+    len: usize,
+    lut: &DateLut,
+    dc: &mut DateCache,
     base_ms: i64,
 ) -> i64 {
-    if len == 13 {
-        if let Some(v) = parse_f3_13(p) {
-            return v as i64 - base_ms;
-        }
-    } else if len == 20 || len == 25 {
-        if let (Some(base_sec_rel), Some(tod)) = (lookup_ymdt_cached(p, lut, cache), parse_swar_hms(p))
-        {
+    ts::parse_ts_rel(p, len, lut, dc, base_ms)
+}
+
+/// Parses 20-byte `YYYY-MM-DDTHH:MM:SSZ` via `FastDateLut` and SWAR `HH:MM:SS`.
+#[inline(always)]
+unsafe fn parse_f1_fast_lut(p: *const u8, fast_lut: &FastDateLut) -> Option<i32> {
+    let base_sec_rel = fast_lut.lookup_ymdt(p)?;
+    let tod = parse_f1_swar_hms(p)?;
+    Some(base_sec_rel + tod)
+}
+
+/// Unified `F1 (20) / F2 (25) / F3 (13)` timestamp parser using `FastDateLut`
+/// for both `F1` and `F2`, and direct `parse_f3_13` for 13-digit epoch ms, with cold `ts::parse_ts_rel` fallback.
+#[inline(always)]
+unsafe fn parse_ts_fast_lut(
+    p: *const u8,
+    len: usize,
+    fast_lut: &FastDateLut,
+    lut: &DateLut,
+    dc: &mut DateCache,
+    base_ms: i64,
+) -> i64 {
+    if (len == 20) | (len == 25) {
+        if let (Some(base_sec_rel), Some(tod)) = (fast_lut.lookup_ymdt(p), parse_swar_hms(p)) {
             if len == 20 {
                 if *p.add(19) == b'Z' {
                     return (base_sec_rel + tod) as i64 * 1000;
@@ -611,8 +720,12 @@ unsafe fn parse_ts_cached(
                 return (base_sec_rel + tod + off) as i64 * 1000;
             }
         }
+    } else if len == 13 {
+        if let Some(v) = parse_f3_13(p) {
+            return v as i64 - base_ms;
+        }
     }
-    ts::parse_ts_rel(p, len, lut, dc, base_ms)
+    parse_ts_rel_fallback(p, len, lut, dc, base_ms)
 }
 
 /// Fast timestamp parser with unquoted `F1/F2/F3` fast paths,
@@ -699,6 +812,46 @@ unsafe fn swar_dec_price(p: *const u8, len: usize) -> Option<u32> {
     ((1..=10_000_000).contains(&v)).then_some(v)
 }
 
+#[inline(always)]
+pub unsafe fn parse_ev_tail_unquoted(
+    p4: *const u8,
+    len4: usize,
+    p5: *const u8,
+    len5: usize,
+    p6: *const u8,
+    len6: usize,
+    sh: &Shared,
+) -> Option<u32> {
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+
+    if len5 == 0 {
+        return None;
+    }
+    match len4 {
+        4 => {
+            let ty = (p4 as *const u32).read_unaligned();
+            ((ty == VIEW) | (ty == CART)).then_some(0)
+        }
+        8 => {
+            if (p4 as *const u64).read_unaligned() != PURCHASE {
+                return None;
+            }
+            let price = match swar_dec_price(p6, len6) {
+                Some(v) => v,
+                None => match ts::digits(p6, len6) {
+                    Some(v) if (1..=10_000_000).contains(&v) => v as u32,
+                    _ => return None,
+                },
+            };
+            let cat = sh.product_cat(p5, len5);
+            Some(((cat as u32) << 24) | price)
+        }
+        _ => None,
+    }
+}
+
 /// Fast event_type + product_id + price_cents validator with **97% View/Cart Fast-Skip**:
 /// - Specializes `q4 == 0 && q5 == 0 && q6 == 0` (outer quotes already stripped by `csv::Reader`):
 ///   `view`/`cart` only checks `len4 == 4`, `len5 != 0`, and `ty == VIEW || ty == CART`.
@@ -723,30 +876,7 @@ pub unsafe fn parse_ev_tail_wq(
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 
     if q4 == 0 && q5 == 0 && q6 == 0 {
-        if raw_w5 == 0 {
-            return None;
-        }
-        return match raw_w4 {
-            4 => {
-                let ty = (p4 as *const u32).read_unaligned();
-                ((ty == VIEW) | (ty == CART)).then_some(0)
-            }
-            8 => {
-                if (p4 as *const u64).read_unaligned() != PURCHASE {
-                    return None;
-                }
-                let price = match swar_dec_price(p6, raw_w6) {
-                    Some(v) => v,
-                    None => match ts::digits(p6, raw_w6) {
-                        Some(v) if (1..=10_000_000).contains(&v) => v as u32,
-                        _ => return None,
-                    },
-                };
-                let cat = sh.product_cat(p5, raw_w5);
-                Some(((cat as u32) << 24) | price)
-            }
-            _ => None,
-        };
+        return parse_ev_tail_unquoted(p4, raw_w4, p5, raw_w5, p6, raw_w6, sh);
     }
 
     if (q4 != 0 && (raw_w4 < 2 || *p4 != b'"' || *p4.add(raw_w4 - 1) != b'"'))
@@ -799,36 +929,32 @@ pub unsafe fn parse_ev_tail_wq(
     }
 }
 
-/// Exact cold scalar fallback for a single event row (already stripped of outer quotes by `csv::Reader`
-/// or raw fields). Matches `main.rs::parse_events_impl` rule-for-rule.
+/// Exact cold scalar fallback for a single event row given stripped field pointers and lengths.
 #[cold]
 #[inline(never)]
-pub unsafe fn parse_event_row_cold(
+pub unsafe fn parse_event_row_cold_fields(
     sh: &Shared,
     dates: &mut DateCache,
-    buf: *const u8,
-    s: &[u32; 8],
-    e: &[u32; 8],
+    ptrs: [*const u8; 7],
+    lens: [usize; 7],
 ) -> Option<FallbackEvRec> {
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 
-    let at = |k: usize| buf.add(s[k] as usize);
-    let len = |k: usize| (e[k] - s[k]) as usize;
-    if len(0) == 0 {
+    if lens[0] == 0 {
         return None;
     }
-    let (event_tok, user_tok) = tok_pair(at(0), len(0), at(1), len(1));
+    let (event_tok, user_tok) = tok_pair(ptrs[0], lens[0], ptrs[1], lens[1]);
     let base_s = sh.base_ms.div_euclid(1000);
     let event_win_ms = (sh.window_end - sh.window_start) as u64;
 
     let mut rec = FallbackEvRec {
         event_tok,
         user_tok: 0,
-        eid_b36: crate::unscramble::decode_b36_ptr(at(0), len(0), b'e').unwrap_or(u64::MAX),
-        uid_b36: if len(1) > 0 {
-            crate::unscramble::decode_b36_ptr(at(1), len(1), b'u').unwrap_or(u64::MAX)
+        eid_b36: crate::unscramble::decode_b36_ptr(ptrs[0], lens[0], b'e').unwrap_or(u64::MAX),
+        uid_b36: if lens[1] > 0 {
+            crate::unscramble::decode_b36_ptr(ptrs[1], lens[1], b'u').unwrap_or(u64::MAX)
         } else {
             u64::MAX
         },
@@ -840,12 +966,12 @@ pub unsafe fn parse_event_row_cold(
 
     'valid: {
         let ts_u32 = if sh.use_rel {
-            let ingest_s_rel = ts::parse_f1_rel(at(3), len(3), &sh.date_lut, dates, base_s);
+            let ingest_s_rel = ts::parse_f1_rel(ptrs[3], lens[3], &sh.date_lut, dates, base_s);
             rec.ingest = ingest_s_rel;
-            if len(1) == 0 || len(5) == 0 || ingest_s_rel == i32::MAX {
+            if lens[1] == 0 || lens[5] == 0 || ingest_s_rel == i32::MAX {
                 break 'valid;
             }
-            let ts_rel = ts::parse_ts_rel(at(2), len(2), &sh.date_lut, dates, sh.base_ms);
+            let ts_rel = ts::parse_ts_rel(ptrs[2], lens[2], &sh.date_lut, dates, sh.base_ms);
             let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
             let late_bad =
                 (ingest_s_rel as i64).wrapping_mul(1000).wrapping_sub(ts_rel) > DAY_MS;
@@ -854,37 +980,37 @@ pub unsafe fn parse_event_row_cold(
             }
             ts_rel as u32
         } else {
-            let ingest_s = ts::parse_f1(at(3), len(3), dates);
+            let ingest_s = ts::parse_f1(ptrs[3], lens[3], dates);
             if ingest_s != BAD {
                 rec.ingest =
                     (ingest_s - base_s).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
             }
-            if len(1) == 0 || len(5) == 0 || ingest_s == BAD {
+            if lens[1] == 0 || lens[5] == 0 || ingest_s == BAD {
                 break 'valid;
             }
-            let t = ts::parse_ts(at(2), len(2), dates);
+            let t = ts::parse_ts(ptrs[2], lens[2], dates);
             if t < sh.window_start || t >= sh.window_end || ingest_s * 1000 - t > DAY_MS {
                 break 'valid;
             }
             (t - sh.base_ms) as u32
         };
 
-        match len(4) {
+        match lens[4] {
             4 => {
-                let ty = (at(4) as *const u32).read_unaligned();
+                let ty = (ptrs[4] as *const u32).read_unaligned();
                 if ty != VIEW && ty != CART {
                     break 'valid;
                 }
             }
             8 => {
-                if (at(4) as *const u64).read_unaligned() != PURCHASE {
+                if (ptrs[4] as *const u64).read_unaligned() != PURCHASE {
                     break 'valid;
                 }
-                let price = match ts::digits(at(6), len(6)) {
+                let price = match ts::digits(ptrs[6], lens[6]) {
                     Some(v) if (1..=10_000_000).contains(&v) => v as u32,
                     _ => break 'valid,
                 };
-                let category = sh.product_cat(at(5), len(5));
+                let category = sh.product_cat(ptrs[5], lens[5]);
                 rec.payload = (category as u32) << 24 | price;
             }
             _ => break 'valid,
@@ -894,6 +1020,89 @@ pub unsafe fn parse_event_row_cold(
         rec.valid = true;
     }
     Some(rec)
+}
+
+/// Exact cold scalar fallback for a single event row (already stripped of outer quotes by `csv::Reader`
+/// or raw fields). Matches `main.rs::parse_events_impl` rule-for-rule.
+#[cold]
+#[inline(never)]
+pub unsafe fn parse_event_row_cold(
+    sh: &Shared,
+    dates: &mut DateCache,
+    buf: *const u8,
+    s: &[u32; 8],
+    e: &[u32; 8],
+) -> Option<FallbackEvRec> {
+    let ptrs = [
+        buf.add(s[0] as usize),
+        buf.add(s[1] as usize),
+        buf.add(s[2] as usize),
+        buf.add(s[3] as usize),
+        buf.add(s[4] as usize),
+        buf.add(s[5] as usize),
+        buf.add(s[6] as usize),
+    ];
+    let lens = [
+        (e[0] - s[0]) as usize,
+        (e[1] - s[1]) as usize,
+        (e[2] - s[2]) as usize,
+        (e[3] - s[3]) as usize,
+        (e[4] - s[4]) as usize,
+        (e[5] - s[5]) as usize,
+        (e[6] - s[6]) as usize,
+    ];
+    parse_event_row_cold_fields(sh, dates, ptrs, lens)
+}
+
+/// Exact cold scalar fallback for a single click row given stripped field pointers and lengths.
+#[cold]
+#[inline(never)]
+pub unsafe fn parse_click_row_cold_fields(
+    sh: &Shared,
+    dates: &mut DateCache,
+    ptrs: [*const u8; 4],
+    lens: [usize; 4],
+) -> Option<FallbackCkRec> {
+    if lens[0] == 0 || lens[1] == 0 {
+        return None;
+    }
+    let click_win_ms = (sh.window_end - sh.base_ms) as u64;
+    let ts_u32 = if sh.use_rel {
+        let ts_rel = ts::parse_ts_rel(ptrs[3], lens[3], &sh.date_lut, dates, sh.base_ms);
+        if (ts_rel as u64) >= click_win_ms {
+            return None;
+        }
+        ts_rel as u32
+    } else {
+        let t = ts::parse_ts(ptrs[3], lens[3], dates);
+        if t < sh.base_ms || t >= sh.window_end {
+            return None;
+        }
+        (t - sh.base_ms) as u32
+    };
+    let campaign = sh.campaign_id(ptrs[2], lens[2])?;
+    let (click_tok, user_tok) = tok_pair(ptrs[0], lens[0], ptrs[1], lens[1]);
+    let mut is_upper_k = false;
+    let cid_b36 = match crate::unscramble::decode_b36_ptr(ptrs[0], lens[0], b'k') {
+        Some(v) => v,
+        None => match crate::unscramble::decode_upper_b36_ptr(ptrs[0], lens[0], b'K') {
+            Some(v) => {
+                is_upper_k = true;
+                v
+            }
+            None => u64::MAX,
+        },
+    };
+    let uid_b36 = crate::unscramble::decode_b36_ptr(ptrs[1], lens[1], b'u').unwrap_or(u64::MAX);
+    Some(FallbackCkRec {
+        click_tok,
+        user_tok,
+        cid_b36,
+        uid_b36,
+        ts: ts_u32,
+        campaign,
+        is_upper_k,
+    })
 }
 
 /// Exact cold scalar fallback for a single click row.
@@ -906,48 +1115,19 @@ pub unsafe fn parse_click_row_cold(
     s: &[u32; 8],
     e: &[u32; 8],
 ) -> Option<FallbackCkRec> {
-    let at = |k: usize| buf.add(s[k] as usize);
-    let len = |k: usize| (e[k] - s[k]) as usize;
-    if len(0) == 0 || len(1) == 0 {
-        return None;
-    }
-    let click_win_ms = (sh.window_end - sh.base_ms) as u64;
-    let ts_u32 = if sh.use_rel {
-        let ts_rel = ts::parse_ts_rel(at(3), len(3), &sh.date_lut, dates, sh.base_ms);
-        if (ts_rel as u64) >= click_win_ms {
-            return None;
-        }
-        ts_rel as u32
-    } else {
-        let t = ts::parse_ts(at(3), len(3), dates);
-        if t < sh.base_ms || t >= sh.window_end {
-            return None;
-        }
-        (t - sh.base_ms) as u32
-    };
-    let campaign = sh.campaign_id(at(2), len(2))?;
-    let (click_tok, user_tok) = tok_pair(at(0), len(0), at(1), len(1));
-    let mut is_upper_k = false;
-    let cid_b36 = match crate::unscramble::decode_b36_ptr(at(0), len(0), b'k') {
-        Some(v) => v,
-        None => match crate::unscramble::decode_upper_b36_ptr(at(0), len(0), b'K') {
-            Some(v) => {
-                is_upper_k = true;
-                v
-            }
-            None => u64::MAX,
-        },
-    };
-    let uid_b36 = crate::unscramble::decode_b36_ptr(at(1), len(1), b'u').unwrap_or(u64::MAX);
-    Some(FallbackCkRec {
-        click_tok,
-        user_tok,
-        cid_b36,
-        uid_b36,
-        ts: ts_u32,
-        campaign,
-        is_upper_k,
-    })
+    let ptrs = [
+        buf.add(s[0] as usize),
+        buf.add(s[1] as usize),
+        buf.add(s[2] as usize),
+        buf.add(s[3] as usize),
+    ];
+    let lens = [
+        (e[0] - s[0]) as usize,
+        (e[1] - s[1]) as usize,
+        (e[2] - s[2]) as usize,
+        (e[3] - s[3]) as usize,
+    ];
+    parse_click_row_cold_fields(sh, dates, ptrs, lens)
 }
 
 /// 64-row columnar batch of fast-parsed event rows ready for vectorized AVX2/AVX-512 unscrambling
@@ -1277,9 +1457,8 @@ fn make_fallback_lk(batch: &FastLkBatch, r: usize) -> FallbackLkRec {
 }
 
 /// Vectorized 64-row event batch classifier:
-/// Unscrambles `eid_b36` and `uid_b36` 8 at a time via ILP scalar `unscramble40_x8_scalar`,
-/// and partitions rows into `normal_out` (`valid && user_idx < user_cap && alias < 14 && event_idx < event_cap`)
-/// and `fallback_out` (all other rows).
+/// Unscrambles `eid_b36` and `uid_b36` 8 at a time via AVX-512DQ (when `use_avx512()` is enabled)
+/// or ILP scalar `unscramble40_x8_scalar`, and partitions rows into `normal_out` and `fallback_out`.
 pub fn classify_ev_batch(
     batch: &FastEvBatch,
     user_key: u64,
@@ -1289,6 +1468,20 @@ pub fn classify_ev_batch(
     normal_out: &mut Vec<NormalEvRec>,
     fallback_out: &mut Vec<FallbackEvRec>,
 ) {
+    if use_avx512() {
+        unsafe {
+            classify_ev_batch_avx512(
+                batch,
+                user_key,
+                event_key,
+                user_cap,
+                event_cap,
+                normal_out,
+                fallback_out,
+            );
+        }
+        return;
+    }
     classify_ev_batch_avx2(
         batch,
         user_key,
@@ -1300,7 +1493,8 @@ pub fn classify_ev_batch(
     );
 }
 
-pub fn classify_ev_batch_avx2(
+#[inline(always)]
+fn classify_ev_batch_with(
     batch: &FastEvBatch,
     user_key: u64,
     event_key: u64,
@@ -1308,17 +1502,18 @@ pub fn classify_ev_batch_avx2(
     event_cap: u64,
     normal_out: &mut Vec<NormalEvRec>,
     fallback_out: &mut Vec<FallbackEvRec>,
+    mut unscramble_x8: impl FnMut([u64; 8], u64) -> [u64; 8],
 ) {
     let n = batch.len;
     let mut i = 0;
     while i + 8 <= n {
         let m8 = (batch.canonical_valid_mask >> i) & 0xFF;
         if m8 == 0xFF {
-            let e_un = unscramble40_x8_scalar(
+            let e_un = unscramble_x8(
                 unsafe { *(batch.eid_b36.as_ptr().add(i) as *const [u64; 8]) },
                 event_key,
             );
-            let u_un = unscramble40_x8_scalar(
+            let u_un = unscramble_x8(
                 unsafe { *(batch.uid_b36.as_ptr().add(i) as *const [u64; 8]) },
                 user_key,
             );
@@ -1392,10 +1587,51 @@ pub fn classify_ev_batch_avx2(
     }
 }
 
-/// 64-row click batch classifier:
-/// Unscrambles `cid_b36` and `uid_b36` 8 at a time via `unscramble40_x8_scalar` and partitions into `normal_out`
-/// (`user_idx < user_cap && alias < 14 && click_idx < click_cap`) and `fallback_out`.
-pub fn classify_ck_batch(
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+pub unsafe fn classify_ev_batch_avx512(
+    batch: &FastEvBatch,
+    user_key: u64,
+    event_key: u64,
+    user_cap: u32,
+    event_cap: u64,
+    normal_out: &mut Vec<NormalEvRec>,
+    fallback_out: &mut Vec<FallbackEvRec>,
+) {
+    classify_ev_batch_with(
+        batch,
+        user_key,
+        event_key,
+        user_cap,
+        event_cap,
+        normal_out,
+        fallback_out,
+        |y, key| unscramble40_x8_avx512(y, key),
+    );
+}
+
+pub fn classify_ev_batch_avx2(
+    batch: &FastEvBatch,
+    user_key: u64,
+    event_key: u64,
+    user_cap: u32,
+    event_cap: u64,
+    normal_out: &mut Vec<NormalEvRec>,
+    fallback_out: &mut Vec<FallbackEvRec>,
+) {
+    classify_ev_batch_with(
+        batch,
+        user_key,
+        event_key,
+        user_cap,
+        event_cap,
+        normal_out,
+        fallback_out,
+        unscramble40_x8_scalar,
+    );
+}
+
+#[inline(always)]
+fn classify_ck_batch_with(
     batch: &FastCkBatch,
     user_key: u64,
     click_key: u64,
@@ -1403,15 +1639,16 @@ pub fn classify_ck_batch(
     click_cap: u64,
     normal_out: &mut Vec<NormalCkRec>,
     fallback_out: &mut Vec<FallbackCkRec>,
+    mut unscramble_x8: impl FnMut([u64; 8], u64) -> [u64; 8],
 ) {
     let n = batch.len;
     let mut i = 0;
     while i + 8 <= n {
-        let c_un = unscramble40_x8_scalar(
+        let c_un = unscramble_x8(
             unsafe { *(batch.cid_b36.as_ptr().add(i) as *const [u64; 8]) },
             click_key,
         );
-        let u_un = unscramble40_x8_scalar(
+        let u_un = unscramble_x8(
             unsafe { *(batch.uid_b36.as_ptr().add(i) as *const [u64; 8]) },
             user_key,
         );
@@ -1463,25 +1700,83 @@ pub fn classify_ck_batch(
     }
 }
 
-/// 64-row link batch classifier:
-/// Unscrambles `ua_b36` and `ub_b36` 8 at a time via `unscramble40_x8_scalar` and partitions into `normal_out`
-/// (`user_idx_a == user_idx_b && user_idx_a < user_cap && alias_a < 16 && alias_b < 16`)
-/// and `fallback_out` (chain users with `alias >= 16`, kiosk links with bit 39 set, or case variants).
-pub fn classify_lk_batch(
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+pub unsafe fn classify_ck_batch_avx512(
+    batch: &FastCkBatch,
+    user_key: u64,
+    click_key: u64,
+    user_cap: u32,
+    click_cap: u64,
+    normal_out: &mut Vec<NormalCkRec>,
+    fallback_out: &mut Vec<FallbackCkRec>,
+) {
+    classify_ck_batch_with(
+        batch,
+        user_key,
+        click_key,
+        user_cap,
+        click_cap,
+        normal_out,
+        fallback_out,
+        |y, key| unscramble40_x8_avx512(y, key),
+    );
+}
+
+/// 64-row click batch classifier:
+/// Unscrambles `cid_b36` and `uid_b36` 8 at a time via AVX-512DQ (when `use_avx512()` is enabled)
+/// or `unscramble40_x8_scalar` and partitions into `normal_out` and `fallback_out`.
+pub fn classify_ck_batch(
+    batch: &FastCkBatch,
+    user_key: u64,
+    click_key: u64,
+    user_cap: u32,
+    click_cap: u64,
+    normal_out: &mut Vec<NormalCkRec>,
+    fallback_out: &mut Vec<FallbackCkRec>,
+) {
+    if use_avx512() {
+        unsafe {
+            classify_ck_batch_avx512(
+                batch,
+                user_key,
+                click_key,
+                user_cap,
+                click_cap,
+                normal_out,
+                fallback_out,
+            );
+        }
+        return;
+    }
+    classify_ck_batch_with(
+        batch,
+        user_key,
+        click_key,
+        user_cap,
+        click_cap,
+        normal_out,
+        fallback_out,
+        unscramble40_x8_scalar,
+    );
+}
+
+#[inline(always)]
+fn classify_lk_batch_with(
     batch: &FastLkBatch,
     user_key: u64,
     user_cap: u32,
     normal_out: &mut Vec<NormalLkRec>,
     fallback_out: &mut Vec<FallbackLkRec>,
+    mut unscramble_x8: impl FnMut([u64; 8], u64) -> [u64; 8],
 ) {
     let n = batch.len;
     let mut i = 0;
     while i + 8 <= n {
-        let a_un = unscramble40_x8_scalar(
+        let a_un = unscramble_x8(
             unsafe { *(batch.ua_b36.as_ptr().add(i) as *const [u64; 8]) },
             user_key,
         );
-        let b_un = unscramble40_x8_scalar(
+        let b_un = unscramble_x8(
             unsafe { *(batch.ub_b36.as_ptr().add(i) as *const [u64; 8]) },
             user_key,
         );
@@ -1535,10 +1830,472 @@ pub fn classify_lk_batch(
     }
 }
 
-/// Scans an event extent `[from, to)` into 64-row `FastEvBatch` batches using our width+quote
-/// table-driven SIMD parser with 97% view/cart fast-skip and 100% exact cold fallback,
-/// invoking `on_batch(&FastEvBatch)` whenever the batch fills or finishes.
-pub unsafe fn scan_events_fast(
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+pub unsafe fn classify_lk_batch_avx512(
+    batch: &FastLkBatch,
+    user_key: u64,
+    user_cap: u32,
+    normal_out: &mut Vec<NormalLkRec>,
+    fallback_out: &mut Vec<FallbackLkRec>,
+) {
+    classify_lk_batch_with(
+        batch,
+        user_key,
+        user_cap,
+        normal_out,
+        fallback_out,
+        |y, key| unscramble40_x8_avx512(y, key),
+    );
+}
+
+/// 64-row link batch classifier:
+/// Unscrambles `ua_b36` and `ub_b36` 8 at a time via AVX-512DQ (when `use_avx512()` is enabled)
+/// or `unscramble40_x8_scalar` and partitions into `normal_out` and `fallback_out`.
+pub fn classify_lk_batch(
+    batch: &FastLkBatch,
+    user_key: u64,
+    user_cap: u32,
+    normal_out: &mut Vec<NormalLkRec>,
+    fallback_out: &mut Vec<FallbackLkRec>,
+) {
+    if use_avx512() {
+        unsafe {
+            classify_lk_batch_avx512(batch, user_key, user_cap, normal_out, fallback_out);
+        }
+        return;
+    }
+    classify_lk_batch_with(
+        batch,
+        user_key,
+        user_cap,
+        normal_out,
+        fallback_out,
+        unscramble40_x8_scalar,
+    );
+}
+
+#[inline(always)]
+unsafe fn find_first_line_start(
+    data: *const u8,
+    size: usize,
+    from: usize,
+    to: usize,
+) -> Option<usize> {
+    if size == 0 || from >= size || to <= from {
+        return None;
+    }
+    let mut pos = from.saturating_sub(1);
+    while pos < size && *data.add(pos) != b'\n' {
+        pos += 1;
+    }
+    if pos >= size {
+        return None;
+    }
+    let cur_off = pos + 1;
+    (cur_off < to).then_some(cur_off)
+}
+
+/// Validates quotes on a `< 64`-byte line (with non-empty field 0: `(cm & 1) == 0`)
+/// and returns a bitmask `open_q` whose bit `k` is `1` iff field `k` had surrounding quotes.
+#[inline(always)]
+unsafe fn validate_and_extract_quotes_u64(qt: u64, cm: u64, nl_bit: u64) -> Option<u64> {
+    let starts = (cm << 1) | 1u64;
+    let ends = (cm | nl_bit) >> 1;
+    let stray = qt & !(starts ^ ends);
+    let open_q = _pext_u64(qt, starts);
+    let close_q = _pext_u64(qt, ends);
+    ((stray | (open_q ^ close_q)) == 0).then_some(open_q)
+}
+
+/// Validates quotes on a `64..128`-byte line across two 64-byte windows (with `(cm0 & 1) == 0`)
+/// and returns a bitmask `open_q` whose bit `k` is `1` iff field `k` had surrounding quotes.
+#[inline(always)]
+unsafe fn validate_and_extract_quotes_128(
+    qt0: u64,
+    qt1_line: u64,
+    cm0: u64,
+    cm1_line: u64,
+    nl1_bit: u64,
+) -> Option<u64> {
+    let starts0 = (cm0 << 1) | 1u64;
+    let ends0 = (cm0 >> 1) | (((cm1_line | nl1_bit) & 1) << 63);
+    let stray0 = qt0 & !(starts0 ^ ends0);
+
+    let starts1 = (cm1_line << 1) | (cm0 >> 63);
+    let ends1 = (cm1_line | nl1_bit) >> 1;
+    let stray1 = qt1_line & !(starts1 ^ ends1);
+
+    let k_s0 = starts0.count_ones();
+    let k_e0 = ends0.count_ones();
+    let open_q = _pext_u64(qt0, starts0) | (_pext_u64(qt1_line, starts1) << k_s0);
+    let close_q = _pext_u64(qt0, ends0) | (_pext_u64(qt1_line, ends1) << k_e0);
+    ((stray0 | stray1 | (open_q ^ close_q)) == 0).then_some(open_q)
+}
+
+#[inline(always)]
+fn next_comma_u64_pair(m0: &mut u64, m1: &mut u64) -> usize {
+    let t0 = m0.trailing_zeros() as usize;
+    let n0 = *m0 & m0.wrapping_sub(1);
+    let t1 = 64 + m1.trailing_zeros() as usize;
+    let n1 = *m1 & m1.wrapping_sub(1);
+    let take0 = *m0 != 0;
+    *m0 = if take0 { n0 } else { *m0 };
+    *m1 = if take0 { *m1 } else { n1 };
+    if take0 {
+        t0
+    } else {
+        t1
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn parse_csv_line_scalar<const N: usize>(
+    data: *const u8,
+    size: usize,
+    cur_off: usize,
+    min_nl_search: usize,
+) -> (usize, Option<([*const u8; N], [usize; N])>) {
+    let mut p = (cur_off + min_nl_search).min(size);
+    while p < size && *data.add(p) != b'\n' {
+        p += 1;
+    }
+    let next_off = if p < size { p + 1 } else { size };
+    let line = std::slice::from_raw_parts(data.add(cur_off), p - cur_off);
+
+    let strip_field = |s: usize, e: usize| -> Option<(*const u8, usize)> {
+        let f = &line[s..e];
+        if f.contains(&b'"') {
+            if f.len() < 2
+                || f[0] != b'"'
+                || f[f.len() - 1] != b'"'
+                || f[1..f.len() - 1].contains(&b'"')
+            {
+                return None;
+            }
+            Some((data.add(cur_off + s + 1), f.len() - 2))
+        } else {
+            Some((data.add(cur_off + s), f.len()))
+        }
+    };
+
+    let mut ptrs = [data; N];
+    let mut lens = [0usize; N];
+    let mut field_start = 0usize;
+    let mut idx = 0usize;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b',' {
+            if idx >= N - 1 {
+                return (next_off, None);
+            }
+            let Some((fp, fl)) = strip_field(field_start, i) else {
+                return (next_off, None);
+            };
+            ptrs[idx] = fp;
+            lens[idx] = fl;
+            idx += 1;
+            field_start = i + 1;
+        }
+    }
+    if idx != N - 1 {
+        return (next_off, None);
+    }
+    let Some((fp, fl)) = strip_field(field_start, line.len()) else {
+        return (next_off, None);
+    };
+    ptrs[idx] = fp;
+    lens[idx] = fl;
+    (next_off, Some((ptrs, lens)))
+}
+
+#[inline(always)]
+unsafe fn push_cold_ev_to_batch(batch: &mut FastEvBatch, r: usize, cold: FallbackEvRec) {
+    batch.eid_b36[r] = cold.eid_b36;
+    batch.uid_b36[r] = cold.uid_b36;
+    batch.event_tok[r] = cold.event_tok;
+    batch.user_tok[r] = cold.user_tok;
+    batch.tok_dirty_mask |= 1u64 << r;
+    batch.ingest[r] = cold.ingest;
+    batch.ts[r] = cold.ts;
+    batch.payload[r] = cold.payload;
+    if cold.valid {
+        batch.valid_mask |= 1u64 << r;
+        if cold.eid_b36 <= MASK40 && cold.uid_b36 <= MASK40 {
+            batch.canonical_valid_mask |= 1u64 << r;
+        }
+    }
+    batch.len = r + 1;
+}
+
+#[inline(always)]
+unsafe fn process_ev_row_unquoted(
+    sh: &Shared,
+    fast_dates: &FastDateLut,
+    dates: &mut DateCache,
+    base_s: i64,
+    event_win_ms: u64,
+    ptrs: [*const u8; 7],
+    lens: [usize; 7],
+    batch: &mut FastEvBatch,
+    on_batch: &mut impl FnMut(&FastEvBatch),
+) {
+    if lens[0] == 0 {
+        return;
+    }
+    let r = batch.len;
+    'row_done: {
+        if let Some((eid_y, uid_y)) =
+            decode_id_pair_unquoted(ptrs[0], lens[0], b'e', ptrs[1], lens[1], b'u')
+        {
+            let ingest_s_rel = if lens[3] == 20 {
+                match parse_f1_fast_lut(ptrs[3], fast_dates) {
+                    Some(s) => s,
+                    None => parse_f1_rel_fallback(ptrs[3], 20, &sh.date_lut, dates, base_s),
+                }
+            } else {
+                i32::MAX
+            };
+            if ingest_s_rel != i32::MAX {
+                let ts_rel = parse_ts_fast_lut(
+                    ptrs[2],
+                    lens[2],
+                    fast_dates,
+                    &sh.date_lut,
+                    dates,
+                    sh.base_ms,
+                );
+                let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
+                let late_bad = (ingest_s_rel as i64)
+                    .wrapping_mul(1000)
+                    .wrapping_sub(ts_rel)
+                    > DAY_MS;
+                if !(win_bad | late_bad) {
+                    if let Some(payload) = parse_ev_tail_unquoted(
+                        ptrs[4],
+                        lens[4],
+                        ptrs[5],
+                        lens[5],
+                        ptrs[6],
+                        lens[6],
+                        sh,
+                    ) {
+                        batch.eid_b36[r] = eid_y;
+                        batch.uid_b36[r] = uid_y;
+                        batch.ingest[r] = ingest_s_rel;
+                        batch.ts[r] = ts_rel as u32;
+                        batch.payload[r] = payload;
+                        batch.canonical_valid_mask |= 1u64 << r;
+                        batch.valid_mask |= 1u64 << r;
+                        batch.len = r + 1;
+                        break 'row_done;
+                    }
+                }
+                batch.eid_b36[r] = eid_y;
+                batch.uid_b36[r] = uid_y;
+                batch.ingest[r] = ingest_s_rel;
+                batch.ts[r] = 0;
+                batch.payload[r] = 0;
+                batch.len = r + 1;
+                break 'row_done;
+            }
+        }
+        if let Some(cold) = parse_event_row_cold_fields(sh, dates, ptrs, lens) {
+            push_cold_ev_to_batch(batch, r, cold);
+        }
+    }
+    if batch.len == FAST_BATCH {
+        on_batch(batch);
+        batch.clear();
+    }
+}
+
+#[inline(always)]
+unsafe fn emit_ev_from_commas_open_q(
+    p: *const u8,
+    c0: usize,
+    c1: usize,
+    c2: usize,
+    c3: usize,
+    c4: usize,
+    c5: usize,
+    nl_pos: usize,
+    open_q: u64,
+    sh: &Shared,
+    fast_dates: &FastDateLut,
+    dates: &mut DateCache,
+    base_s: i64,
+    event_win_ms: u64,
+    batch: &mut FastEvBatch,
+    on_batch: &mut impl FnMut(&FastEvBatch),
+) {
+    let q0 = (open_q as usize) & 1;
+    let l0 = c0 - 2 * q0;
+    if l0 == 0 {
+        return;
+    }
+    let q1 = ((open_q >> 1) as usize) & 1;
+    let q2 = ((open_q >> 2) as usize) & 1;
+    let q3 = ((open_q >> 3) as usize) & 1;
+    let q4 = ((open_q >> 4) as usize) & 1;
+    let q5 = ((open_q >> 5) as usize) & 1;
+    let q6 = ((open_q >> 6) as usize) & 1;
+
+    let ptrs = [
+        p.add(q0),
+        p.add(c0 + 1 + q1),
+        p.add(c1 + 1 + q2),
+        p.add(c2 + 1 + q3),
+        p.add(c3 + 1 + q4),
+        p.add(c4 + 1 + q5),
+        p.add(c5 + 1 + q6),
+    ];
+    let lens = [
+        l0,
+        c1 - c0 - 1 - 2 * q1,
+        c2 - c1 - 1 - 2 * q2,
+        c3 - c2 - 1 - 2 * q3,
+        c4 - c3 - 1 - 2 * q4,
+        c5 - c4 - 1 - 2 * q5,
+        nl_pos - c5 - 1 - 2 * q6,
+    ];
+    process_ev_row_unquoted(
+        sh,
+        fast_dates,
+        dates,
+        base_s,
+        event_win_ms,
+        ptrs,
+        lens,
+        batch,
+        on_batch,
+    );
+}
+
+#[inline(always)]
+unsafe fn process_ev_masks_u64_pair(
+    nl0: u64,
+    nl1: u64,
+    cm0: u64,
+    cm1: u64,
+    qt0: u64,
+    qt1: u64,
+    p: *const u8,
+    sh: &Shared,
+    fast_dates: &FastDateLut,
+    dates: &mut DateCache,
+    base_s: i64,
+    event_win_ms: u64,
+    batch: &mut FastEvBatch,
+    on_batch: &mut impl FnMut(&FastEvBatch),
+) -> usize {
+    if nl0 != 0 {
+        let nl_pos = nl0.trailing_zeros() as usize;
+        let line_mask = _bzhi_u64(u64::MAX, nl_pos as u32);
+        let cm_line = cm0 & line_mask;
+        if (cm_line.count_ones() == 6) & ((cm_line & 1) == 0) {
+            let qt_line = qt0 & line_mask;
+            if let Some(open_q) =
+                validate_and_extract_quotes_u64(qt_line, cm_line, 1u64 << nl_pos)
+            {
+                let mut m = cm_line;
+                let c0 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let c1 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let c2 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let c3 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let c4 = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let c5 = m.trailing_zeros() as usize;
+                emit_ev_from_commas_open_q(
+                    p,
+                    c0,
+                    c1,
+                    c2,
+                    c3,
+                    c4,
+                    c5,
+                    nl_pos,
+                    open_q,
+                    sh,
+                    fast_dates,
+                    dates,
+                    base_s,
+                    event_win_ms,
+                    batch,
+                    on_batch,
+                );
+            }
+        }
+        return nl_pos + 1;
+    }
+
+    let nl1_pos = nl1.trailing_zeros() as usize;
+    let nl_pos = 64 + nl1_pos;
+    let mask1 = _bzhi_u64(u64::MAX, nl1_pos as u32);
+    let cm1_line = cm1 & mask1;
+    let k0 = cm0.count_ones() as usize;
+    let k1 = cm1_line.count_ones() as usize;
+    if (k0 + k1 != 6) | ((cm0 & 1) != 0) {
+        return nl_pos + 1;
+    }
+    let qt1_line = qt1 & mask1;
+    let Some(open_q) =
+        validate_and_extract_quotes_128(qt0, qt1_line, cm0, cm1_line, 1u64 << nl1_pos)
+    else {
+        return nl_pos + 1;
+    };
+
+    let mut m0 = cm0;
+    let mut m1 = cm1_line;
+    let (c0, c1, c2, c3, c4, c5) = if k0 >= 3 {
+        let c0 = m0.trailing_zeros() as usize;
+        m0 &= m0 - 1;
+        let c1 = m0.trailing_zeros() as usize;
+        m0 &= m0 - 1;
+        let c2 = m0.trailing_zeros() as usize;
+        m0 &= m0 - 1;
+        let c3 = next_comma_u64_pair(&mut m0, &mut m1);
+        let c4 = next_comma_u64_pair(&mut m0, &mut m1);
+        let c5 = next_comma_u64_pair(&mut m0, &mut m1);
+        (c0, c1, c2, c3, c4, c5)
+    } else {
+        let c0 = next_comma_u64_pair(&mut m0, &mut m1);
+        let c1 = next_comma_u64_pair(&mut m0, &mut m1);
+        let c2 = next_comma_u64_pair(&mut m0, &mut m1);
+        let c3 = next_comma_u64_pair(&mut m0, &mut m1);
+        let c4 = next_comma_u64_pair(&mut m0, &mut m1);
+        let c5 = next_comma_u64_pair(&mut m0, &mut m1);
+        (c0, c1, c2, c3, c4, c5)
+    };
+
+    emit_ev_from_commas_open_q(
+        p,
+        c0,
+        c1,
+        c2,
+        c3,
+        c4,
+        c5,
+        nl_pos,
+        open_q,
+        sh,
+        fast_dates,
+        dates,
+        base_s,
+        event_win_ms,
+        batch,
+        on_batch,
+    );
+    nl_pos + 1
+}
+
+/// 2-window AVX-512BW/VL direct-from-mmap event scanner (`< 128`-byte rows zero-copy,
+/// `>= 128`-byte lines via scalar fallback, final `<= 128`-byte tail via `csv::Reader`).
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+pub unsafe fn scan_events_avx512(
     reader: &mut crate::csv::Reader,
     sh: &Shared,
     dates: &mut DateCache,
@@ -1552,7 +2309,161 @@ pub unsafe fn scan_events_fast(
     batch.clear();
     let base_s = sh.base_ms.div_euclid(1000);
     let event_win_ms = (sh.window_end - sh.window_start) as u64;
-    let mut last_date: (u64, u32, i32) = (0, 0, 0);
+    let fast_dates = FastDateLut::new(sh.window_start, sh.window_end, base_s);
+
+    if !sh.use_rel {
+        reader.scan::<7>(data, size, from, to, |buf, s, e| {
+            let r = batch.len;
+            if let Some(cold) = parse_event_row_cold(sh, dates, buf, s, e) {
+                push_cold_ev_to_batch(batch, r, cold);
+                if batch.len == FAST_BATCH {
+                    on_batch(batch);
+                    batch.clear();
+                }
+            }
+        });
+        if batch.len > 0 {
+            on_batch(batch);
+            batch.clear();
+        }
+        return;
+    }
+
+    let Some(mut cur_off) = find_first_line_start(data, size, from, to) else {
+        return;
+    };
+    let direct_limit = to.min(size.saturating_sub(128));
+    let c_nl = _mm512_set1_epi8(b'\n' as i8);
+    let c_cm = _mm512_set1_epi8(b',' as i8);
+    let c_qt = _mm512_set1_epi8(b'"' as i8);
+
+    while cur_off < direct_limit {
+        let p = data.add(cur_off);
+        let v0 = _mm512_loadu_si512(p as *const __m512i);
+        let v1 = _mm512_loadu_si512(p.add(64) as *const __m512i);
+        let nl0 = _mm512_cmpeq_epi8_mask(v0, c_nl);
+        let nl1 = _mm512_cmpeq_epi8_mask(v1, c_nl);
+        let cm0 = _mm512_cmpeq_epi8_mask(v0, c_cm);
+        let cm1 = _mm512_cmpeq_epi8_mask(v1, c_cm);
+        let qt0 = _mm512_cmpeq_epi8_mask(v0, c_qt);
+        let qt1 = _mm512_cmpeq_epi8_mask(v1, c_qt);
+
+        if (nl0 | nl1) == 0 {
+            let (next_off, parsed) = parse_csv_line_scalar::<7>(data, size, cur_off, 128);
+            if let Some((ptrs, lens)) = parsed {
+                process_ev_row_unquoted(
+                    sh,
+                    &fast_dates,
+                    dates,
+                    base_s,
+                    event_win_ms,
+                    ptrs,
+                    lens,
+                    batch,
+                    &mut on_batch,
+                );
+            }
+            cur_off = next_off;
+            continue;
+        }
+        cur_off += process_ev_masks_u64_pair(
+            nl0,
+            nl1,
+            cm0,
+            cm1,
+            qt0,
+            qt1,
+            p,
+            sh,
+            &fast_dates,
+            dates,
+            base_s,
+            event_win_ms,
+            batch,
+            &mut on_batch,
+        );
+    }
+
+    if cur_off < to {
+        reader.scan::<7>(data, size, cur_off, to, |buf, s, e| {
+            let ptrs = [
+                buf.add(s[0] as usize),
+                buf.add(s[1] as usize),
+                buf.add(s[2] as usize),
+                buf.add(s[3] as usize),
+                buf.add(s[4] as usize),
+                buf.add(s[5] as usize),
+                buf.add(s[6] as usize),
+            ];
+            let lens = [
+                (e[0] - s[0]) as usize,
+                (e[1] - s[1]) as usize,
+                (e[2] - s[2]) as usize,
+                (e[3] - s[3]) as usize,
+                (e[4] - s[4]) as usize,
+                (e[5] - s[5]) as usize,
+                (e[6] - s[6]) as usize,
+            ];
+            process_ev_row_unquoted(
+                sh,
+                &fast_dates,
+                dates,
+                base_s,
+                event_win_ms,
+                ptrs,
+                lens,
+                batch,
+                &mut on_batch,
+            );
+        });
+    }
+
+    if batch.len > 0 {
+        on_batch(batch);
+        batch.clear();
+    }
+}
+
+/// Scans an event extent `[from, to)` into 64-row `FastEvBatch` batches, dispatching to
+/// `scan_events_avx512` when `use_avx512()` is enabled, else `csv::Reader` + `FastDateLut`.
+pub unsafe fn scan_events_fast(
+    reader: &mut crate::csv::Reader,
+    sh: &Shared,
+    dates: &mut DateCache,
+    data: *const u8,
+    size: usize,
+    from: usize,
+    to: usize,
+    batch: &mut FastEvBatch,
+    mut on_batch: impl FnMut(&FastEvBatch),
+) {
+    if use_avx512() && sh.use_rel {
+        scan_events_avx512(reader, sh, dates, data, size, from, to, batch, on_batch);
+        return;
+    }
+
+    batch.clear();
+    let base_s = sh.base_ms.div_euclid(1000);
+    let event_win_ms = (sh.window_end - sh.window_start) as u64;
+    let fast_dates = FastDateLut::new(sh.window_start, sh.window_end, base_s);
+
+    if !sh.use_rel {
+        reader.scan::<7>(data, size, from, to, |buf, s, e| {
+            let r = batch.len;
+            if let Some(cold) = parse_event_row_cold(sh, dates, buf, s, e) {
+                push_cold_ev_to_batch(batch, r, cold);
+                if batch.len == FAST_BATCH {
+                    on_batch(batch);
+                    batch.clear();
+                }
+            }
+        });
+        if batch.len > 0 {
+            on_batch(batch);
+            batch.clear();
+        }
+        return;
+    }
 
     reader.scan::<7>(data, size, from, to, |buf, s, e| {
         let at = |k: usize| buf.add(s[k] as usize);
@@ -1561,92 +2472,66 @@ pub unsafe fn scan_events_fast(
             return;
         }
         let r = batch.len;
-
-        // Fast path when sh.use_rel is true:
-        // `csv::Reader` has already stripped outer quotes (`q = 0`).
         'row_done: {
-            if sh.use_rel {
-                if let Some((eid_y, uid_y)) =
-                    decode_id_pair_wq(at(0), len(0), 0, b'e', at(1), len(1), 0, b'u')
-                {
-                    let ingest_s_rel = if len(3) == 20 {
-                        match parse_f1_swar_lut_cached(at(3), &sh.date_lut, &mut last_date) {
-                            Some(s) => s,
-                            None => ts::parse_f1_rel(at(3), 20, &sh.date_lut, dates, base_s),
-                        }
-                    } else {
-                        i32::MAX
-                    };
-                    if ingest_s_rel != i32::MAX {
-                        let ts_rel = parse_ts_cached(
-                            at(2),
-                            len(2),
-                            &sh.date_lut,
-                            dates,
-                            &mut last_date,
-                            sh.base_ms,
-                        );
-                        let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
-                        let late_bad = (ingest_s_rel as i64)
-                            .wrapping_mul(1000)
-                            .wrapping_sub(ts_rel)
-                            > DAY_MS;
-                        if !(win_bad | late_bad) {
-                            if let Some(payload) = parse_ev_tail_wq(
-                                at(4),
-                                len(4),
-                                0,
-                                at(5),
-                                len(5),
-                                0,
-                                at(6),
-                                len(6),
-                                0,
-                                sh,
-                            ) {
-                                batch.eid_b36[r] = eid_y;
-                                batch.uid_b36[r] = uid_y;
-                                batch.ingest[r] = ingest_s_rel;
-                                batch.ts[r] = ts_rel as u32;
-                                batch.payload[r] = payload;
-                                batch.canonical_valid_mask |= 1u64 << r;
-                                batch.valid_mask |= 1u64 << r;
-                                batch.len = r + 1;
-                                break 'row_done;
-                            }
-                        }
-                        // Invalid row with canonical 40-bit IDs and valid ingest_ts: store directly
-                        // without falling through to parse_event_row_cold.
-                        batch.eid_b36[r] = eid_y;
-                        batch.uid_b36[r] = uid_y;
-                        batch.ingest[r] = ingest_s_rel;
-                        batch.ts[r] = 0;
-                        batch.payload[r] = 0;
-                        batch.len = r + 1;
-                        break 'row_done;
+            if let Some((eid_y, uid_y)) =
+                decode_id_pair_unquoted(at(0), len(0), b'e', at(1), len(1), b'u')
+            {
+                let ingest_s_rel = if len(3) == 20 {
+                    match parse_f1_fast_lut(at(3), &fast_dates) {
+                        Some(s) => s,
+                        None => parse_f1_rel_fallback(at(3), 20, &sh.date_lut, dates, base_s),
                     }
+                } else {
+                    i32::MAX
+                };
+                if ingest_s_rel != i32::MAX {
+                    let ts_rel = parse_ts_fast_lut(
+                        at(2),
+                        len(2),
+                        &fast_dates,
+                        &sh.date_lut,
+                        dates,
+                        sh.base_ms,
+                    );
+                    let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
+                    let late_bad = (ingest_s_rel as i64)
+                        .wrapping_mul(1000)
+                        .wrapping_sub(ts_rel)
+                        > DAY_MS;
+                    if !(win_bad | late_bad) {
+                        if let Some(payload) = parse_ev_tail_unquoted(
+                            at(4),
+                            len(4),
+                            at(5),
+                            len(5),
+                            at(6),
+                            len(6),
+                            sh,
+                        ) {
+                            batch.eid_b36[r] = eid_y;
+                            batch.uid_b36[r] = uid_y;
+                            batch.ingest[r] = ingest_s_rel;
+                            batch.ts[r] = ts_rel as u32;
+                            batch.payload[r] = payload;
+                            batch.canonical_valid_mask |= 1u64 << r;
+                            batch.valid_mask |= 1u64 << r;
+                            batch.len = r + 1;
+                            break 'row_done;
+                        }
+                    }
+                    batch.eid_b36[r] = eid_y;
+                    batch.uid_b36[r] = uid_y;
+                    batch.ingest[r] = ingest_s_rel;
+                    batch.ts[r] = 0;
+                    batch.payload[r] = 0;
+                    batch.len = r + 1;
+                    break 'row_done;
                 }
             }
-            // Cold exact fallback for invalid rows, non-canonical IDs, or non-use_rel windows
             if let Some(cold) = parse_event_row_cold(sh, dates, buf, s, e) {
-                batch.eid_b36[r] = cold.eid_b36;
-                batch.uid_b36[r] = cold.uid_b36;
-                batch.event_tok[r] = cold.event_tok;
-                batch.user_tok[r] = cold.user_tok;
-                batch.tok_dirty_mask |= 1u64 << r;
-                batch.ingest[r] = cold.ingest;
-                batch.ts[r] = cold.ts;
-                batch.payload[r] = cold.payload;
-                if cold.valid {
-                    batch.valid_mask |= 1u64 << r;
-                    if cold.eid_b36 <= MASK40 && cold.uid_b36 <= MASK40 {
-                        batch.canonical_valid_mask |= 1u64 << r;
-                    }
-                }
-                batch.len = r + 1;
+                push_cold_ev_to_batch(batch, r, cold);
             }
         }
-
         if batch.len == FAST_BATCH {
             on_batch(batch);
             batch.clear();
@@ -1659,8 +2544,223 @@ pub unsafe fn scan_events_fast(
     }
 }
 
-/// Scans a click extent `[from, to)` into 64-row `FastCkBatch` batches.
-pub unsafe fn scan_clicks_fast(
+#[inline(always)]
+unsafe fn push_cold_ck_to_batch(batch: &mut FastCkBatch, r: usize, cold: FallbackCkRec) {
+    batch.cid_b36[r] = cold.cid_b36;
+    batch.uid_b36[r] = cold.uid_b36;
+    batch.click_tok[r] = cold.click_tok;
+    batch.user_tok[r] = cold.user_tok;
+    batch.tok_dirty_mask |= 1u64 << r;
+    batch.ts[r] = cold.ts;
+    batch.campaign[r] = cold.campaign;
+    if cold.cid_b36 <= MASK40 && cold.uid_b36 <= MASK40 {
+        if cold.is_upper_k {
+            batch.upper_k_mask |= 1u64 << r;
+        } else {
+            batch.canonical_mask |= 1u64 << r;
+        }
+    }
+    batch.len = r + 1;
+}
+
+#[inline(always)]
+unsafe fn process_ck_row_unquoted(
+    sh: &Shared,
+    fast_dates: &FastDateLut,
+    dates: &mut DateCache,
+    click_win_ms: u64,
+    ptrs: [*const u8; 4],
+    lens: [usize; 4],
+    batch: &mut FastCkBatch,
+    on_batch: &mut impl FnMut(&FastCkBatch),
+) {
+    if lens[0] == 0 || lens[1] == 0 {
+        return;
+    }
+    let r = batch.len;
+    'row_done: {
+        if let Some((cid_y, uid_y)) =
+            decode_id_pair_unquoted(ptrs[0], lens[0], b'k', ptrs[1], lens[1], b'u')
+        {
+            let ts_rel = parse_ts_fast_lut(
+                ptrs[3],
+                lens[3],
+                fast_dates,
+                &sh.date_lut,
+                dates,
+                sh.base_ms,
+            );
+            if (ts_rel as u64) < click_win_ms {
+                if let Some(camp) = parse_campaign_wq(
+                    ptrs[2],
+                    lens[2],
+                    0,
+                    &sh.direct_camp,
+                    &sh.campaign_ids,
+                ) {
+                    batch.cid_b36[r] = cid_y;
+                    batch.uid_b36[r] = uid_y;
+                    batch.ts[r] = ts_rel as u32;
+                    batch.campaign[r] = camp;
+                    batch.canonical_mask |= 1u64 << r;
+                    batch.len = r + 1;
+                    break 'row_done;
+                }
+            }
+        }
+        if let Some(cold) = parse_click_row_cold_fields(sh, dates, ptrs, lens) {
+            push_cold_ck_to_batch(batch, r, cold);
+        }
+    }
+    if batch.len == FAST_BATCH {
+        on_batch(batch);
+        batch.clear();
+    }
+}
+
+#[inline(always)]
+unsafe fn emit_ck_from_commas_open_q(
+    p: *const u8,
+    c0: usize,
+    c1: usize,
+    c2: usize,
+    nl_pos: usize,
+    open_q: u64,
+    sh: &Shared,
+    fast_dates: &FastDateLut,
+    dates: &mut DateCache,
+    click_win_ms: u64,
+    batch: &mut FastCkBatch,
+    on_batch: &mut impl FnMut(&FastCkBatch),
+) {
+    let q0 = (open_q as usize) & 1;
+    let q1 = ((open_q >> 1) as usize) & 1;
+    let l0 = c0 - 2 * q0;
+    let l1 = c1 - c0 - 1 - 2 * q1;
+    if l0 == 0 || l1 == 0 {
+        return;
+    }
+    let q2 = ((open_q >> 2) as usize) & 1;
+    let q3 = ((open_q >> 3) as usize) & 1;
+
+    let ptrs = [
+        p.add(q0),
+        p.add(c0 + 1 + q1),
+        p.add(c1 + 1 + q2),
+        p.add(c2 + 1 + q3),
+    ];
+    let lens = [l0, l1, c2 - c1 - 1 - 2 * q2, nl_pos - c2 - 1 - 2 * q3];
+    process_ck_row_unquoted(
+        sh,
+        fast_dates,
+        dates,
+        click_win_ms,
+        ptrs,
+        lens,
+        batch,
+        on_batch,
+    );
+}
+
+#[inline(always)]
+unsafe fn process_ck_64_masks(
+    nl0: u64,
+    cm0: u64,
+    qt0: u64,
+    p: *const u8,
+    sh: &Shared,
+    fast_dates: &FastDateLut,
+    dates: &mut DateCache,
+    click_win_ms: u64,
+    batch: &mut FastCkBatch,
+    on_batch: &mut impl FnMut(&FastCkBatch),
+) -> usize {
+    let nl_pos = nl0.trailing_zeros() as usize;
+    let line_mask = _bzhi_u64(u64::MAX, nl_pos as u32);
+    let cm_line = cm0 & line_mask;
+    if (cm_line.count_ones() == 3) & ((cm_line & 1) == 0) {
+        let qt_line = qt0 & line_mask;
+        if let Some(open_q) = validate_and_extract_quotes_u64(qt_line, cm_line, 1u64 << nl_pos) {
+            let mut m = cm_line;
+            let c0 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let c1 = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let c2 = m.trailing_zeros() as usize;
+            emit_ck_from_commas_open_q(
+                p,
+                c0,
+                c1,
+                c2,
+                nl_pos,
+                open_q,
+                sh,
+                fast_dates,
+                dates,
+                click_win_ms,
+                batch,
+                on_batch,
+            );
+        }
+    }
+    nl_pos + 1
+}
+
+#[inline(always)]
+unsafe fn process_ck_128_masks(
+    nl1: u64,
+    cm0: u64,
+    cm1: u64,
+    qt0: u64,
+    qt1: u64,
+    p: *const u8,
+    sh: &Shared,
+    fast_dates: &FastDateLut,
+    dates: &mut DateCache,
+    click_win_ms: u64,
+    batch: &mut FastCkBatch,
+    on_batch: &mut impl FnMut(&FastCkBatch),
+) -> usize {
+    let nl1_pos = nl1.trailing_zeros() as usize;
+    let nl_pos = 64 + nl1_pos;
+    let mask1 = _bzhi_u64(u64::MAX, nl1_pos as u32);
+    let cm1_line = cm1 & mask1;
+    let k0 = cm0.count_ones() as usize;
+    let k1 = cm1_line.count_ones() as usize;
+    if (k0 + k1 != 3) | ((cm0 & 1) != 0) {
+        return nl_pos + 1;
+    }
+    let qt1_line = qt1 & mask1;
+    let Some(open_q) =
+        validate_and_extract_quotes_128(qt0, qt1_line, cm0, cm1_line, 1u64 << nl1_pos)
+    else {
+        return nl_pos + 1;
+    };
+    let mut m0 = cm0;
+    let mut m1 = cm1_line;
+    let c0 = next_comma_u64_pair(&mut m0, &mut m1);
+    let c1 = next_comma_u64_pair(&mut m0, &mut m1);
+    let c2 = next_comma_u64_pair(&mut m0, &mut m1);
+    emit_ck_from_commas_open_q(
+        p,
+        c0,
+        c1,
+        c2,
+        nl_pos,
+        open_q,
+        sh,
+        fast_dates,
+        dates,
+        click_win_ms,
+        batch,
+        on_batch,
+    );
+    nl_pos + 1
+}
+
+/// 2-window AVX-512BW/VL direct-from-mmap click scanner.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+pub unsafe fn scan_clicks_avx512(
     reader: &mut crate::csv::Reader,
     sh: &Shared,
     dates: &mut DateCache,
@@ -1673,7 +2773,164 @@ pub unsafe fn scan_clicks_fast(
 ) {
     batch.clear();
     let click_win_ms = (sh.window_end - sh.base_ms) as u64;
-    let mut last_date: (u64, u32, i32) = (0, 0, 0);
+    let fast_dates = FastDateLut::new(sh.window_start, sh.window_end, sh.base_ms.div_euclid(1000));
+
+    if !sh.use_rel {
+        reader.scan::<4>(data, size, from, to, |buf, s, e| {
+            let r = batch.len;
+            if let Some(cold) = parse_click_row_cold(sh, dates, buf, s, e) {
+                push_cold_ck_to_batch(batch, r, cold);
+                if batch.len == FAST_BATCH {
+                    on_batch(batch);
+                    batch.clear();
+                }
+            }
+        });
+        if batch.len > 0 {
+            on_batch(batch);
+            batch.clear();
+        }
+        return;
+    }
+
+    let Some(mut cur_off) = find_first_line_start(data, size, from, to) else {
+        return;
+    };
+    let direct_limit = to.min(size.saturating_sub(128));
+    let c_nl = _mm512_set1_epi8(b'\n' as i8);
+    let c_cm = _mm512_set1_epi8(b',' as i8);
+    let c_qt = _mm512_set1_epi8(b'"' as i8);
+
+    while cur_off < direct_limit {
+        let p = data.add(cur_off);
+        let v0 = _mm512_loadu_si512(p as *const __m512i);
+        let nl0 = _mm512_cmpeq_epi8_mask(v0, c_nl);
+        let cm0 = _mm512_cmpeq_epi8_mask(v0, c_cm);
+        let qt0 = _mm512_cmpeq_epi8_mask(v0, c_qt);
+        if nl0 != 0 {
+            cur_off += process_ck_64_masks(
+                nl0,
+                cm0,
+                qt0,
+                p,
+                sh,
+                &fast_dates,
+                dates,
+                click_win_ms,
+                batch,
+                &mut on_batch,
+            );
+            continue;
+        }
+        let v1 = _mm512_loadu_si512(p.add(64) as *const __m512i);
+        let nl1 = _mm512_cmpeq_epi8_mask(v1, c_nl);
+        if nl1 == 0 {
+            let (next_off, parsed) = parse_csv_line_scalar::<4>(data, size, cur_off, 128);
+            if let Some((ptrs, lens)) = parsed {
+                process_ck_row_unquoted(
+                    sh,
+                    &fast_dates,
+                    dates,
+                    click_win_ms,
+                    ptrs,
+                    lens,
+                    batch,
+                    &mut on_batch,
+                );
+            }
+            cur_off = next_off;
+            continue;
+        }
+        let cm1 = _mm512_cmpeq_epi8_mask(v1, c_cm);
+        let qt1 = _mm512_cmpeq_epi8_mask(v1, c_qt);
+        cur_off += process_ck_128_masks(
+            nl1,
+            cm0,
+            cm1,
+            qt0,
+            qt1,
+            p,
+            sh,
+            &fast_dates,
+            dates,
+            click_win_ms,
+            batch,
+            &mut on_batch,
+        );
+    }
+
+    if cur_off < to {
+        reader.scan::<4>(data, size, cur_off, to, |buf, s, e| {
+            let ptrs = [
+                buf.add(s[0] as usize),
+                buf.add(s[1] as usize),
+                buf.add(s[2] as usize),
+                buf.add(s[3] as usize),
+            ];
+            let lens = [
+                (e[0] - s[0]) as usize,
+                (e[1] - s[1]) as usize,
+                (e[2] - s[2]) as usize,
+                (e[3] - s[3]) as usize,
+            ];
+            process_ck_row_unquoted(
+                sh,
+                &fast_dates,
+                dates,
+                click_win_ms,
+                ptrs,
+                lens,
+                batch,
+                &mut on_batch,
+            );
+        });
+    }
+
+    if batch.len > 0 {
+        on_batch(batch);
+        batch.clear();
+    }
+}
+
+/// Scans a click extent `[from, to)` into 64-row `FastCkBatch` batches, dispatching to
+/// `scan_clicks_avx512` when `use_avx512()` is enabled, else `csv::Reader` + `FastDateLut`.
+pub unsafe fn scan_clicks_fast(
+    reader: &mut crate::csv::Reader,
+    sh: &Shared,
+    dates: &mut DateCache,
+    data: *const u8,
+    size: usize,
+    from: usize,
+    to: usize,
+    batch: &mut FastCkBatch,
+    mut on_batch: impl FnMut(&FastCkBatch),
+) {
+    if use_avx512() && sh.use_rel {
+        scan_clicks_avx512(reader, sh, dates, data, size, from, to, batch, on_batch);
+        return;
+    }
+
+    batch.clear();
+    let click_win_ms = (sh.window_end - sh.base_ms) as u64;
+    let fast_dates = FastDateLut::new(sh.window_start, sh.window_end, sh.base_ms.div_euclid(1000));
+
+    if !sh.use_rel {
+        reader.scan::<4>(data, size, from, to, |buf, s, e| {
+            let r = batch.len;
+            if let Some(cold) = parse_click_row_cold(sh, dates, buf, s, e) {
+                push_cold_ck_to_batch(batch, r, cold);
+                if batch.len == FAST_BATCH {
+                    on_batch(batch);
+                    batch.clear();
+                }
+            }
+        });
+        if batch.len > 0 {
+            on_batch(batch);
+            batch.clear();
+        }
+        return;
+    }
 
     reader.scan::<4>(data, size, from, to, |buf, s, e| {
         let at = |k: usize| buf.add(s[k] as usize);
@@ -1682,58 +2939,40 @@ pub unsafe fn scan_clicks_fast(
             return;
         }
         let r = batch.len;
-
         'row_done: {
-            if sh.use_rel {
-                if let Some((cid_y, uid_y)) =
-                    decode_id_pair_wq(at(0), len(0), 0, b'k', at(1), len(1), 0, b'u')
-                {
-                    let ts_rel = parse_ts_cached(
-                        at(3),
-                        len(3),
-                        &sh.date_lut,
-                        dates,
-                        &mut last_date,
-                        sh.base_ms,
-                    );
-                    if (ts_rel as u64) < click_win_ms {
-                        if let Some(camp) = parse_campaign_wq(
-                            at(2),
-                            len(2),
-                            0,
-                            &sh.direct_camp,
-                            &sh.campaign_ids,
-                        ) {
-                            batch.cid_b36[r] = cid_y;
-                            batch.uid_b36[r] = uid_y;
-                            batch.ts[r] = ts_rel as u32;
-                            batch.campaign[r] = camp;
-                            batch.canonical_mask |= 1u64 << r;
-                            batch.len = r + 1;
-                            break 'row_done;
-                        }
+            if let Some((cid_y, uid_y)) =
+                decode_id_pair_unquoted(at(0), len(0), b'k', at(1), len(1), b'u')
+            {
+                let ts_rel = parse_ts_fast_lut(
+                    at(3),
+                    len(3),
+                    &fast_dates,
+                    &sh.date_lut,
+                    dates,
+                    sh.base_ms,
+                );
+                if (ts_rel as u64) < click_win_ms {
+                    if let Some(camp) = parse_campaign_wq(
+                        at(2),
+                        len(2),
+                        0,
+                        &sh.direct_camp,
+                        &sh.campaign_ids,
+                    ) {
+                        batch.cid_b36[r] = cid_y;
+                        batch.uid_b36[r] = uid_y;
+                        batch.ts[r] = ts_rel as u32;
+                        batch.campaign[r] = camp;
+                        batch.canonical_mask |= 1u64 << r;
+                        batch.len = r + 1;
+                        break 'row_done;
                     }
                 }
             }
             if let Some(cold) = parse_click_row_cold(sh, dates, buf, s, e) {
-                batch.cid_b36[r] = cold.cid_b36;
-                batch.uid_b36[r] = cold.uid_b36;
-                batch.click_tok[r] = cold.click_tok;
-                batch.user_tok[r] = cold.user_tok;
-                batch.tok_dirty_mask |= 1u64 << r;
-                batch.ts[r] = cold.ts;
-                batch.campaign[r] = cold.campaign;
-                if cold.cid_b36 <= MASK40 && cold.uid_b36 <= MASK40 {
-                    if cold.is_upper_k {
-                        batch.upper_k_mask |= 1u64 << r;
-                    } else {
-                        batch.canonical_mask |= 1u64 << r;
-                    }
-                }
-                batch.len = r + 1;
+                push_cold_ck_to_batch(batch, r, cold);
             }
         }
-
         if batch.len == FAST_BATCH {
             on_batch(batch);
             batch.clear();
@@ -1746,8 +2985,78 @@ pub unsafe fn scan_clicks_fast(
     }
 }
 
-/// Scans a link extent `[from, to)` into 64-row `FastLkBatch` batches.
-pub unsafe fn scan_links_fast(
+#[inline(always)]
+unsafe fn process_lk_row_unquoted(
+    pa: *const u8,
+    la: usize,
+    pb: *const u8,
+    lb: usize,
+    batch: &mut FastLkBatch,
+    on_batch: &mut impl FnMut(&FastLkBatch),
+) {
+    if la == 0 || lb == 0 {
+        return;
+    }
+    let r = batch.len;
+    if let Some((ya, yb)) = decode_id_pair_unquoted(pa, la, b'u', pb, lb, b'u') {
+        if ya == yb {
+            return;
+        }
+        batch.ua_b36[r] = ya;
+        batch.ub_b36[r] = yb;
+        batch.canonical_mask |= 1u64 << r;
+    } else {
+        let (ta, tb) = tok_pair(pa, la, pb, lb);
+        if ta == tb {
+            return;
+        }
+        batch.ua_tok[r] = ta;
+        batch.ub_tok[r] = tb;
+        batch.tok_dirty_mask |= 1u64 << r;
+        batch.ua_b36[r] = crate::unscramble::decode_b36_ptr(pa, la, b'u').unwrap_or(u64::MAX);
+        batch.ub_b36[r] = crate::unscramble::decode_b36_ptr(pb, lb, b'u').unwrap_or(u64::MAX);
+    }
+    batch.len = r + 1;
+    if batch.len == FAST_BATCH {
+        on_batch(batch);
+        batch.clear();
+    }
+}
+
+#[inline(always)]
+unsafe fn process_lk_64_masks(
+    nl0: u64,
+    cm0: u64,
+    qt0: u64,
+    p: *const u8,
+    batch: &mut FastLkBatch,
+    on_batch: &mut impl FnMut(&FastLkBatch),
+) -> usize {
+    let nl_pos = nl0.trailing_zeros() as usize;
+    let line_mask = _bzhi_u64(u64::MAX, nl_pos as u32);
+    let cm_line = cm0 & line_mask;
+    if (cm_line.count_ones() == 1) & ((cm_line & 1) == 0) {
+        let qt_line = qt0 & line_mask;
+        if let Some(open_q) = validate_and_extract_quotes_u64(qt_line, cm_line, 1u64 << nl_pos) {
+            let c0 = cm_line.trailing_zeros() as usize;
+            let q0 = (open_q as usize) & 1;
+            let q1 = ((open_q >> 1) as usize) & 1;
+            process_lk_row_unquoted(
+                p.add(q0),
+                c0 - 2 * q0,
+                p.add(c0 + 1 + q1),
+                nl_pos - c0 - 1 - 2 * q1,
+                batch,
+                on_batch,
+            );
+        }
+    }
+    nl_pos + 1
+}
+
+/// 64-byte AVX-512BW direct-from-mmap link scanner draining multiple lines per ZMM load.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+pub unsafe fn scan_links_avx512(
     reader: &mut crate::csv::Reader,
     data: *const u8,
     size: usize,
@@ -1757,38 +3066,97 @@ pub unsafe fn scan_links_fast(
     mut on_batch: impl FnMut(&FastLkBatch),
 ) {
     batch.clear();
+    let Some(mut cur_off) = find_first_line_start(data, size, from, to) else {
+        return;
+    };
+    let direct_limit = to.min(size.saturating_sub(128));
+    let c_nl = _mm512_set1_epi8(b'\n' as i8);
+    let c_cm = _mm512_set1_epi8(b',' as i8);
+    let c_qt = _mm512_set1_epi8(b'"' as i8);
+
+    'outer: while cur_off < direct_limit {
+        let block_ptr = data.add(cur_off);
+        let v0 = _mm512_loadu_si512(block_ptr as *const __m512i);
+        let mut nl0 = _mm512_cmpeq_epi8_mask(v0, c_nl);
+        let mut cm0 = _mm512_cmpeq_epi8_mask(v0, c_cm);
+        let mut qt0 = _mm512_cmpeq_epi8_mask(v0, c_qt);
+        if nl0 == 0 {
+            let (next_off, parsed) = parse_csv_line_scalar::<2>(data, size, cur_off, 64);
+            if let Some((ptrs, lens)) = parsed {
+                process_lk_row_unquoted(ptrs[0], lens[0], ptrs[1], lens[1], batch, &mut on_batch);
+            }
+            cur_off = next_off;
+            continue;
+        }
+        let mut block_pos = 0usize;
+        while nl0 != 0 {
+            if cur_off >= to {
+                break 'outer;
+            }
+            let adv = process_lk_64_masks(
+                nl0,
+                cm0,
+                qt0,
+                block_ptr.add(block_pos),
+                batch,
+                &mut on_batch,
+            );
+            cur_off += adv;
+            block_pos += adv;
+            if adv >= 64 {
+                break;
+            }
+            nl0 >>= adv;
+            cm0 >>= adv;
+            qt0 >>= adv;
+        }
+    }
+
+    if cur_off < to {
+        reader.scan::<2>(data, size, cur_off, to, |buf, s, e| {
+            process_lk_row_unquoted(
+                buf.add(s[0] as usize),
+                (e[0] - s[0]) as usize,
+                buf.add(s[1] as usize),
+                (e[1] - s[1]) as usize,
+                batch,
+                &mut on_batch,
+            );
+        });
+    }
+
+    if batch.len > 0 {
+        on_batch(batch);
+        batch.clear();
+    }
+}
+
+/// Scans a link extent `[from, to)` into 64-row `FastLkBatch` batches, dispatching to
+/// `scan_links_avx512` when `use_avx512()` is enabled, else `csv::Reader`.
+pub unsafe fn scan_links_fast(
+    reader: &mut crate::csv::Reader,
+    data: *const u8,
+    size: usize,
+    from: usize,
+    to: usize,
+    batch: &mut FastLkBatch,
+    mut on_batch: impl FnMut(&FastLkBatch),
+) {
+    if use_avx512() {
+        scan_links_avx512(reader, data, size, from, to, batch, on_batch);
+        return;
+    }
+
+    batch.clear();
     reader.scan::<2>(data, size, from, to, |buf, s, e| {
-        let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
-        if la == 0 || lb == 0 {
-            return;
-        }
-        let pa = buf.add(s[0] as usize);
-        let pb = buf.add(s[1] as usize);
-        let r = batch.len;
-        if let Some((ya, yb)) = decode_id_pair_wq(pa, la, 0, b'u', pb, lb, 0, b'u') {
-            if ya == yb {
-                return;
-            }
-            batch.ua_b36[r] = ya;
-            batch.ub_b36[r] = yb;
-            batch.canonical_mask |= 1u64 << r;
-            batch.len = r + 1;
-        } else {
-            let (ta, tb) = tok_pair(pa, la, pb, lb);
-            if ta == tb {
-                return;
-            }
-            batch.ua_b36[r] = crate::unscramble::decode_b36_ptr(pa, la, b'u').unwrap_or(u64::MAX);
-            batch.ub_b36[r] = crate::unscramble::decode_b36_ptr(pb, lb, b'u').unwrap_or(u64::MAX);
-            batch.ua_tok[r] = ta;
-            batch.ub_tok[r] = tb;
-            batch.tok_dirty_mask |= 1u64 << r;
-            batch.len = r + 1;
-        }
-        if batch.len == FAST_BATCH {
-            on_batch(batch);
-            batch.clear();
-        }
+        process_lk_row_unquoted(
+            buf.add(s[0] as usize),
+            (e[0] - s[0]) as usize,
+            buf.add(s[1] as usize),
+            (e[1] - s[1]) as usize,
+            batch,
+            &mut on_batch,
+        );
     });
     if batch.len > 0 {
         on_batch(batch);
@@ -1925,14 +3293,14 @@ mod tests {
             assert_eq!(decode_id_pair_wq(bad_char.as_ptr(), 9, 0, b'e', good9.as_ptr(), 9, 0, b'e'), None);
             assert_eq!(decode_id_pair_wq(over_40.as_ptr(), 9, 0, b'e', good9.as_ptr(), 9, 0, b'e'), None);
 
-            // Verify unified F1/F2/F3 timestamp parser matches ts::parse_ts_rel on valid and malformed forms
+            // Verify FastDateLut + unified F1/F2/F3 timestamp parser matches ts::parse_ts_rel on valid and malformed forms
             let ws = 1828500000_000i64 - (1828500000_000i64 % DAY_MS);
             let we = ws + 14 * DAY_MS;
             let base_ms = ws - WEEK_MS;
             let lut = DateLut::new(ws, we, base_ms.div_euclid(1000));
+            let fast_lut = FastDateLut::new(ws, we, base_ms.div_euclid(1000));
             let mut dc1 = DateCache::new();
             let mut dc2 = DateCache::new();
-            let mut cache = (0u64, 0u32, 0i32);
             let ts_cases: &[&[u8]] = &[
                 b"2027-12-12T04:10:10Z",
                 b"2027-12-09T19:21:09+05:30",
@@ -1946,14 +3314,37 @@ mod tests {
                 b"1828801833000",
                 b"182880183300a",
                 b"2028-02-29T00:00:00Z",
+                b"2027-02-29T00:00:00Z",
+                b"2027-12-00T00:00:00Z",
+                b"2027-12-32T00:00:00Z",
+                b"2027-12-12/04:10:10Z",
             ];
             for &s in ts_cases {
                 let mut buf = [b' '; 64];
                 buf[16..16 + s.len()].copy_from_slice(s);
                 let p = buf.as_ptr().add(16);
                 let exp = ts::parse_ts_rel(p, s.len(), &lut, &mut dc1, base_ms);
-                let got = parse_ts_cached(p, s.len(), &lut, &mut dc2, &mut cache, base_ms);
-                assert_eq!(got, exp, "parse_ts_cached mismatch on {:?}", String::from_utf8_lossy(s));
+                let got = parse_ts_fast_lut(p, s.len(), &fast_lut, &lut, &mut dc2, base_ms);
+                assert_eq!(got, exp, "parse_ts_fast_lut mismatch on {:?}", String::from_utf8_lossy(s));
+            }
+            // Verify FastDateLut on leap-year Feb 2028 boundary
+            let ws_leap = 1835222400_000i64; // 2028-02-27T00:00:00Z
+            let we_leap = ws_leap + 14 * DAY_MS;
+            let base_leap = ws_leap - WEEK_MS;
+            let lut_leap = DateLut::new(ws_leap, we_leap, base_leap.div_euclid(1000));
+            let fast_leap = FastDateLut::new(ws_leap, we_leap, base_leap.div_euclid(1000));
+            for s in [
+                b"2028-02-28T23:59:59Z".as_slice(),
+                b"2028-02-29T12:34:56Z".as_slice(),
+                b"2028-03-01T00:00:00Z".as_slice(),
+                b"2028-02-30T00:00:00Z".as_slice(),
+            ] {
+                let mut buf = [b' '; 64];
+                buf[16..16 + s.len()].copy_from_slice(s);
+                let p = buf.as_ptr().add(16);
+                let exp = ts::parse_ts_rel(p, s.len(), &lut_leap, &mut dc1, base_leap);
+                let got = parse_ts_fast_lut(p, s.len(), &fast_leap, &lut_leap, &mut dc2, base_leap);
+                assert_eq!(got, exp, "leap parse_ts_fast_lut mismatch on {:?}", String::from_utf8_lossy(s));
             }
         }
     }
@@ -2179,6 +3570,47 @@ mod tests {
         }
         crate::sys::unmap_file(lk_data, lk_size);
         assert_eq!(fast_lks, ref_lks);
+        // Verify multi-extent unaligned range splits match single-extent scan on dev events
+        {
+            let mut split_ev_rows = Vec::new();
+            let ev_file2 = std::fs::File::open(&ev_path).unwrap();
+            let ev_sz2 = ev_file2.metadata().unwrap().len() as usize;
+            let ev_ptr2 = crate::sys::map_file(&ev_file2, ev_sz2);
+            for t in 0..8 {
+                let a = ev_sz2 * t / 8;
+                let b = ev_sz2 * (t + 1) / 8;
+                unsafe {
+                    scan_events_fast(&mut reader1, &sh, &mut dates1, ev_ptr2, ev_sz2, a, b, &mut batch, |fb| {
+                        for r in 0..fb.len {
+                            let valid = (fb.valid_mask & (1u64 << r)) != 0;
+                            let etok = if fb.event_tok[r] != 0 {
+                                fb.event_tok[r]
+                            } else {
+                                encode_base36_token(b'e', fb.eid_b36[r])
+                            };
+                            let utok = if !valid {
+                                0
+                            } else if fb.user_tok[r] != 0 {
+                                fb.user_tok[r]
+                            } else {
+                                encode_base36_token(b'u', fb.uid_b36[r])
+                            };
+                            split_ev_rows.push((
+                                etok,
+                                utok,
+                                fb.ingest[r],
+                                if valid { fb.ts[r] } else { 0 },
+                                if valid { fb.payload[r] } else { 0 },
+                                valid,
+                            ));
+                        }
+                    });
+                }
+            }
+            crate::sys::unmap_file(ev_ptr2, ev_sz2);
+            assert_eq!(split_ev_rows, ref_rows, "multi-extent split mismatch on dev events");
+        }
+
         // Also test every single fixture directory in /home/colton/Documents/Projects/Builders/#3/fixtures/*
         let fixtures_root = Path::new("/home/colton/Documents/Projects/Builders/#3/fixtures");
         if fixtures_root.exists() {
@@ -2294,8 +3726,691 @@ mod tests {
                         assert_eq!(f_fast, f_ref, "fixture {:?} clicks mismatch", entry.file_name());
                     }
                 }
+                for lk_e in std::fs::read_dir(in_dir.join("links")).unwrap().flatten() {
+                    if lk_e.path().extension().is_some_and(|x| x == "csv") {
+                        let f = std::fs::File::open(lk_e.path()).unwrap();
+                        let mut sz = f.metadata().unwrap().len() as usize;
+                        if sz == 0 {
+                            continue;
+                        }
+                        let ptr = crate::sys::map_file(&f, sz);
+                        sz = unsafe { crate::sys::end_line(ptr, sz) };
+                        let mut f_fast = Vec::new();
+                        let mut f_ref = Vec::new();
+                        unsafe {
+                            scan_links_fast(&mut reader1, ptr, sz, 0, sz, &mut lk_batch, |b| {
+                                for r in 0..b.len {
+                                    let ta = if b.ua_tok[r] != 0 {
+                                        b.ua_tok[r]
+                                    } else {
+                                        encode_base36_token(b'u', b.ua_b36[r])
+                                    };
+                                    let tb = if b.ub_tok[r] != 0 {
+                                        b.ub_tok[r]
+                                    } else {
+                                        encode_base36_token(b'u', b.ub_b36[r])
+                                    };
+                                    f_fast.push((ta, tb));
+                                }
+                            });
+                            reader2.scan::<2>(ptr, sz, 0, sz, |buf, s, e| {
+                                let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
+                                if la != 0 && lb != 0 {
+                                    let (a, b) = tok_pair(buf.add(s[0] as usize), la, buf.add(s[1] as usize), lb);
+                                    if a != b {
+                                        f_ref.push((a, b));
+                                    }
+                                }
+                            });
+                        }
+                        crate::sys::unmap_file(ptr, sz);
+                        assert_eq!(f_fast, f_ref, "fixture {:?} links mismatch", entry.file_name());
+                    }
+                }
             }
             eprintln!("Verified all {fixture_count} hand-written fixture suites (E1..E20, A1..A12, L1..L4)!");
+        }
+    }
+
+    #[cfg(target_feature = "bmi2")]
+    #[test]
+    fn test_avx512_bitmask_helpers_match_cold_reference() {
+        fn compute_delim_masks_64(p: *const u8) -> (u64, u64, u64) {
+            let (mut nl, mut cm, mut qt) = (0u64, 0u64, 0u64);
+            for i in 0..64 {
+                let b = unsafe { *p.add(i) };
+                let bit = 1u64 << i;
+                if b == b'\n' {
+                    nl |= bit;
+                } else if b == b',' {
+                    cm |= bit;
+                } else if b == b'"' {
+                    qt |= bit;
+                }
+            }
+            (nl, cm, qt)
+        }
+
+        unsafe fn run_ev_mask_pipeline(
+            sh: &Shared,
+            buf: &[u8],
+            from: usize,
+            to: usize,
+        ) -> Vec<(u64, u64, i32, u32, u32, bool)> {
+            let mut padded = Vec::with_capacity(64 + buf.len() + 256);
+            padded.resize(64, b'\n');
+            padded.extend_from_slice(buf);
+            padded.resize(padded.len() + 256, b'\n');
+            let data = padded.as_ptr().add(64);
+            let size = buf.len();
+            let base_s = sh.base_ms.div_euclid(1000);
+            let event_win_ms = (sh.window_end - sh.window_start) as u64;
+            let fast_dates = FastDateLut::new(sh.window_start, sh.window_end, base_s);
+            let mut dates = DateCache::new();
+            let mut reader = crate::csv::Reader::new(64 << 10);
+            let mut batch = FastEvBatch::new();
+            let mut out = Vec::new();
+            let mut drain = |b: &FastEvBatch| {
+                for r in 0..b.len {
+                    let valid = (b.valid_mask & (1u64 << r)) != 0;
+                    let etok = if b.event_tok[r] != 0 {
+                        b.event_tok[r]
+                    } else {
+                        encode_base36_token(b'e', b.eid_b36[r])
+                    };
+                    let utok = if !valid {
+                        0
+                    } else if b.user_tok[r] != 0 {
+                        b.user_tok[r]
+                    } else {
+                        encode_base36_token(b'u', b.uid_b36[r])
+                    };
+                    out.push((
+                        etok,
+                        utok,
+                        b.ingest[r],
+                        if valid { b.ts[r] } else { 0 },
+                        if valid { b.payload[r] } else { 0 },
+                        valid,
+                    ));
+                }
+            };
+
+            if !sh.use_rel {
+                reader.scan::<7>(data, size, from, to, |bptr, s, e| {
+                    let r = batch.len;
+                    if let Some(cold) = parse_event_row_cold(sh, &mut dates, bptr, s, e) {
+                        push_cold_ev_to_batch(&mut batch, r, cold);
+                        if batch.len == FAST_BATCH {
+                            drain(&batch);
+                            batch.clear();
+                        }
+                    }
+                });
+                if batch.len > 0 {
+                    drain(&batch);
+                }
+                return out;
+            }
+
+            let Some(mut cur_off) = find_first_line_start(data, size, from, to) else {
+                return out;
+            };
+            let direct_limit = to.min(size.saturating_sub(128));
+            while cur_off < direct_limit {
+                let p = data.add(cur_off);
+                let (nl0, cm0, qt0) = compute_delim_masks_64(p);
+                let (nl1, cm1, qt1) = compute_delim_masks_64(p.add(64));
+                if (nl0 | nl1) == 0 {
+                    let (next_off, parsed) = parse_csv_line_scalar::<7>(data, size, cur_off, 128);
+                    if let Some((ptrs, lens)) = parsed {
+                        process_ev_row_unquoted(
+                            sh,
+                            &fast_dates,
+                            &mut dates,
+                            base_s,
+                            event_win_ms,
+                            ptrs,
+                            lens,
+                            &mut batch,
+                            &mut drain,
+                        );
+                    }
+                    cur_off = next_off;
+                    continue;
+                }
+                cur_off += process_ev_masks_u64_pair(
+                    nl0,
+                    nl1,
+                    cm0,
+                    cm1,
+                    qt0,
+                    qt1,
+                    p,
+                    sh,
+                    &fast_dates,
+                    &mut dates,
+                    base_s,
+                    event_win_ms,
+                    &mut batch,
+                    &mut drain,
+                );
+            }
+            if cur_off < to {
+                reader.scan::<7>(data, size, cur_off, to, |bptr, s, e| {
+                    let ptrs = [
+                        bptr.add(s[0] as usize),
+                        bptr.add(s[1] as usize),
+                        bptr.add(s[2] as usize),
+                        bptr.add(s[3] as usize),
+                        bptr.add(s[4] as usize),
+                        bptr.add(s[5] as usize),
+                        bptr.add(s[6] as usize),
+                    ];
+                    let lens = [
+                        (e[0] - s[0]) as usize,
+                        (e[1] - s[1]) as usize,
+                        (e[2] - s[2]) as usize,
+                        (e[3] - s[3]) as usize,
+                        (e[4] - s[4]) as usize,
+                        (e[5] - s[5]) as usize,
+                        (e[6] - s[6]) as usize,
+                    ];
+                    process_ev_row_unquoted(
+                        sh,
+                        &fast_dates,
+                        &mut dates,
+                        base_s,
+                        event_win_ms,
+                        ptrs,
+                        lens,
+                        &mut batch,
+                        &mut drain,
+                    );
+                });
+            }
+            if batch.len > 0 {
+                drain(&batch);
+            }
+            out
+        }
+
+        unsafe fn run_ck_mask_pipeline(
+            sh: &Shared,
+            buf: &[u8],
+            from: usize,
+            to: usize,
+        ) -> Vec<(u64, u64, u32, u32)> {
+            let mut padded = Vec::with_capacity(64 + buf.len() + 256);
+            padded.resize(64, b'\n');
+            padded.extend_from_slice(buf);
+            padded.resize(padded.len() + 256, b'\n');
+            let data = padded.as_ptr().add(64);
+            let size = buf.len();
+            let click_win_ms = (sh.window_end - sh.base_ms) as u64;
+            let fast_dates =
+                FastDateLut::new(sh.window_start, sh.window_end, sh.base_ms.div_euclid(1000));
+            let mut dates = DateCache::new();
+            let mut reader = crate::csv::Reader::new(64 << 10);
+            let mut batch = FastCkBatch::new();
+            let mut out = Vec::new();
+            let mut drain = |b: &FastCkBatch| {
+                for r in 0..b.len {
+                    let ctok = if b.click_tok[r] != 0 {
+                        b.click_tok[r]
+                    } else {
+                        encode_base36_token(b'k', b.cid_b36[r])
+                    };
+                    let utok = if b.user_tok[r] != 0 {
+                        b.user_tok[r]
+                    } else {
+                        encode_base36_token(b'u', b.uid_b36[r])
+                    };
+                    out.push((ctok, utok, b.ts[r], b.campaign[r]));
+                }
+            };
+
+            if !sh.use_rel {
+                reader.scan::<4>(data, size, from, to, |bptr, s, e| {
+                    let r = batch.len;
+                    if let Some(cold) = parse_click_row_cold(sh, &mut dates, bptr, s, e) {
+                        push_cold_ck_to_batch(&mut batch, r, cold);
+                        if batch.len == FAST_BATCH {
+                            drain(&batch);
+                            batch.clear();
+                        }
+                    }
+                });
+                if batch.len > 0 {
+                    drain(&batch);
+                }
+                return out;
+            }
+
+            let Some(mut cur_off) = find_first_line_start(data, size, from, to) else {
+                return out;
+            };
+            let direct_limit = to.min(size.saturating_sub(128));
+            while cur_off < direct_limit {
+                let p = data.add(cur_off);
+                let (nl0, cm0, qt0) = compute_delim_masks_64(p);
+                if nl0 != 0 {
+                    cur_off += process_ck_64_masks(
+                        nl0,
+                        cm0,
+                        qt0,
+                        p,
+                        sh,
+                        &fast_dates,
+                        &mut dates,
+                        click_win_ms,
+                        &mut batch,
+                        &mut drain,
+                    );
+                    continue;
+                }
+                let (nl1, cm1, qt1) = compute_delim_masks_64(p.add(64));
+                if nl1 == 0 {
+                    let (next_off, parsed) = parse_csv_line_scalar::<4>(data, size, cur_off, 128);
+                    if let Some((ptrs, lens)) = parsed {
+                        process_ck_row_unquoted(
+                            sh,
+                            &fast_dates,
+                            &mut dates,
+                            click_win_ms,
+                            ptrs,
+                            lens,
+                            &mut batch,
+                            &mut drain,
+                        );
+                    }
+                    cur_off = next_off;
+                    continue;
+                }
+                cur_off += process_ck_128_masks(
+                    nl1,
+                    cm0,
+                    cm1,
+                    qt0,
+                    qt1,
+                    p,
+                    sh,
+                    &fast_dates,
+                    &mut dates,
+                    click_win_ms,
+                    &mut batch,
+                    &mut drain,
+                );
+            }
+            if cur_off < to {
+                reader.scan::<4>(data, size, cur_off, to, |bptr, s, e| {
+                    let ptrs = [
+                        bptr.add(s[0] as usize),
+                        bptr.add(s[1] as usize),
+                        bptr.add(s[2] as usize),
+                        bptr.add(s[3] as usize),
+                    ];
+                    let lens = [
+                        (e[0] - s[0]) as usize,
+                        (e[1] - s[1]) as usize,
+                        (e[2] - s[2]) as usize,
+                        (e[3] - s[3]) as usize,
+                    ];
+                    process_ck_row_unquoted(
+                        sh,
+                        &fast_dates,
+                        &mut dates,
+                        click_win_ms,
+                        ptrs,
+                        lens,
+                        &mut batch,
+                        &mut drain,
+                    );
+                });
+            }
+            if batch.len > 0 {
+                drain(&batch);
+            }
+            out
+        }
+
+        unsafe fn run_lk_mask_pipeline(buf: &[u8], from: usize, to: usize) -> Vec<(u64, u64)> {
+            let mut padded = Vec::with_capacity(64 + buf.len() + 256);
+            padded.resize(64, b'\n');
+            padded.extend_from_slice(buf);
+            padded.resize(padded.len() + 256, b'\n');
+            let data = padded.as_ptr().add(64);
+            let size = buf.len();
+            let mut reader = crate::csv::Reader::new(64 << 10);
+            let mut batch = FastLkBatch::new();
+            let mut out = Vec::new();
+            let mut drain = |b: &FastLkBatch| {
+                for r in 0..b.len {
+                    let ta = if b.ua_tok[r] != 0 {
+                        b.ua_tok[r]
+                    } else {
+                        encode_base36_token(b'u', b.ua_b36[r])
+                    };
+                    let tb = if b.ub_tok[r] != 0 {
+                        b.ub_tok[r]
+                    } else {
+                        encode_base36_token(b'u', b.ub_b36[r])
+                    };
+                    out.push((ta, tb));
+                }
+            };
+            let Some(mut cur_off) = find_first_line_start(data, size, from, to) else {
+                return out;
+            };
+            let direct_limit = to.min(size.saturating_sub(128));
+            'outer: while cur_off < direct_limit {
+                let block_ptr = data.add(cur_off);
+                let (mut nl0, mut cm0, mut qt0) = compute_delim_masks_64(block_ptr);
+                if nl0 == 0 {
+                    let (next_off, parsed) = parse_csv_line_scalar::<2>(data, size, cur_off, 64);
+                    if let Some((ptrs, lens)) = parsed {
+                        process_lk_row_unquoted(
+                            ptrs[0],
+                            lens[0],
+                            ptrs[1],
+                            lens[1],
+                            &mut batch,
+                            &mut drain,
+                        );
+                    }
+                    cur_off = next_off;
+                    continue;
+                }
+                let mut block_pos = 0usize;
+                while nl0 != 0 {
+                    if cur_off >= to {
+                        break 'outer;
+                    }
+                    let adv = process_lk_64_masks(
+                        nl0,
+                        cm0,
+                        qt0,
+                        block_ptr.add(block_pos),
+                        &mut batch,
+                        &mut drain,
+                    );
+                    cur_off += adv;
+                    block_pos += adv;
+                    if adv >= 64 {
+                        break;
+                    }
+                    nl0 >>= adv;
+                    cm0 >>= adv;
+                    qt0 >>= adv;
+                }
+            }
+            if cur_off < to {
+                reader.scan::<2>(data, size, cur_off, to, |bptr, s, e| {
+                    process_lk_row_unquoted(
+                        bptr.add(s[0] as usize),
+                        (e[0] - s[0]) as usize,
+                        bptr.add(s[1] as usize),
+                        (e[1] - s[1]) as usize,
+                        &mut batch,
+                        &mut drain,
+                    );
+                });
+            }
+            if batch.len > 0 {
+                drain(&batch);
+            }
+            out
+        }
+
+        // 1. Synthetic boundary stress cases for <64B, 64B, 65..128B, >=128B lines, and quote rules.
+        let dev_dir = Path::new("/home/colton/Documents/Projects/Builders/#3/data/dev");
+        if dev_dir.exists() {
+            let sh = dummy_shared(dev_dir);
+            let mut ev_cases = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+            let mut ck_cases = String::from("click_id,user_id,campaign_id,ts\n");
+            let mut lk_cases = String::from("user_a,user_b\n");
+
+            // Exact 63, 64, 65, 127, 128, 160-byte event lines (with non-empty & empty trailing price_cents)
+            // Base line without trailing digits on field 0: 1 + 6 commas + dates + type + prod = ~60 bytes
+            let pad_to = |prefix: &str, suffix: &str, target_nl_pos: usize| -> String {
+                let need = target_nl_pos - prefix.len() - suffix.len();
+                format!("{prefix}{}{suffix}\n", "0".repeat(need))
+            };
+            // nl_pos == 63 and 64 with empty last field (c5 == 62 and c5 == 63)
+            ev_cases.push_str(&pad_to("e1,", "u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,", 63));
+            ev_cases.push_str(&pad_to("e2,", "u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,", 64));
+            ev_cases.push_str(&pad_to("e3,", "u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,100", 64));
+            ev_cases.push_str(&pad_to("e4,", "u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,", 127));
+            ev_cases.push_str(&pad_to("e5,", "u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,99", 127));
+            ev_cases.push_str(&pad_to("e6,", "u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,purchase,p1,199", 128));
+            ev_cases.push_str(&pad_to("e7,", "u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,purchase,p1,299", 160));
+            // k0 < 3 (leading field > 64 bytes -> all commas in window 1)
+            ev_cases.push_str(&format!(
+                "e{},u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,10\n",
+                "z".repeat(66)
+            ));
+            // Comma right at byte 63 followed by comma at byte 64 (cm0 bit 63 = 1, cm1 bit 0 = 1)
+            ev_cases.push_str(&format!(
+                "{},,\"\",2027-12-12T04:10:11Z,view,p1,10\n",
+                format!("e10,u1{}", "x".repeat(57))
+            ));
+            // Quoted fields across 64-byte boundary + malformed quote forms + empty ""
+            ev_cases.push_str("\"e11\",\"u1\",\"2027-12-12T04:10:10Z\",\"2027-12-12T04:10:11Z\",\"cart\",\"p1\",\"50\"\n");
+            ev_cases.push_str("e12,u1,\"2027-12-12T04:10:10Z\",\"2027-12-12T04:10:11Z\",view,p1,\"\"\n");
+            ev_cases.push_str("e13,u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,\",p1,10\n");
+            ev_cases.push_str("e14,u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,\"view\"x,p1,10\n");
+            ev_cases.push_str("e15,u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,vi\"ew,p1,10\n");
+            ev_cases.push_str(",u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,10\n");
+            // Padding rows at the end so the boundary rows above definitely go through the direct mask loop (< direct_limit)
+            for i in 0..8 {
+                ev_cases.push_str(&format!(
+                    "e_pad{i},u1,2027-12-12T04:10:10Z,2027-12-12T04:10:11Z,view,p1,10\n"
+                ));
+            }
+
+            let mut reader = crate::csv::Reader::new(64 << 10);
+            let mut dates = DateCache::new();
+            let ev_bytes = ev_cases.as_bytes();
+            let got_ev = unsafe { run_ev_mask_pipeline(&sh, ev_bytes, 0, ev_bytes.len()) };
+            let mut exp_ev = Vec::new();
+            unsafe {
+                let mut padded = vec![b'\n'; 64];
+                padded.extend_from_slice(ev_bytes);
+                padded.resize(padded.len() + 256, b'\n');
+                reader.scan::<7>(padded.as_ptr().add(64), ev_bytes.len(), 0, ev_bytes.len(), |b, s, e| {
+                    if let Some(c) = parse_event_row_cold(&sh, &mut dates, b, s, e) {
+                        exp_ev.push((c.event_tok, c.user_tok, c.ingest, c.ts, c.payload, c.valid));
+                    }
+                });
+            }
+            assert_eq!(got_ev, exp_ev, "synthetic boundary event mismatch");
+
+            ck_cases.push_str(&pad_to("k1,", "u1,c_1,2027-12-12T04:10:10Z", 63));
+            ck_cases.push_str(&pad_to("k2,", "u1,c_1,2027-12-12T04:10:10Z", 64));
+            ck_cases.push_str(&pad_to("k3,", "u1,c_1,2027-12-12T04:10:10Z", 127));
+            ck_cases.push_str(&pad_to("k4,", "u1,c_1,2027-12-12T04:10:10Z", 128));
+            ck_cases.push_str("\"k5\",\"u1\",\"c_1\",\"2027-12-12T04:10:10Z\"\n");
+            ck_cases.push_str("k6,u1,\",2027-12-12T04:10:10Z\n");
+            ck_cases.push_str("k7,u1,c_1,2027-12-12T04:10:10Z\n".repeat(8).as_str());
+            let ck_bytes = ck_cases.as_bytes();
+            let got_ck = unsafe { run_ck_mask_pipeline(&sh, ck_bytes, 0, ck_bytes.len()) };
+            let mut exp_ck = Vec::new();
+            unsafe {
+                let mut padded = vec![b'\n'; 64];
+                padded.extend_from_slice(ck_bytes);
+                padded.resize(padded.len() + 256, b'\n');
+                reader.scan::<4>(padded.as_ptr().add(64), ck_bytes.len(), 0, ck_bytes.len(), |b, s, e| {
+                    if let Some(c) = parse_click_row_cold(&sh, &mut dates, b, s, e) {
+                        exp_ck.push((c.click_tok, c.user_tok, c.ts, c.campaign));
+                    }
+                });
+            }
+            assert_eq!(got_ck, exp_ck, "synthetic boundary click mismatch");
+
+            lk_cases.push_str("u1,u2\n");
+            lk_cases.push_str("\"u3\",\"u4\"\n");
+            lk_cases.push_str(&format!("u{},u6\n", "a".repeat(70)));
+            lk_cases.push_str("u7,\"u8\n");
+            lk_cases.push_str("u9,u10\n".repeat(12).as_str());
+            let lk_bytes = lk_cases.as_bytes();
+            let got_lk = unsafe { run_lk_mask_pipeline(lk_bytes, 0, lk_bytes.len()) };
+            let mut exp_lk = Vec::new();
+            unsafe {
+                let mut padded = vec![b'\n'; 64];
+                padded.extend_from_slice(lk_bytes);
+                padded.resize(padded.len() + 256, b'\n');
+                reader.scan::<2>(padded.as_ptr().add(64), lk_bytes.len(), 0, lk_bytes.len(), |b, s, e| {
+                    let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
+                    if la != 0 && lb != 0 {
+                        let (ta, tb) = tok_pair(b.add(s[0] as usize), la, b.add(s[1] as usize), lb);
+                        if ta != tb {
+                            exp_lk.push((ta, tb));
+                        }
+                    }
+                });
+            }
+            assert_eq!(got_lk, exp_lk, "synthetic boundary link mismatch");
+
+            // 2. Real dev part-00001 files (including 8 unaligned extent splits on events)
+            let ev_bytes = std::fs::read(dev_dir.join("events/part-00001.csv")).unwrap();
+            let got_dev_ev = unsafe { run_ev_mask_pipeline(&sh, &ev_bytes, 0, ev_bytes.len()) };
+            let mut split_dev_ev = Vec::new();
+            for t in 0..8 {
+                let a = ev_bytes.len() * t / 8;
+                let b = ev_bytes.len() * (t + 1) / 8;
+                split_dev_ev.extend(unsafe { run_ev_mask_pipeline(&sh, &ev_bytes, a, b) });
+            }
+            assert_eq!(got_dev_ev, split_dev_ev, "dev event mask pipeline split mismatch");
+
+            let ck_bytes = std::fs::read(dev_dir.join("clicks/part-00001.csv")).unwrap();
+            let got_dev_ck = unsafe { run_ck_mask_pipeline(&sh, &ck_bytes, 0, ck_bytes.len()) };
+            let mut exp_dev_ck = Vec::new();
+            unsafe {
+                let mut padded = vec![b'\n'; 64];
+                padded.extend_from_slice(&ck_bytes);
+                padded.resize(padded.len() + 256, b'\n');
+                reader.scan::<4>(padded.as_ptr().add(64), ck_bytes.len(), 0, ck_bytes.len(), |b, s, e| {
+                    if let Some(c) = parse_click_row_cold(&sh, &mut dates, b, s, e) {
+                        exp_dev_ck.push((c.click_tok, c.user_tok, c.ts, c.campaign));
+                    }
+                });
+            }
+            assert_eq!(got_dev_ck, exp_dev_ck, "dev click mask pipeline mismatch");
+
+            let lk_bytes = std::fs::read(dev_dir.join("links/part-00001.csv")).unwrap();
+            let got_dev_lk = unsafe { run_lk_mask_pipeline(&lk_bytes, 0, lk_bytes.len()) };
+            let mut exp_dev_lk = Vec::new();
+            unsafe {
+                let mut padded = vec![b'\n'; 64];
+                padded.extend_from_slice(&lk_bytes);
+                padded.resize(padded.len() + 256, b'\n');
+                reader.scan::<2>(padded.as_ptr().add(64), lk_bytes.len(), 0, lk_bytes.len(), |b, s, e| {
+                    let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
+                    if la != 0 && lb != 0 {
+                        let (ta, tb) = tok_pair(b.add(s[0] as usize), la, b.add(s[1] as usize), lb);
+                        if ta != tb {
+                            exp_dev_lk.push((ta, tb));
+                        }
+                    }
+                });
+            }
+            assert_eq!(got_dev_lk, exp_dev_lk, "dev link mask pipeline mismatch");
+        }
+
+        // 3. All 36 hand-written fixture suites, padded with trailing dummy rows so every real fixture row goes through the direct mask loop!
+        let fixtures_root = Path::new("/home/colton/Documents/Projects/Builders/#3/fixtures");
+        if fixtures_root.exists() {
+            let mut reader = crate::csv::Reader::new(64 << 10);
+            let mut dates = DateCache::new();
+            for entry in std::fs::read_dir(fixtures_root).unwrap().flatten() {
+                let in_dir = entry.path().join("input");
+                if !in_dir.is_dir() {
+                    continue;
+                }
+                let f_sh = dummy_shared(&in_dir);
+                for ev_e in std::fs::read_dir(in_dir.join("events")).unwrap().flatten() {
+                    if ev_e.path().extension().is_some_and(|x| x == "csv") {
+                        let mut raw = std::fs::read(ev_e.path()).unwrap();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        if !raw.ends_with(b"\n") {
+                            raw.push(b'\n');
+                        }
+                        let real_end = raw.len();
+                        raw.extend_from_slice(&b"pad,pad,2027-01-01T00:00:00Z,2027-01-01T00:00:00Z,view,p1,0\n".repeat(4));
+                        let got = unsafe { run_ev_mask_pipeline(&f_sh, &raw, 0, real_end) };
+                        let mut exp = Vec::new();
+                        unsafe {
+                            let mut padded = vec![b'\n'; 64];
+                            padded.extend_from_slice(&raw);
+                            padded.resize(padded.len() + 256, b'\n');
+                            reader.scan::<7>(padded.as_ptr().add(64), raw.len(), 0, real_end, |b, s, e| {
+                                if let Some(c) = parse_event_row_cold(&f_sh, &mut dates, b, s, e) {
+                                    exp.push((c.event_tok, c.user_tok, c.ingest, c.ts, c.payload, c.valid));
+                                }
+                            });
+                        }
+                        assert_eq!(got, exp, "fixture {:?} event mask helper mismatch", entry.file_name());
+                    }
+                }
+                for ck_e in std::fs::read_dir(in_dir.join("clicks")).unwrap().flatten() {
+                    if ck_e.path().extension().is_some_and(|x| x == "csv") {
+                        let mut raw = std::fs::read(ck_e.path()).unwrap();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        if !raw.ends_with(b"\n") {
+                            raw.push(b'\n');
+                        }
+                        let real_end = raw.len();
+                        raw.extend_from_slice(&b"pad,pad,c_1,2027-01-01T00:00:00Z\n".repeat(5));
+                        let got = unsafe { run_ck_mask_pipeline(&f_sh, &raw, 0, real_end) };
+                        let mut exp = Vec::new();
+                        unsafe {
+                            let mut padded = vec![b'\n'; 64];
+                            padded.extend_from_slice(&raw);
+                            padded.resize(padded.len() + 256, b'\n');
+                            reader.scan::<4>(padded.as_ptr().add(64), raw.len(), 0, real_end, |b, s, e| {
+                                if let Some(c) = parse_click_row_cold(&f_sh, &mut dates, b, s, e) {
+                                    exp.push((c.click_tok, c.user_tok, c.ts, c.campaign));
+                                }
+                            });
+                        }
+                        assert_eq!(got, exp, "fixture {:?} click mask helper mismatch", entry.file_name());
+                    }
+                }
+                for lk_e in std::fs::read_dir(in_dir.join("links")).unwrap().flatten() {
+                    if lk_e.path().extension().is_some_and(|x| x == "csv") {
+                        let mut raw = std::fs::read(lk_e.path()).unwrap();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        if !raw.ends_with(b"\n") {
+                            raw.push(b'\n');
+                        }
+                        let real_end = raw.len();
+                        raw.extend_from_slice(&b"u0,u0\n".repeat(25));
+                        let got = unsafe { run_lk_mask_pipeline(&raw, 0, real_end) };
+                        let mut exp = Vec::new();
+                        unsafe {
+                            let mut padded = vec![b'\n'; 64];
+                            padded.extend_from_slice(&raw);
+                            padded.resize(padded.len() + 256, b'\n');
+                            reader.scan::<2>(padded.as_ptr().add(64), raw.len(), 0, real_end, |b, s, e| {
+                                let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
+                                if la != 0 && lb != 0 {
+                                    let (ta, tb) = tok_pair(b.add(s[0] as usize), la, b.add(s[1] as usize), lb);
+                                    if ta != tb {
+                                        exp.push((ta, tb));
+                                    }
+                                }
+                            });
+                        }
+                        assert_eq!(got, exp, "fixture {:?} link mask helper mismatch", entry.file_name());
+                    }
+                }
+            }
         }
     }
 
@@ -2363,45 +4478,52 @@ mod tests {
 
             let mut scan_reader = crate::csv::Reader::new(64 << 10);
             let mut scan_rows = 0usize;
+            let c_sr0 = ctrs.read();
             let t_scan0 = std::time::Instant::now();
-            unsafe {
-                scan_reader.scan::<7>(ptr, sz, 0, sz, |_buf, s, e| {
-                    std::hint::black_box((s[0], e[0]));
-                    scan_rows += 1;
-                });
+            for _ in 0..REPS {
+                scan_rows = 0;
+                unsafe {
+                    scan_reader.scan::<7>(ptr, sz, 0, sz, |_buf, s, e| {
+                        std::hint::black_box((s[0], e[0]));
+                        scan_rows += 1;
+                    });
+                }
             }
-            let dt_scan = t_scan0.elapsed();
+            let dt_scan = t_scan0.elapsed() / REPS as u32;
+            let c_sr1 = ctrs.read();
 
             let mut scan_only_reader = crate::csv::Reader::new(64 << 10);
             let mut scan_only_dates = DateCache::new();
             let mut scan_only_batch = FastEvBatch::new();
             let mut scan_only_rows = 0usize;
+            let c_so0 = ctrs.read();
             let t_so0 = std::time::Instant::now();
-            unsafe {
-                scan_events_fast(
-                    &mut scan_only_reader,
-                    &sh,
-                    &mut scan_only_dates,
-                    ptr,
-                    sz,
-                    0,
-                    sz,
-                    &mut scan_only_batch,
-                    |b| {
-                        scan_only_rows += b.len;
-                        std::hint::black_box(b.canonical_valid_mask);
-                    },
-                );
+            for _ in 0..REPS {
+                scan_only_rows = 0;
+                unsafe {
+                    scan_events_fast(
+                        &mut scan_only_reader,
+                        &sh,
+                        &mut scan_only_dates,
+                        ptr,
+                        sz,
+                        0,
+                        sz,
+                        &mut scan_only_batch,
+                        |b| {
+                            scan_only_rows += b.len;
+                            std::hint::black_box(b.canonical_valid_mask);
+                        },
+                    );
+                }
             }
-            let dt_so = t_so0.elapsed();
+            let dt_so = t_so0.elapsed() / REPS as u32;
+            let c_so1 = ctrs.read();
 
             crate::sys::unmap_file(ptr, sz);
             let mb = sz as f64 / (1024.0 * 1024.0);
-            let dt_line = dt_scan.saturating_sub(dt_idx);
-            let dt_scan_body = dt_so.saturating_sub(dt_scan);
-            let dt_classify = dt.saturating_sub(dt_so);
             eprintln!(
-                "[fast_parse bench] {dir_name}/events/part-00001.csv ({:.2} MiB, {} rows, {} delims): total={:?} ({:.1} MiB/s) [Mcyc={:.3}, Minstr={:.3}, Mllc={:.3}, Mbr={:.3}] | index={:?} ({:.1}%), line_loop={:?} ({:.1}%), scan_body={:?} ({:.1}%), classify={:?} ({:.1}%), scan_rows={}, so_rows={}",
+                "[fast_parse bench] {dir_name}/events/part-00001.csv ({:.2} MiB, {} rows, {} delims): scan_fast+classify={:?} ({:.1} MiB/s) [Mcyc={:.3}, Minstr={:.3}, Mllc={:.3}, Mbr={:.3}] | scan_fast_only={:?} ({:.1} MiB/s) [Mcyc={:.3}, Minstr={:.3}] | csv_reader_base={:?} [Mcyc={:.3}, Minstr={:.3}] (idx={:?}), scan_rows={}, so_rows={}",
                 mb,
                 total_normal + total_fallback,
                 delims,
@@ -2411,14 +4533,14 @@ mod tests {
                 c1[1].saturating_sub(c0[1]) as f64 / (1e6 * REPS as f64),
                 c1[2].saturating_sub(c0[2]) as f64 / (1e6 * REPS as f64),
                 c1[3].saturating_sub(c0[3]) as f64 / (1e6 * REPS as f64),
+                dt_so,
+                mb / dt_so.as_secs_f64(),
+                c_so1[0].saturating_sub(c_so0[0]) as f64 / (1e6 * REPS as f64),
+                c_so1[1].saturating_sub(c_so0[1]) as f64 / (1e6 * REPS as f64),
+                dt_scan,
+                c_sr1[0].saturating_sub(c_sr0[0]) as f64 / (1e6 * REPS as f64),
+                c_sr1[1].saturating_sub(c_sr0[1]) as f64 / (1e6 * REPS as f64),
                 dt_idx,
-                dt_idx.as_secs_f64() * 100.0 / dt.as_secs_f64(),
-                dt_line,
-                dt_line.as_secs_f64() * 100.0 / dt.as_secs_f64(),
-                dt_scan_body,
-                dt_scan_body.as_secs_f64() * 100.0 / dt.as_secs_f64(),
-                dt_classify,
-                dt_classify.as_secs_f64() * 100.0 / dt.as_secs_f64(),
                 scan_rows,
                 scan_only_rows,
             );

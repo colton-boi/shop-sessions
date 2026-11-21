@@ -254,6 +254,7 @@ pub struct FastUserBatch {
     pub events: Vec<i32>,
     pub revenue_cents: Vec<i32>,
     pub top_category: Vec<u8>,
+    row_cap: usize,
 }
 
 impl Default for FastUserBatch {
@@ -264,17 +265,94 @@ impl Default for FastUserBatch {
 
 impl FastUserBatch {
     pub fn new() -> Self {
+        Self::with_capacity(32 << 10)
+    }
+
+    pub fn with_capacity(est_rows: usize) -> Self {
+        let est_rows = est_rows.max(1024);
+        let est_users = (est_rows / 4).max(1024);
+        let mut names_offsets = Vec::with_capacity(est_users + 1);
+        names_offsets.push(0);
+        let person_keys = Vec::with_capacity(est_rows);
+        let day = Vec::with_capacity(est_rows);
+        let sessions = Vec::with_capacity(est_rows);
+        let events = Vec::with_capacity(est_rows);
+        let revenue_cents = Vec::with_capacity(est_rows);
+        let top_category = Vec::with_capacity(est_rows);
+        let row_cap = person_keys
+            .capacity()
+            .min(day.capacity())
+            .min(sessions.capacity())
+            .min(events.capacity())
+            .min(revenue_cents.capacity())
+            .min(top_category.capacity());
         Self {
             person_tokens: Vec::new(),
             rows: Vec::new(),
-            names_data: Vec::with_capacity(256 << 10),
-            names_offsets: vec![0],
-            person_keys: Vec::with_capacity(32 << 10),
-            day: Vec::with_capacity(32 << 10),
-            sessions: Vec::with_capacity(32 << 10),
-            events: Vec::with_capacity(32 << 10),
-            revenue_cents: Vec::with_capacity(32 << 10),
-            top_category: Vec::with_capacity(32 << 10),
+            names_data: Vec::with_capacity(est_users * 9),
+            names_offsets,
+            person_keys,
+            day,
+            sessions,
+            events,
+            revenue_cents,
+            top_category,
+            row_cap,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_rows(&mut self) {
+        self.person_keys.reserve(1);
+        self.day.reserve(1);
+        self.sessions.reserve(1);
+        self.events.reserve(1);
+        self.revenue_cents.reserve(1);
+        self.top_category.reserve(1);
+        self.row_cap = self
+            .person_keys
+            .capacity()
+            .min(self.day.capacity())
+            .min(self.sessions.capacity())
+            .min(self.events.capacity())
+            .min(self.revenue_cents.capacity())
+            .min(self.top_category.capacity());
+    }
+
+    #[inline(always)]
+    pub fn push_row(
+        &mut self,
+        person_idx: u32,
+        day: i32,
+        sessions: i32,
+        events: i32,
+        revenue_cents: i32,
+        top_category: u8,
+    ) {
+        let n = self.person_keys.len();
+        debug_assert_eq!(self.day.len(), n);
+        debug_assert_eq!(self.sessions.len(), n);
+        debug_assert_eq!(self.events.len(), n);
+        debug_assert_eq!(self.revenue_cents.len(), n);
+        debug_assert_eq!(self.top_category.len(), n);
+        if n == self.row_cap {
+            self.grow_rows();
+        }
+        unsafe {
+            *self.person_keys.as_mut_ptr().add(n) = person_idx;
+            *self.day.as_mut_ptr().add(n) = day;
+            *self.sessions.as_mut_ptr().add(n) = sessions;
+            *self.events.as_mut_ptr().add(n) = events;
+            *self.revenue_cents.as_mut_ptr().add(n) = revenue_cents;
+            *self.top_category.as_mut_ptr().add(n) = top_category;
+            let new_len = n + 1;
+            self.person_keys.set_len(new_len);
+            self.day.set_len(new_len);
+            self.sessions.set_len(new_len);
+            self.events.set_len(new_len);
+            self.revenue_cents.set_len(new_len);
+            self.top_category.set_len(new_len);
         }
     }
 
@@ -319,7 +397,7 @@ impl FastUserBatch {
         let base_len = self.names_data.len();
         unsafe {
             let dst = &mut *(self.names_data.as_mut_ptr().add(base_len) as *mut [u8; 9]);
-            let len = crate::unscramble::encode_b36(b'u', best_y, dst);
+            let len = crate::fast_b36::encode_b36_nodiv(b'u', best_y, dst);
             self.names_data.set_len(base_len + len);
             self.names_offsets.push((base_len + len) as u32);
         }
@@ -428,10 +506,11 @@ pub struct FastSessWorker {
     pub sday: Vec<u32>,
     /// Identified user runs in the current 32K block.
     pub runs: Vec<UserRun>,
-    /// Per-thread `campaign_daily` cells (`(num_campaigns + 1) * days`).
+    /// Per-thread `campaign_daily` cells (`(num_campaigns + 1) * days`), touched on purchasing sessions and finalized at end.
     pub cells: Vec<Cell>,
-    /// Separate per-thread `assisted_sessions` table (`num_campaigns * days`) for cache-friendly click assist updates.
-    pub assisted: Vec<u32>,
+    /// Packed `(sessions, assisted)` counters (`8 bytes/cell` = `224 KiB` on 2K campaigns x 14 days)
+    /// so non-purchasing sessions avoid touching `cells` (`672 KiB`) during `sess3a`.
+    sess_assist: Vec<SessAssist>,
     /// Generation-tagged coverage array (`num_campaigns`) for the `> 16` clicks two-pointer assist loop.
     covered: Vec<u64>,
     assist_gen: u32,
@@ -443,10 +522,22 @@ pub struct FastSessWorker {
     pub kept_odd_events: Vec<(u32, u64)>,
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct SessAssist {
+    sessions: u32,
+    assisted: u32,
+}
+
 impl FastSessWorker {
     pub fn new(num_campaigns: usize, days: usize) -> Self {
+        let est_rows = if num_campaigns > 8 { 512_000 } else { 32 << 10 };
+        Self::new_with_capacity(num_campaigns, days, est_rows)
+    }
+
+    pub fn new_with_capacity(num_campaigns: usize, days: usize, est_rows_per_thread: usize) -> Self {
         let total_cells = (num_campaigns + 1) * days;
-        // Allocate 512 KiB arrays directly on the heap without overflowing the stack.
+        // Allocate 256 KiB / 128 KiB arrays directly on the heap without overflowing the stack.
         let slots: Box<[FastEvRec; BLOCK_EVENTS]> = vec![FastEvRec::default(); BLOCK_EVENTS]
             .into_boxed_slice()
             .try_into()
@@ -456,6 +547,7 @@ impl FastSessWorker {
             .try_into()
             .unwrap();
         let tile = Box::<RunTileBuf>::default();
+        let big = est_rows_per_thread > (32 << 10);
 
         Self {
             slots,
@@ -468,19 +560,20 @@ impl FastSessWorker {
             sday: Vec::with_capacity(8192),
             runs: Vec::with_capacity(2048),
             cells: vec![Cell::default(); total_cells],
-            assisted: vec![0u32; total_cells],
+            sess_assist: vec![SessAssist::default(); total_cells],
             covered: vec![0u64; num_campaigns.max(1)],
             assist_gen: 0,
-            user_out: FastUserBatch::new(),
-            boundary_segs: Vec::new(),
-            kept_odd_events: Vec::new(),
+            user_out: FastUserBatch::with_capacity(est_rows_per_thread),
+            boundary_segs: Vec::with_capacity(if big { 256 } else { 0 }),
+            kept_odd_events: Vec::with_capacity(if big { 4096 } else { 0 }),
         }
     }
 
-    /// Merges `assisted` into `cells` and returns the thread's `campaign_daily` cells.
+    /// Merges `sess_assist` into `cells` and returns the thread's `campaign_daily` cells.
     pub fn finalize_cells(&mut self) -> &[Cell] {
-        for (c, &a) in self.cells.iter_mut().zip(&self.assisted) {
-            c.assisted = a;
+        for (c, &sa) in self.cells.iter_mut().zip(&self.sess_assist) {
+            c.sessions = sa.sessions;
+            c.assisted = sa.assisted;
         }
         &self.cells
     }
@@ -554,6 +647,33 @@ impl FastSessWorker {
         self.finish_block_32k_after_dedup(block_idx, gen, cfg);
     }
 
+    /// Stage 3A (linked-chunk arena variant): Processes one block of up to 16,384 consecutive
+    /// `event_index` slots directly from `LinkedChunkArena<FastEvRec>` without `by_partition` regrouping.
+    pub unsafe fn process_block_linked(
+        &mut self,
+        block_idx: u32,
+        chunks: crate::fast_arena::ChunkIter<'_, FastEvRec>,
+        cfg: &FastSessConfig<'_>,
+    ) {
+        let mut any = false;
+        let mut gen = 0u16;
+        let slots_ptr = self.slots.as_mut_ptr();
+        for chunk in chunks {
+            let slice = chunk.as_slice();
+            if slice.is_empty() {
+                continue;
+            }
+            if !any {
+                gen = self.next_generation();
+                any = true;
+            }
+            Self::dedup_slice(slots_ptr, slice, gen);
+        }
+        if any {
+            self.finish_block_32k_after_dedup(block_idx, gen, cfg);
+        }
+    }
+
     /// Stage 3A: Processes one block of up to 32,768 consecutive `event_index` slots:
     /// 1. Direct-index L2 dedup in `self.slots` using generation counter `self.gen`.
     /// 2. L1-tiled compaction of live valid events into `q_w0` + `pkm` and fused boundary pass.
@@ -591,7 +711,32 @@ impl FastSessWorker {
 
         // 3. Process interior user runs (`r in 1..nrun-1`)
         if nrun >= 3 {
-            for r in 1..(nrun - 1) {
+            let last_interior = nrun - 1;
+            for r in 1..last_interior {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    if r + 3 < last_interior {
+                        let u3 = (*self.runs.get_unchecked(r + 3)).user_idx as usize;
+                        if u3 < cfg.alias_masks.len() {
+                            _mm_prefetch(cfg.alias_masks.as_ptr().add(u3) as *const i8, _MM_HINT_T0);
+                        }
+                        if u3 < cfg.click_csr.user_cap {
+                            _mm_prefetch(cfg.click_csr.csr_off.as_ptr().add(u3) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(cfg.click_csr.csr_off.as_ptr().add(u3 + 1) as *const i8, _MM_HINT_T0);
+                        }
+                    }
+                    if r + 1 < last_interior {
+                        let u1 = (*self.runs.get_unchecked(r + 1)).user_idx as usize;
+                        if u1 < cfg.click_csr.user_cap {
+                            let s1 = cfg.click_csr.csr_slice(u1);
+                            if !s1.is_empty() {
+                                _mm_prefetch(s1.as_ptr() as *const i8, _MM_HINT_T0);
+                            }
+                        }
+                    }
+                }
+
                 let run = self.runs[r];
                 let u = run.user_idx as usize;
                 let ut = if u < cfg.alias_masks.len() { cfg.alias_masks[u] } else { IS_COMPLEX };
@@ -650,7 +795,6 @@ impl FastSessWorker {
 
     /// Fuses compaction of occupied valid slots from `self.slots[0..BLOCK_EVENTS]` into `q_w0` + `pkm`
     /// with L1-tiled run/session boundary detection (`sts`, `s_ev_start`, `runs`).
-    /// Uses 256-bit AVX2 (avoiding 512-bit `zmm` frequency downclocking).
     #[inline(always)]
     fn compact_and_identify(&mut self, gen: u16) -> usize {
         self.sts.clear();
@@ -658,6 +802,9 @@ impl FastSessWorker {
         self.runs.clear();
         #[cfg(target_arch = "x86_64")]
         unsafe {
+            if use_avx512() {
+                return self.compact_and_identify_avx512(gen);
+            }
             if is_x86_feature_detected!("avx2") {
                 return self.compact_and_identify_avx2(gen);
             }
@@ -864,6 +1011,27 @@ impl FastSessWorker {
                         m |= 1u16 << (*alias_ptr.add(i + lane));
                     }
                     cur_run.alias_mask = m;
+                }
+            } else if (u_start_mask | unsorted_mask) == 0 {
+                let aliases = (alias_ptr.add(i) as *const u64).read_unaligned();
+                let a0 = *alias_ptr.add(i);
+                if aliases == (a0 as u64).wrapping_mul(0x0101_0101_0101_0101) {
+                    cur_run.alias_mask |= 1u16 << a0;
+                } else {
+                    let mut m = cur_run.alias_mask;
+                    for lane in 0..8 {
+                        m |= 1u16 << (*alias_ptr.add(i + lane));
+                    }
+                    cur_run.alias_mask = m;
+                }
+                let mut gm = gt_gap_mask;
+                while gm != 0 {
+                    let lane = gm.trailing_zeros() as usize;
+                    gm &= gm - 1;
+                    let idx = i + lane;
+                    let g_idx = (total_k + idx - 1) as u16;
+                    sts.push(*ts_ptr.add(idx));
+                    s_ev_start.push(g_idx);
                 }
             } else {
                 for lane in 0..8 {
@@ -1087,6 +1255,309 @@ impl FastSessWorker {
         total_k
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn flush_tile_avx512(
+        tile: &mut RunTileBuf,
+        sts: &mut Vec<u32>,
+        s_ev_start: &mut Vec<u16>,
+        runs: &mut Vec<UserRun>,
+        total_k: usize,
+        t: usize,
+        cur_run: &mut UserRun,
+        has_started: &mut bool,
+    ) {
+        use std::arch::x86_64::*;
+        let end = 1 + t;
+        let mut i = if !*has_started {
+            *cur_run = UserRun {
+                user_idx: *tile.user.get_unchecked(1),
+                ev_start: total_k as u16,
+                ev_end: 0,
+                sess_start: sts.len() as u32,
+                sess_end: 0,
+                alias_mask: 1u16 << (*tile.alias.get_unchecked(1)),
+                unsorted: false,
+            };
+            sts.push(*tile.ts.get_unchecked(1));
+            s_ev_start.push(total_k as u16);
+            *has_started = true;
+            2usize
+        } else {
+            1usize
+        };
+
+        let v_gap = _mm512_set1_epi32(SESSION_GAP_MS as i32);
+        let u_ptr = tile.user.as_ptr();
+        let ts_ptr = tile.ts.as_ptr();
+        let alias_ptr = tile.alias.as_ptr();
+
+        while i + 16 <= end {
+            let u_cur = _mm512_loadu_si512(u_ptr.add(i) as *const __m512i);
+            let u_prev = _mm512_loadu_si512(u_ptr.add(i - 1) as *const __m512i);
+            let u_start_mask = _mm512_cmpneq_epi32_mask(u_cur, u_prev) as u32;
+
+            let ts_cur = _mm512_loadu_si512(ts_ptr.add(i) as *const __m512i);
+            let ts_prev = _mm512_loadu_si512(ts_ptr.add(i - 1) as *const __m512i);
+
+            let lt_mask = _mm512_cmplt_epu32_mask(ts_cur, ts_prev) as u32;
+            let unsorted_mask = lt_mask & !u_start_mask;
+
+            let diff = _mm512_sub_epi32(ts_cur, ts_prev);
+            let gt_gap_mask = (_mm512_cmpgt_epu32_mask(diff, v_gap) as u32) & !lt_mask;
+
+            let any_boundary = u_start_mask | gt_gap_mask | unsorted_mask;
+            if any_boundary == 0 {
+                let ap = alias_ptr.add(i);
+                let a0 = *ap;
+                let rep = (a0 as u64).wrapping_mul(0x0101_0101_0101_0101);
+                if (ap as *const u64).read_unaligned() == rep
+                    && (ap.add(8) as *const u64).read_unaligned() == rep
+                {
+                    cur_run.alias_mask |= 1u16 << a0;
+                } else {
+                    let mut m = cur_run.alias_mask;
+                    for lane in 0..16 {
+                        m |= 1u16 << (*alias_ptr.add(i + lane));
+                    }
+                    cur_run.alias_mask = m;
+                }
+            } else if (u_start_mask | unsorted_mask) == 0 {
+                let ap = alias_ptr.add(i);
+                let a0 = *ap;
+                let rep = (a0 as u64).wrapping_mul(0x0101_0101_0101_0101);
+                if (ap as *const u64).read_unaligned() == rep
+                    && (ap.add(8) as *const u64).read_unaligned() == rep
+                {
+                    cur_run.alias_mask |= 1u16 << a0;
+                } else {
+                    let mut m = cur_run.alias_mask;
+                    for lane in 0..16 {
+                        m |= 1u16 << (*alias_ptr.add(i + lane));
+                    }
+                    cur_run.alias_mask = m;
+                }
+                let mut gm = gt_gap_mask;
+                while gm != 0 {
+                    let lane = gm.trailing_zeros() as usize;
+                    gm &= gm - 1;
+                    let idx = i + lane;
+                    let g_idx = (total_k + idx - 1) as u16;
+                    sts.push(*ts_ptr.add(idx));
+                    s_ev_start.push(g_idx);
+                }
+            } else {
+                for lane in 0..16 {
+                    let idx = i + lane;
+                    let g_idx = (total_k + idx - 1) as u16;
+                    let bit = 1u32 << lane;
+                    let alias = *alias_ptr.add(idx);
+                    if (u_start_mask & bit) != 0 {
+                        cur_run.ev_end = g_idx;
+                        cur_run.sess_end = sts.len() as u32;
+                        runs.push(*cur_run);
+
+                        let u = *u_ptr.add(idx);
+                        let ts = *ts_ptr.add(idx);
+                        *cur_run = UserRun {
+                            user_idx: u,
+                            ev_start: g_idx,
+                            ev_end: 0,
+                            sess_start: sts.len() as u32,
+                            sess_end: 0,
+                            alias_mask: 1u16 << alias,
+                            unsorted: false,
+                        };
+                        sts.push(ts);
+                        s_ev_start.push(g_idx);
+                    } else {
+                        cur_run.alias_mask |= 1u16 << alias;
+                        if (unsorted_mask & bit) != 0 {
+                            cur_run.unsorted = true;
+                        } else if (gt_gap_mask & bit) != 0 {
+                            sts.push(*ts_ptr.add(idx));
+                            s_ev_start.push(g_idx);
+                        }
+                    }
+                }
+            }
+            i += 16;
+        }
+
+        while i < end {
+            let g_idx = (total_k + i - 1) as u16;
+            let u = *u_ptr.add(i);
+            let ts = *ts_ptr.add(i);
+            let prev_ts = *ts_ptr.add(i - 1);
+            let alias = *alias_ptr.add(i);
+            if u != cur_run.user_idx {
+                cur_run.ev_end = g_idx;
+                cur_run.sess_end = sts.len() as u32;
+                runs.push(*cur_run);
+
+                *cur_run = UserRun {
+                    user_idx: u,
+                    ev_start: g_idx,
+                    ev_end: 0,
+                    sess_start: sts.len() as u32,
+                    sess_end: 0,
+                    alias_mask: 1u16 << alias,
+                    unsorted: false,
+                };
+                sts.push(ts);
+                s_ev_start.push(g_idx);
+            } else {
+                cur_run.alias_mask |= 1u16 << alias;
+                if ts < prev_ts {
+                    cur_run.unsorted = true;
+                } else if ts - prev_ts > SESSION_GAP_MS {
+                    sts.push(ts);
+                    s_ev_start.push(g_idx);
+                }
+            }
+            i += 1;
+        }
+
+        tile.user[0] = *u_ptr.add(t);
+        tile.ts[0] = *ts_ptr.add(t);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+    unsafe fn compact_and_identify_avx512(&mut self, gen: u16) -> usize {
+        use std::arch::x86_64::*;
+        self.pkm.fill(0);
+        let mut total_k = 0usize;
+        let mut t = 0usize;
+        let mut cur_run = UserRun::default();
+        let mut has_started = false;
+
+        let tags = _mm512_setr_epi64(
+            0u16.wrapping_add(gen) as i64,
+            1u16.wrapping_add(gen) as i64,
+            2u16.wrapping_add(gen) as i64,
+            3u16.wrapping_add(gen) as i64,
+            4u16.wrapping_add(gen) as i64,
+            5u16.wrapping_add(gen) as i64,
+            6u16.wrapping_add(gen) as i64,
+            7u16.wrapping_add(gen) as i64,
+        );
+        let mask16 = _mm512_set1_epi64(0xFFFF);
+        let mask25 = _mm512_set1_epi64(0x1FF_FFFF);
+        let mask_f = _mm512_set1_epi64(0xF);
+        let price_mask = _mm512_set1_epi64((0xFF_FFFFu64 << 9) as i64);
+        let odd_bit_vec = _mm512_set1_epi64(ODD_USER_BIT as i64);
+        let inv_w0 = _mm512_set1_epi64(-1);
+        let idx_even = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        let idx_odd = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+        let mut w0_buf = [0u64; 8];
+        let mut w1_buf = [0u64; 8];
+
+        let slots_ptr = self.slots.as_ptr() as *const __m512i;
+        let q_w0_ptr = self.q_w0.as_mut_ptr();
+        let pkm_byte_ptr = self.pkm.as_mut_ptr() as *mut u8;
+        let tile = &mut *self.tile;
+
+        for chunk in 0..(BLOCK_EVENTS / 8) {
+            let v0 = _mm512_loadu_si512(slots_ptr.add(chunk * 2));
+            let v1 = _mm512_loadu_si512(slots_ptr.add(chunk * 2 + 1));
+            let w0 = _mm512_permutex2var_epi64(v0, idx_even, v1);
+            let w1 = _mm512_permutex2var_epi64(v0, idx_odd, v1);
+
+            let slot_tags = _mm512_and_si512(w1, mask16);
+            let occupied = _mm512_cmpeq_epi64_mask(slot_tags, tags);
+            let valid = _mm512_cmpneq_epi64_mask(w0, inv_w0);
+            let live = occupied & valid;
+            if live == 0 {
+                continue;
+            }
+
+            let cnt = live.count_ones() as usize;
+            let odd_mask = _mm512_test_epi64_mask(w1, odd_bit_vec);
+            if (live & odd_mask) == 0 {
+                let k = total_k + t;
+                let tp = 1 + t;
+                let w0_c = _mm512_maskz_compress_epi64(live, w0);
+                let w1_c = _mm512_maskz_compress_epi64(live, w1);
+                _mm512_mask_compressstoreu_epi64(q_w0_ptr.add(k) as *mut i64, live, w0);
+
+                let u64v = _mm512_and_si512(_mm512_srli_epi64(w1_c, 37), mask25);
+                let u32v = _mm512_cvtepi64_epi32(u64v);
+                _mm256_storeu_si256(tile.user.as_mut_ptr().add(tp) as *mut __m256i, u32v);
+
+                let ts32 = _mm512_cvtepi64_epi32(_mm512_srli_epi64(w0_c, 33));
+                _mm256_storeu_si256(tile.ts.as_mut_ptr().add(tp) as *mut __m256i, ts32);
+
+                let a8 = _mm512_cvtepi64_epi8(_mm512_and_si512(w0_c, mask_f));
+                _mm_storel_epi64(tile.alias.as_mut_ptr().add(tp) as *mut __m128i, a8);
+
+                let purch_mask = _mm512_test_epi64_mask(w0_c, price_mask) as u16;
+                let pkm_u16 = pkm_byte_ptr.add(k >> 3) as *mut u16;
+                pkm_u16.write_unaligned(pkm_u16.read_unaligned() | (purch_mask << (k & 7)));
+
+                t += cnt;
+            } else {
+                _mm512_mask_compressstoreu_epi64(w0_buf.as_mut_ptr() as *mut i64, live, w0);
+                _mm512_mask_compressstoreu_epi64(w1_buf.as_mut_ptr() as *mut i64, live, w1);
+
+                for i in 0..cnt {
+                    let cw0 = w0_buf[i];
+                    let cw1 = w1_buf[i];
+                    if (cw1 & ODD_USER_BIT) != 0 {
+                        let handle = ((cw1 >> 37) & 0x1FF_FFFF) as u32;
+                        self.kept_odd_events.push((handle, cw0));
+                        continue;
+                    }
+                    let k = total_k + t;
+                    let tp = 1 + t;
+                    *q_w0_ptr.add(k) = cw0;
+                    *tile.user.get_unchecked_mut(tp) = ((cw1 >> 37) & 0x1FF_FFFF) as u32;
+                    *tile.ts.get_unchecked_mut(tp) = (cw0 >> 33) as u32;
+                    *tile.alias.get_unchecked_mut(tp) = (cw0 & 0xF) as u8;
+                    let is_purch = ((cw0 >> 9) & 0xFF_FFFF) != 0;
+                    *self.pkm.get_unchecked_mut(k >> 6) |= (is_purch as u64) << (k & 63);
+                    t += 1;
+                }
+            }
+
+            if t >= TILE_FLUSH {
+                Self::flush_tile_avx512(
+                    tile,
+                    &mut self.sts,
+                    &mut self.s_ev_start,
+                    &mut self.runs,
+                    total_k,
+                    t,
+                    &mut cur_run,
+                    &mut has_started,
+                );
+                total_k += t;
+                t = 0;
+            }
+        }
+
+        if t > 0 {
+            Self::flush_tile_avx512(
+                tile,
+                &mut self.sts,
+                &mut self.s_ev_start,
+                &mut self.runs,
+                total_k,
+                t,
+                &mut cur_run,
+                &mut has_started,
+            );
+            total_k += t;
+        }
+        if has_started {
+            cur_run.ev_end = total_k as u16;
+            cur_run.sess_end = self.sts.len() as u32;
+            self.runs.push(cur_run);
+            self.s_ev_start.push(total_k as u16);
+        }
+        total_k
+    }
+
     /// Attributes sessions `[run.sess_start..run.sess_end)` for `run.user_idx`, aggregates purchase
     /// events via `self.pkm`, updates `campaign_daily` counters, and appends `user_daily` rows.
     fn attribute_and_emit_run(
@@ -1115,19 +1586,12 @@ impl FastSessWorker {
             self.user_out.person_tokens.push(winner_tok);
         }
 
-        // Compute session days via exact magic multiply `(((sts[s] + ws_day_offset) >> 10) * 6_515_625) >> 39`
-        self.sday.clear();
-        self.sday.extend(
-            (s0..s1).map(|s| fast_session_day(unsafe { *self.sts.get_unchecked(s) }, cfg.ws_day_offset)),
-        );
-
         let raw_clicks = if (run.user_idx as usize) < cfg.click_csr.user_cap {
             cfg.click_csr.csr_slice(run.user_idx as usize)
         } else {
             &[]
         };
 
-        // Check if all clicks in `raw_clicks` belong to `class`
         let all_in_class = raw_clicks.iter().all(|c| (class & (1u16 << c.alias())) != 0);
         let filtered_buf: Vec<ClickSlot>;
         let clicks: &[ClickSlot] = if all_in_class {
@@ -1141,15 +1605,156 @@ impl FastSessWorker {
             &filtered_buf
         };
 
+        let any_purch = has_any_purchase(&self.pkm, run.ev_start as usize, run.ev_end as usize);
+
+        if nsess == 1 {
+            self.attribute_and_emit_single_sess(person_idx, run, clicks, any_purch, cfg);
+            return;
+        }
+
+        let nck = clicks.len();
+        match (any_purch, nck) {
+            (false, 0) => self.attribute_and_emit_multi_sess::<false, 0>(person_idx, s0, nsess, clicks, cfg),
+            (false, 1..=16) => self.attribute_and_emit_multi_sess::<false, 1>(person_idx, s0, nsess, clicks, cfg),
+            (false, _) => self.attribute_and_emit_multi_sess::<false, 2>(person_idx, s0, nsess, clicks, cfg),
+            (true, 0) => self.attribute_and_emit_multi_sess::<true, 0>(person_idx, s0, nsess, clicks, cfg),
+            (true, 1..=16) => self.attribute_and_emit_multi_sess::<true, 1>(person_idx, s0, nsess, clicks, cfg),
+            (true, _) => self.attribute_and_emit_multi_sess::<true, 2>(person_idx, s0, nsess, clicks, cfg),
+        }
+    }
+
+    fn attribute_and_emit_single_sess(
+        &mut self,
+        person_idx: u32,
+        run: UserRun,
+        clicks: &[ClickSlot],
+        any_purch: bool,
+        cfg: &FastSessConfig<'_>,
+    ) {
+        let s0 = run.sess_start as usize;
+        let s_ts = unsafe { *self.sts.get_unchecked(s0) };
+        let ev_start = unsafe { *self.s_ev_start.get_unchecked(s0) } as usize;
+        let ev_end = unsafe { *self.s_ev_start.get_unchecked(s0 + 1) } as usize;
+        let s_day = fast_session_day(s_ts, cfg.ws_day_offset);
+        let days = cfg.days;
+        let organic = cfg.num_campaigns;
+        let nck = clicks.len();
+
+        let credited_camp = if nck == 0 {
+            organic
+        } else if nck == 1 {
+            let c0 = unsafe { *clicks.get_unchecked(0) };
+            if s_ts.wrapping_sub(c0.ts()) <= WEEK_MS {
+                let camp = c0.camp() as usize;
+                self.sess_assist[camp * days + s_day as usize].assisted += 1;
+                camp
+            } else {
+                organic
+            }
+        } else if nck <= 16 {
+            let mut credited = organic;
+            let mut seen = [0u32; 16];
+            let mut n_seen = 0usize;
+            for c in clicks {
+                if s_ts.wrapping_sub(c.ts()) <= WEEK_MS {
+                    let camp = c.camp();
+                    credited = camp as usize;
+                    if !seen[..n_seen].contains(&camp) {
+                        seen[n_seen] = camp;
+                        n_seen += 1;
+                        self.sess_assist[credited * days + s_day as usize].assisted += 1;
+                    }
+                }
+            }
+            credited
+        } else {
+            self.assist_gen = self.assist_gen.wrapping_add(1);
+            let gen_tag = (self.assist_gen as u64) << 32;
+            let hi = clicks.partition_point(|c| c.ts() <= s_ts);
+            let credited = if hi > 0 && s_ts - clicks[hi - 1].ts() <= WEEK_MS {
+                clicks[hi - 1].camp() as usize
+            } else {
+                organic
+            };
+            for c in &clicks[..hi] {
+                if s_ts - c.ts() > WEEK_MS {
+                    continue;
+                }
+                let camp = c.camp() as usize;
+                if camp >= self.covered.len() {
+                    self.covered.resize(camp + 1, 0);
+                }
+                let cov = &mut self.covered[camp];
+                if (*cov & 0xFFFF_FFFF_0000_0000) != gen_tag {
+                    *cov = gen_tag | 1;
+                    self.sess_assist[camp * days + s_day as usize].assisted += 1;
+                }
+            }
+            credited
+        };
+
+        let (sess_rev, top_category) = if !any_purch {
+            (0u64, None)
+        } else {
+            let mut cat_rev = [0u64; 32];
+            let mut cat_mask = 0u32;
+            let rev = sum_session_purchases(
+                &self.pkm,
+                &*self.q_w0,
+                ev_start,
+                ev_end,
+                &mut cat_rev,
+                &mut cat_mask,
+            );
+            (rev, resolve_top_category(&mut cat_rev, &mut cat_mask))
+        };
+
+        let idx = credited_camp * days + s_day as usize;
+        self.sess_assist[idx].sessions += 1;
+        if sess_rev > 0 {
+            let cell = &mut self.cells[idx];
+            cell.purchasing += 1;
+            cell.revenue += sess_rev;
+        }
+
+        let day = cfg.first_day + s_day as i32;
+        let nev = (ev_end - ev_start) as u32;
+        #[cfg(test)]
+        self.user_out.rows.push(FastUserDailyRow {
+            person_idx,
+            day,
+            sessions: 1,
+            events: nev,
+            revenue_cents: sess_rev,
+            top_category,
+        });
+        self.user_out.push_row(
+            person_idx,
+            day,
+            1,
+            nev as i32,
+            sess_rev as i32,
+            top_category.unwrap_or(crate::fast_parquet::NULL_CAT),
+        );
+    }
+
+    fn attribute_and_emit_multi_sess<const HAS_PURCH: bool, const CLICK_MODE: u8>(
+        &mut self,
+        person_idx: u32,
+        s0: usize,
+        nsess: usize,
+        clicks: &[ClickSlot],
+        cfg: &FastSessConfig<'_>,
+    ) {
         let nck = clicks.len();
         let days = cfg.days;
         let organic = cfg.num_campaigns;
 
-        // Precompute same_camp_mask[0..16] for the 1..=16 clicks vectorized fast path
+        // Precompute same_camp_mask[0..16] only when `CLICK_MODE == 1` and `nck > 1`
         let mut ck_ts16 = [u32::MAX; 16];
         let mut ck_camp16 = [0u32; 16];
         let mut same_camp_mask16 = [0u16; 16];
-        if (1..=16).contains(&nck) {
+        if CLICK_MODE == 1 && nck > 1 {
             for i in 0..nck {
                 ck_ts16[i] = clicks[i].ts();
                 ck_camp16[i] = clicks[i].camp();
@@ -1165,21 +1770,27 @@ impl FastSessWorker {
             }
         }
 
-        let mut cur_day = self.sday[0];
+        if CLICK_MODE == 2 {
+            self.sday.clear();
+        }
+
+        let mut cur_day = fast_session_day(unsafe { *self.sts.get_unchecked(s0) }, cfg.ws_day_offset);
         let mut day_sessions = 0u32;
         let mut day_events = 0u32;
         let mut day_rev = 0u64;
         let mut cat_rev = [0u64; 32];
         let mut cat_mask = 0u32;
-
         let mut next_click = 0usize;
 
         for local_s in 0..nsess {
             let s = s0 + local_s;
-            let s_day = self.sday[local_s];
-            let s_ts = self.sts[s];
-            let ev_start = self.s_ev_start[s] as usize;
-            let ev_end = self.s_ev_start[s + 1] as usize;
+            let s_ts = unsafe { *self.sts.get_unchecked(s) };
+            let s_day = fast_session_day(s_ts, cfg.ws_day_offset);
+            if CLICK_MODE == 2 {
+                self.sday.push(s_day);
+            }
+            let ev_start = unsafe { *self.s_ev_start.get_unchecked(s) } as usize;
+            let ev_end = unsafe { *self.s_ev_start.get_unchecked(s + 1) } as usize;
 
             if s_day != cur_day {
                 self.emit_user_day_row(
@@ -1197,54 +1808,46 @@ impl FastSessWorker {
                 day_rev = 0;
             }
 
-            // Aggregate purchases in session `[ev_start..ev_end)` using `self.pkm` bitmask
-            let mut sess_rev = 0u64;
-            let mut w_idx = ev_start >> 6;
-            let end_w_idx = (ev_end.saturating_sub(1)) >> 6;
-            if ev_start < ev_end {
-                while w_idx <= end_w_idx {
-                    let mut word = self.pkm[w_idx];
-                    if w_idx == (ev_start >> 6) {
-                        word &= !0u64 << (ev_start & 63);
-                    }
-                    if w_idx == end_w_idx && (ev_end & 63) != 0 {
-                        word &= (1u64 << (ev_end & 63)) - 1;
-                    }
-                    while word != 0 {
-                        let bit = word.trailing_zeros() as usize;
-                        let ev_idx = (w_idx << 6) + bit;
-                        let w0 = self.q_w0[ev_idx];
-                        let price = ((w0 >> 9) & 0xFF_FFFF) as u64;
-                        let cat = ((w0 >> 4) & 0x1F) as usize;
-                        sess_rev += price;
-                        cat_rev[cat] += price;
-                        cat_mask |= 1u32 << cat;
-                        word &= word - 1;
-                    }
-                    w_idx += 1;
-                }
-            }
+            let sess_rev = if HAS_PURCH {
+                sum_session_purchases(
+                    &self.pkm,
+                    &*self.q_w0,
+                    ev_start,
+                    ev_end,
+                    &mut cat_rev,
+                    &mut cat_mask,
+                )
+            } else {
+                0u64
+            };
 
-            // Attribute session against clicks (0 clicks, 1..=16 clicks vectorized, >16 clicks two-pointer)
-            let credited_camp = if nck == 0 {
+            let credited_camp = if CLICK_MODE == 0 {
                 organic
-            } else if nck <= 16 {
-                let win_mask = compute_click_window_mask_16(s_ts, nck, &ck_ts16);
-                if win_mask == 0 {
-                    organic
-                } else {
-                    // Record all distinct campaigns in the 7-day window as assisted
-                    let mut m = win_mask;
-                    while m != 0 {
-                        let k = m.trailing_zeros() as usize;
-                        let c = ck_camp16[k] as usize;
-                        self.assisted[c * days + s_day as usize] += 1;
-                        m &= !same_camp_mask16[k];
+            } else if CLICK_MODE == 1 {
+                if nck == 1 {
+                    let c0 = unsafe { *clicks.get_unchecked(0) };
+                    if s_ts.wrapping_sub(c0.ts()) <= WEEK_MS {
+                        let c = c0.camp() as usize;
+                        self.sess_assist[c * days + s_day as usize].assisted += 1;
+                        c
+                    } else {
+                        organic
                     }
-                    // Highest set bit in `win_mask` is the latest click <= s_ts
-                    // (ties at the same ts already have smallest base36 click_id placed last by ClickCsr!)
-                    let latest = 31 - (win_mask as u32).leading_zeros() as usize;
-                    ck_camp16[latest] as usize
+                } else {
+                    let win_mask = compute_click_window_mask_16(s_ts, nck, &ck_ts16);
+                    if win_mask == 0 {
+                        organic
+                    } else {
+                        let mut m = win_mask;
+                        while m != 0 {
+                            let k = m.trailing_zeros() as usize;
+                            let c = ck_camp16[k] as usize;
+                            self.sess_assist[c * days + s_day as usize].assisted += 1;
+                            m &= !same_camp_mask16[k];
+                        }
+                        let latest = 31 - (win_mask as u32).leading_zeros() as usize;
+                        ck_camp16[latest] as usize
+                    }
                 }
             } else {
                 while next_click < nck && clicks[next_click].ts() <= s_ts {
@@ -1257,14 +1860,17 @@ impl FastSessWorker {
                 }
             };
 
-            let cell = &mut self.cells[credited_camp * days + s_day as usize];
-            cell.sessions += 1;
-            cell.purchasing += (sess_rev > 0) as u32;
-            cell.revenue += sess_rev;
+            let idx = credited_camp * days + s_day as usize;
+            self.sess_assist[idx].sessions += 1;
+            if HAS_PURCH && sess_rev > 0 {
+                let cell = &mut self.cells[idx];
+                cell.purchasing += 1;
+                cell.revenue += sess_rev;
+                day_rev += sess_rev;
+            }
 
             day_sessions += 1;
             day_events += (ev_end - ev_start) as u32;
-            day_rev += sess_rev;
         }
 
         self.emit_user_day_row(
@@ -1277,8 +1883,7 @@ impl FastSessWorker {
             &mut cat_mask,
         );
 
-        // For > 16 clicks, run the two-pointer window [lo, hi) over `sts[s0..s1]` for assisted sessions
-        if nck > 16 {
+        if CLICK_MODE == 2 {
             self.attribute_assists_gt16(s0, nsess, days, clicks);
         }
     }
@@ -1294,26 +1899,11 @@ impl FastSessWorker {
         cat_rev: &mut [u64; 32],
         cat_mask: &mut u32,
     ) {
-        let mut top_category = None;
-        if *cat_mask != 0 {
-            let mut m = *cat_mask;
-            let mut best_rev = 0u64;
-            let mut best_cat = 0u8;
-            while m != 0 {
-                let c = m.trailing_zeros() as usize;
-                let rev = cat_rev[c];
-                cat_rev[c] = 0;
-                // Ascending bit iteration visits smaller category indices first,
-                // so strict `>` automatically tie-breaks in favor of the smallest category index!
-                if rev > best_rev {
-                    best_rev = rev;
-                    best_cat = c as u8;
-                }
-                m &= m - 1;
-            }
-            *cat_mask = 0;
-            top_category = Some(best_cat);
-        }
+        let top_category = if *cat_mask != 0 {
+            resolve_top_category(cat_rev, cat_mask)
+        } else {
+            None
+        };
         #[cfg(test)]
         self.user_out.rows.push(FastUserDailyRow {
             person_idx,
@@ -1323,14 +1913,14 @@ impl FastSessWorker {
             revenue_cents,
             top_category,
         });
-        self.user_out.person_keys.push(person_idx);
-        self.user_out.day.push(day);
-        self.user_out.sessions.push(sessions as i32);
-        self.user_out.events.push(events as i32);
-        self.user_out.revenue_cents.push(revenue_cents as i32);
-        self.user_out
-            .top_category
-            .push(top_category.unwrap_or(crate::fast_parquet::NULL_CAT));
+        self.user_out.push_row(
+            person_idx,
+            day,
+            sessions as i32,
+            events as i32,
+            revenue_cents as i32,
+            top_category.unwrap_or(crate::fast_parquet::NULL_CAT),
+        );
     }
 
     /// Two-pointer `[lo, hi)` assisted-session attribution for users with `> 16` clicks.
@@ -1361,7 +1951,7 @@ impl FastSessWorker {
             *cov = gen_tag | (hi as u64);
             for s_idx in from..hi {
                 let d = self.sday[s_idx] as usize;
-                self.assisted[camp * days + d] += 1;
+                self.sess_assist[camp * days + d].assisted += 1;
             }
         }
     }
@@ -1701,10 +2291,13 @@ impl FastSessWorker {
             } else {
                 organic
             };
-            let cell = &mut self.cells[credited * days + s_day as usize];
-            cell.sessions += 1;
-            cell.purchasing += (sess_rev > 0) as u32;
-            cell.revenue += sess_rev;
+            let idx = credited * days + s_day as usize;
+            self.sess_assist[idx].sessions += 1;
+            if sess_rev > 0 {
+                let cell = &mut self.cells[idx];
+                cell.purchasing += 1;
+                cell.revenue += sess_rev;
+            }
 
             day_sessions += 1;
             day_events += count;
@@ -1728,14 +2321,126 @@ impl FastSessWorker {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn use_avx512() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512dq")
+            && std::env::var_os("SS_NO_AVX512").is_none()
+    })
+}
+
+#[inline(always)]
+fn has_any_purchase(pkm: &[u64], ev_start: usize, ev_end: usize) -> bool {
+    if ev_start >= ev_end {
+        return false;
+    }
+    let w0 = ev_start >> 6;
+    let w1 = (ev_end - 1) >> 6;
+    let lo_mask = !0u64 << (ev_start & 63);
+    let hi_rem = ev_end & 63;
+    let hi_mask = if hi_rem == 0 { !0u64 } else { (1u64 << hi_rem) - 1 };
+    if w0 == w1 {
+        return (unsafe { *pkm.get_unchecked(w0) } & lo_mask & hi_mask) != 0;
+    }
+    if (unsafe { *pkm.get_unchecked(w0) } & lo_mask) != 0 {
+        return true;
+    }
+    let mut w = w0 + 1;
+    while w < w1 {
+        if unsafe { *pkm.get_unchecked(w) } != 0 {
+            return true;
+        }
+        w += 1;
+    }
+    (unsafe { *pkm.get_unchecked(w1) } & hi_mask) != 0
+}
+
+#[inline(always)]
+fn sum_session_purchases(
+    pkm: &[u64],
+    q_w0: &[u64],
+    ev_start: usize,
+    ev_end: usize,
+    cat_rev: &mut [u64; 32],
+    cat_mask: &mut u32,
+) -> u64 {
+    if ev_start >= ev_end {
+        return 0;
+    }
+    let mut sess_rev = 0u64;
+    let mut w_idx = ev_start >> 6;
+    let end_w_idx = (ev_end - 1) >> 6;
+    let first_w = w_idx;
+    while w_idx <= end_w_idx {
+        let mut word = unsafe { *pkm.get_unchecked(w_idx) };
+        if w_idx == first_w {
+            word &= !0u64 << (ev_start & 63);
+        }
+        if w_idx == end_w_idx && (ev_end & 63) != 0 {
+            word &= (1u64 << (ev_end & 63)) - 1;
+        }
+        while word != 0 {
+            let bit = word.trailing_zeros() as usize;
+            let ev_idx = (w_idx << 6) + bit;
+            let w0 = unsafe { *q_w0.get_unchecked(ev_idx) };
+            let price = ((w0 >> 9) & 0xFF_FFFF) as u64;
+            let cat = ((w0 >> 4) & 0x1F) as usize;
+            sess_rev += price;
+            cat_rev[cat] += price;
+            *cat_mask |= 1u32 << cat;
+            word &= word - 1;
+        }
+        w_idx += 1;
+    }
+    sess_rev
+}
+
+#[inline(always)]
+fn resolve_top_category(cat_rev: &mut [u64; 32], cat_mask: &mut u32) -> Option<u8> {
+    if *cat_mask == 0 {
+        return None;
+    }
+    let mut m = *cat_mask;
+    let mut best_rev = 0u64;
+    let mut best_cat = 0u8;
+    while m != 0 {
+        let c = m.trailing_zeros() as usize;
+        let rev = cat_rev[c];
+        cat_rev[c] = 0;
+        if rev > best_rev {
+            best_rev = rev;
+            best_cat = c as u8;
+        }
+        m &= m - 1;
+    }
+    *cat_mask = 0;
+    Some(best_cat)
+}
+
 /// Computes the 16-bit mask of clicks `k in 0..nck` (`nck <= 16`) that satisfy
 /// `0 <= sess_ts - ck_ts[k] <= WEEK_MS` (i.e. `sess_ts.wrapping_sub(ck_ts[k]) <= WEEK_MS`).
-/// Uses 256-bit AVX2 on x86_64 (avoiding 512-bit `zmm` frequency downclocking).
 #[inline(always)]
 pub fn compute_click_window_mask_16(sess_ts: u32, nck: usize, ck_ts: &[u32; 16]) -> u16 {
+    if nck <= 4 {
+        let mut m = 0u16;
+        for k in 0..nck {
+            if sess_ts.wrapping_sub(unsafe { *ck_ts.get_unchecked(k) }) <= WEEK_MS {
+                m |= 1u16 << k;
+            }
+        }
+        return m;
+    }
     let valid_lanes = ((1u32 << nck) - 1) as u16;
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        if use_avx512() {
+            return compute_click_window_mask_16_avx512(sess_ts, ck_ts) & valid_lanes;
+        }
         if is_x86_feature_detected!("avx2") {
             return compute_click_window_mask_16_avx2(sess_ts, ck_ts) & valid_lanes;
         }
@@ -1747,6 +2452,17 @@ pub fn compute_click_window_mask_16(sess_ts: u32, nck: usize, ck_ts: &[u32; 16])
         }
     }
     m
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+unsafe fn compute_click_window_mask_16_avx512(sess_ts: u32, ck_ts: &[u32; 16]) -> u16 {
+    use std::arch::x86_64::*;
+    let v_sess = _mm512_set1_epi32(sess_ts as i32);
+    let v_ck = _mm512_loadu_si512(ck_ts.as_ptr() as *const __m512i);
+    let diff = _mm512_sub_epi32(v_sess, v_ck);
+    let v_week = _mm512_set1_epi32(WEEK_MS as i32);
+    _mm512_cmple_epu32_mask(diff, v_week)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2218,5 +2934,283 @@ mod tests {
             let e = batch.names_offsets[i + 1] as usize;
             assert_eq!(&batch.names_data[s..e], expected);
         }
+    }
+
+    #[test]
+    fn test_sess3a_substep_profile() {
+        use std::time::Instant;
+        let ukey = 0x9999_AAAA_BBBBu64 & MASK40;
+        let ckey = 0xCCCC_DDDD_EEEEu64 & MASK40;
+        let num_blocks = 128usize;
+        let users_per_block = 1024usize;
+        let total_users = num_blocks * users_per_block + 8;
+
+        let mut tab = UserAliasTable::new(total_users, ukey);
+        let mut intra = Vec::with_capacity(total_users / 4);
+        for u in (0..total_users as u32).step_by(5) {
+            intra.push(IntraEdge::new(u, 0, 1));
+        }
+        tab.build_from_intra_and_complex(&intra, &[], &[]);
+
+        // Realistic click distribution: ~40% 0 clicks, ~50% 1..=8 clicks, ~10% 18 clicks
+        let mut est_clicks = 0usize;
+        for u in 0..total_users {
+            est_clicks += match u % 10 {
+                0..=3 => 0,
+                4..=8 => 1 + (u % 8),
+                _ => 18,
+            };
+        }
+        let mut csr = ClickCsr::with_capacity(total_users, est_clicks);
+        let mut c_idx = 0usize;
+        for u in 0..total_users as u32 {
+            let nck = match (u as usize) % 10 {
+                0..=3 => 0,
+                4..=8 => 1 + ((u as usize) % 8),
+                _ => 18,
+            };
+            for k in 0..nck {
+                let ts = WEEK_MS + (k as u32) * 120_000;
+                let camp = ((u as usize + k * 7) % 2000) as u32;
+                csr.put_click(c_idx, ts, camp, 0, u);
+                c_idx += 1;
+            }
+        }
+        assert!(csr.finalize_and_sort(ckey));
+
+        // Build 128 full 16K blocks (~2.1M events): ~50% 1-session runs, ~50% 2-session runs, ~3% purchases
+        let mut blocks: Vec<Vec<FastEvRec>> = Vec::with_capacity(num_blocks);
+        for b in 0..num_blocks {
+            let mut evs = Vec::with_capacity(BLOCK_EVENTS);
+            let base_u = (b * users_per_block) as u32;
+            for lu in 0..users_per_block as u32 {
+                let u = base_u + lu;
+                let two_sess = (u & 1) == 1;
+                for e in 0..16u32 {
+                    let slot = (lu * 16 + e) as u16;
+                    let ts = WEEK_MS
+                        + if !two_sess || e < 8 {
+                            e * 10_000
+                        } else {
+                            3_600_000 + e * 10_000
+                        };
+                    let price = if ((u as usize * 17 + e as usize) % 33) == 0 {
+                        499
+                    } else {
+                        0
+                    };
+                    let cat = ((u + e) % 20) as u8;
+                    let alias = if (u % 5) == 0 { (e % 2) as u8 } else { 0 };
+                    evs.push(FastEvRec::new_valid(ts, price, cat, alias, u, 100, slot));
+                }
+            }
+            blocks.push(evs);
+        }
+
+        let claimed: Vec<AtomicU64> = (0..total_users.div_ceil(64))
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        let cfg = FastSessConfig {
+            alias_masks: &tab.alias_masks,
+            multi_comp_users: &tab.multi_comp_users,
+            click_csr: &csr,
+            claimed_users: &claimed,
+            user_key: ukey,
+            ws_day_offset: -(WEEK_MS as i64),
+            first_day: 20_000,
+            days: 14,
+            num_campaigns: 2000,
+        };
+
+        let mut worker = FastSessWorker::new(2000, 14);
+        let mut dedup_ns = 0u128;
+        let mut compact_ns = 0u128;
+        let mut attr_ns = 0u128;
+        let mut interior_runs = 0usize;
+
+        for b in 0..num_blocks {
+            let t0 = Instant::now();
+            let gen = worker.next_generation();
+            let slots_ptr = worker.slots.as_mut_ptr();
+            unsafe {
+                FastSessWorker::dedup_slice(slots_ptr, &blocks[b], gen);
+            }
+            let t1 = Instant::now();
+            let k = worker.compact_and_identify(gen);
+            let t2 = Instant::now();
+            let nrun = worker.runs.len();
+            if k > 0 && nrun >= 3 {
+                for r in 1..(nrun - 1) {
+                    let run = worker.runs[r];
+                    let u = run.user_idx as usize;
+                    let ut = cfg.alias_masks[u];
+                    let comp_mask = ut & ALIAS_MASK;
+                    let class = if (run.alias_mask & !comp_mask) == 0 {
+                        comp_mask
+                    } else {
+                        run.alias_mask
+                    };
+                    if cfg.try_claim_user(run.user_idx) {
+                        worker.attribute_and_emit_run(run, class, &cfg);
+                        interior_runs += 1;
+                    }
+                }
+            }
+            let t3 = Instant::now();
+            dedup_ns += (t1 - t0).as_nanos();
+            compact_ns += (t2 - t1).as_nanos();
+            attr_ns += (t3 - t2).as_nanos();
+        }
+
+        // Measure push_person_name standalone for the exact same `interior_runs` distribution
+        let mut name_batch = FastUserBatch::new();
+        let t_name0 = Instant::now();
+        for b in 0..num_blocks {
+            let base_u = (b * users_per_block) as u32;
+            for lu in 1..(users_per_block as u32 - 1) {
+                let u = base_u + lu;
+                let mask = if (u % 5) == 0 { 0b11u16 } else { 0b1u16 };
+                std::hint::black_box(name_batch.push_person_name(u, mask, ukey));
+            }
+        }
+        let name_ns = t_name0.elapsed().as_nanos();
+        std::hint::black_box(&worker.user_out);
+        std::hint::black_box(&name_batch);
+
+        let total_ms = (dedup_ns + compact_ns + attr_ns) as f64 / 1e6;
+        eprintln!(
+            "[sess3a substep profile] blocks={num_blocks} runs={interior_runs} total={total_ms:.2} ms | \
+dedup={:.2} ms ({:.1}%) | compact={:.2} ms ({:.1}%) | attr_total={:.2} ms ({:.1}%) | push_person_name={:.2} ms ({:.1}%)",
+            dedup_ns as f64 / 1e6,
+            dedup_ns as f64 * 100.0 / (dedup_ns + compact_ns + attr_ns) as f64,
+            compact_ns as f64 / 1e6,
+            compact_ns as f64 * 100.0 / (dedup_ns + compact_ns + attr_ns) as f64,
+            attr_ns as f64 / 1e6,
+            attr_ns as f64 * 100.0 / (dedup_ns + compact_ns + attr_ns) as f64,
+            name_ns as f64 / 1e6,
+            name_ns as f64 * 100.0 / (dedup_ns + compact_ns + attr_ns) as f64,
+        );
+    }
+
+    #[test]
+    fn test_fast_sess_fast_paths_exact() {
+        // 1. Verify has_any_purchase word boundary logic
+        let mut pkm = [0u64; 4];
+        pkm[0] = 1u64 << 63;
+        pkm[2] = 1u64 << 5;
+        assert!(!has_any_purchase(&pkm, 0, 0));
+        assert!(!has_any_purchase(&pkm, 0, 63));
+        assert!(has_any_purchase(&pkm, 0, 64));
+        assert!(has_any_purchase(&pkm, 63, 65));
+        assert!(!has_any_purchase(&pkm, 64, 133));
+        assert!(has_any_purchase(&pkm, 64, 134));
+        assert!(has_any_purchase(&pkm, 133, 134));
+        assert!(!has_any_purchase(&pkm, 134, 256));
+
+        // 2. Verify all combinations of nsess == 1 vs >1, any_purch false vs true, nck = 0, 1, 3, 18
+        let ukey = 0x5555_6666_7777u64 & MASK40;
+        let ckey = 0x8888_9999_AAAAu64 & MASK40;
+        let tab = UserAliasTable::new(16, ukey);
+        let mut csr = ClickCsr::with_capacity(16, 48);
+        let t0 = WEEK_MS + 10_000;
+
+        // User 1: nsess=1, any_purch=false, nck=1 (in window, camp 1)
+        csr.put_click(0, t0 - 1_000, 1, 0, 1);
+        // User 2: nsess=1, any_purch=true, nck=3 (camp 2, camp 1, camp 2 -> assisted camp 1 & 2 once each, latest camp 2)
+        csr.put_click(1, t0 - 5_000, 2, 0, 2);
+        csr.put_click(2, t0 - 2_000, 1, 0, 2);
+        csr.put_click(3, t0 - 1_000, 2, 0, 2);
+        // User 3: nsess=1, any_purch=false, nck=18 (16 out-of-window / duplicate camps + 2 in window)
+        let mut cidx = 4usize;
+        for k in 0..16u32 {
+            csr.put_click(cidx, 100 + k * 100, 0, 0, 3); // > 7 days before t0 + DAY_MS_U32
+            cidx += 1;
+        }
+        csr.put_click(cidx, t0 + DAY_MS_U32 - 5_000, 3, 0, 3);
+        csr.put_click(cidx + 1, t0 + DAY_MS_U32 - 4_000, 3, 0, 3);
+        cidx += 2;
+        // User 4: nsess=3 (2 on day 0, 1 on day 1), any_purch=false, nck=1 (reaches day 0, expires before day 1)
+        csr.put_click(cidx, t0 - 10_000, 4, 0, 4);
+        cidx += 1;
+        // User 5: nsess=3 (2 on day 0, 1 on day 1), any_purch=false, nck=18
+        for k in 0..18u32 {
+            csr.put_click(cidx, t0 - 10_000 + k * 10, k % 3, 0, 5);
+            cidx += 1;
+        }
+        assert!(csr.finalize_and_sort(ckey));
+
+        let claimed = [AtomicU64::new(0)];
+        let cfg = FastSessConfig {
+            alias_masks: &tab.alias_masks,
+            multi_comp_users: &tab.multi_comp_users,
+            click_csr: &csr,
+            claimed_users: &claimed,
+            user_key: ukey,
+            ws_day_offset: -(WEEK_MS as i64),
+            first_day: 20_000,
+            days: 14,
+            num_campaigns: 6,
+        };
+
+        let mut worker = FastSessWorker::new(6, 14);
+        let events = vec![
+            // Head boundary user 0
+            FastEvRec::new_valid(t0, 0, 0, 0, 0, 100, 0),
+            // User 1: 1 sess, 2 events, 0 purch, 1 click -> day 0 camp 1
+            FastEvRec::new_valid(t0, 0, 0, 0, 1, 100, 1),
+            FastEvRec::new_valid(t0 + 100, 0, 0, 0, 1, 100, 2),
+            // User 2: 1 sess, 2 events, 500 cents cat 4, 3 clicks -> day 0 camp 2 (assisted 1,2)
+            FastEvRec::new_valid(t0, 500, 4, 0, 2, 100, 3),
+            FastEvRec::new_valid(t0 + 100, 0, 0, 0, 2, 100, 4),
+            // User 3: 1 sess at day 1, 1 event, 0 purch, 18 clicks -> day 1 camp 3 (assisted 3)
+            FastEvRec::new_valid(t0 + DAY_MS_U32, 0, 0, 0, 3, 100, 5),
+            // User 4: 3 sess (2 on day 0, 1 on day 1 > WEEK_MS after click), 0 purch, 1 click (camp 4)
+            FastEvRec::new_valid(t0, 0, 0, 0, 4, 100, 6),
+            FastEvRec::new_valid(t0 + 2_000_000, 0, 0, 0, 4, 100, 7),
+            FastEvRec::new_valid(t0 + WEEK_MS + 100, 0, 0, 0, 4, 100, 8),
+            // User 5: 3 sess (2 on day 0, 1 on day 1 <= WEEK_MS after clicks), 0 purch, 18 clicks (camps 0,1,2, latest camp 2)
+            FastEvRec::new_valid(t0, 0, 0, 0, 5, 100, 9),
+            FastEvRec::new_valid(t0 + 2_000_000, 0, 0, 0, 5, 100, 10),
+            FastEvRec::new_valid(t0 + DAY_MS_U32, 0, 0, 0, 5, 100, 11),
+            // User 6: 2 sess on day 0, 0 purch, 0 clicks -> day 0 organic (camp 6)
+            FastEvRec::new_valid(t0, 0, 0, 0, 6, 100, 12),
+            FastEvRec::new_valid(t0 + 2_000_000, 0, 0, 0, 6, 100, 13),
+            // Tail boundary user 7
+            FastEvRec::new_valid(t0, 0, 0, 0, 7, 100, 14),
+        ];
+
+        worker.process_block_32k(0, &events, &cfg);
+
+        // Verify user_daily rows for users 1..=6
+        assert_eq!(worker.user_out.rows.len(), 8);
+        assert_eq!(worker.user_out.person_keys.len(), 8);
+        assert_eq!(worker.user_out.rows[0], FastUserDailyRow { person_idx: 0, day: 20_000, sessions: 1, events: 2, revenue_cents: 0, top_category: None });
+        assert_eq!(worker.user_out.rows[1], FastUserDailyRow { person_idx: 1, day: 20_000, sessions: 1, events: 2, revenue_cents: 500, top_category: Some(4) });
+        assert_eq!(worker.user_out.rows[2], FastUserDailyRow { person_idx: 2, day: 20_001, sessions: 1, events: 1, revenue_cents: 0, top_category: None });
+        assert_eq!(worker.user_out.rows[3], FastUserDailyRow { person_idx: 3, day: 20_000, sessions: 2, events: 2, revenue_cents: 0, top_category: None });
+        assert_eq!(worker.user_out.rows[4], FastUserDailyRow { person_idx: 3, day: 20_007, sessions: 1, events: 1, revenue_cents: 0, top_category: None });
+        assert_eq!(worker.user_out.rows[5], FastUserDailyRow { person_idx: 4, day: 20_000, sessions: 2, events: 2, revenue_cents: 0, top_category: None });
+        assert_eq!(worker.user_out.rows[6], FastUserDailyRow { person_idx: 4, day: 20_001, sessions: 1, events: 1, revenue_cents: 0, top_category: None });
+        assert_eq!(worker.user_out.rows[7], FastUserDailyRow { person_idx: 5, day: 20_000, sessions: 2, events: 2, revenue_cents: 0, top_category: None });
+
+        let cells = worker.finalize_cells();
+        let c = |camp: usize, day: usize| cells[camp * 14 + day];
+        assert_eq!(c(1, 0).sessions, 1);
+        assert_eq!(c(1, 0).assisted, 4); // u2 (1) + u5 (2) + u1 (1)
+        assert_eq!(c(2, 0).sessions, 3); // u2 (1) + u5 (2)
+        assert_eq!(c(2, 0).purchasing, 1);
+        assert_eq!(c(2, 0).revenue, 500);
+        assert_eq!(c(2, 0).assisted, 3); // u2 (1) + u5 (2)
+        assert_eq!(c(0, 0).assisted, 2); // u5 (2)
+        assert_eq!(c(3, 1).sessions, 1);
+        assert_eq!(c(3, 1).assisted, 1);
+        assert_eq!(c(4, 0).sessions, 2);
+        assert_eq!(c(4, 0).assisted, 2);
+        assert_eq!(c(6, 7).sessions, 1); // u4 day 7 -> organic
+        assert_eq!(c(2, 1).sessions, 1); // u5 day 1 -> camp 2
+        assert_eq!(c(0, 1).assisted, 1);
+        assert_eq!(c(1, 1).assisted, 1);
+        assert_eq!(c(2, 1).assisted, 1);
+        assert_eq!(c(6, 0).sessions, 2); // u6 day 0 -> organic
     }
 }

@@ -1,10 +1,13 @@
 use crate::csv::Reader;
 use crate::diag;
 use crate::dims::Dims;
+use crate::fast_arena::{LinkedChunkArena, LinkedScatter};
 use crate::fast_links::{
-    encode_base36_token, encode_upper_k_token, user_alias_token, ClickCsr, ClickSlot, IntraEdge,
-    UserAliasTable, HAS_EXTRA_EVENTS, IS_COMPLEX, MASK40,
+    encode_base36_token, encode_upper_k_token, user_alias_token, ClickBucketPrep, ClickCsr,
+    ClickSlot, IntraEdge, UserAliasTable, HAS_EXTRA_EVENTS, IS_COMPLEX, MASK40, UB_SHIFT,
+    UB_USERS,
 };
+use crate::fast_parquet::write_campaigns_sharded;
 use crate::fast_parse::{
     scan_clicks_fast, scan_events_fast, scan_links_fast, FallbackEvRec, FastCkBatch, FastEvBatch,
     FastLkBatch,
@@ -18,14 +21,11 @@ use crate::scatter::{by_partition, part_of_key, Arena, Scatter};
 use crate::sys::{self, mix, par, PerThread};
 use crate::ts::{DateCache, DateLut, DAY_MS};
 use crate::unscramble::{recover_dataset_keys_from_slices, unscramble40, unscramble40_x8};
-use crate::{write_campaigns, CRec, Input, Mapped, PRec, Shared, C_CHUNK, P_CHUNK};
+use crate::{CRec, Input, Mapped, PRec, Shared, C_CHUNK, P_CHUNK};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
-const EV_CHUNK: usize = 512;
-const CK_CHUNK: usize = 512;
-const CK_BUCKETS: usize = 128;
 const CX_PARTS: usize = 64;
 
 struct FastParseWorker {
@@ -37,8 +37,8 @@ struct FastParseWorker {
     intra_buckets: Vec<Vec<IntraEdge>>,
     complex_edges: Vec<(u64, u64)>,
     fallback_clicks: Vec<CRec>,
-    ev_scatter: Scatter<FastEvRec, 4>,
-    ck_scatter: Scatter<ClickSlot, 4>,
+    ev_scatter: LinkedScatter<FastEvRec>,
+    ck_scatter: LinkedScatter<ClickSlot>,
     odd_user_tokens: Vec<u64>,
     odd_eid_events: Vec<FallbackEvRec>,
     parsed_ev_rows: u64,
@@ -57,8 +57,8 @@ impl FastParseWorker {
             intra_buckets: vec![Vec::new(); num_user_buckets],
             complex_edges: Vec::new(),
             fallback_clicks: Vec::new(),
-            ev_scatter: Scatter::new(),
-            ck_scatter: Scatter::new(),
+            ev_scatter: LinkedScatter::new(),
+            ck_scatter: LinkedScatter::new(),
             odd_user_tokens: Vec::new(),
             odd_eid_events: Vec::new(),
             parsed_ev_rows: 0,
@@ -101,7 +101,7 @@ fn mark_user_complex(user_alias_table: &UserAliasTable, b36: u64, user_key: u64,
 unsafe fn push_odd_user_or_fallback(
     w: &mut FastParseWorker,
     tid: usize,
-    ev_arena: &Arena<FastEvRec>,
+    ev_arena: &LinkedChunkArena<FastEvRec>,
     block: usize,
     slot: u16,
     ts: u32,
@@ -152,7 +152,7 @@ unsafe fn push_canonical_valid_ev(
     u_val: u64,
     w: &mut FastParseWorker,
     tid: usize,
-    ev_arena: &Arena<FastEvRec>,
+    ev_arena: &LinkedChunkArena<FastEvRec>,
     user_alias_table: &UserAliasTable,
     user_key: u64,
     user_cap: u32,
@@ -234,7 +234,7 @@ unsafe fn process_ev_row_unscrambled(
     u_val: u64,
     w: &mut FastParseWorker,
     tid: usize,
-    ev_arena: &Arena<FastEvRec>,
+    ev_arena: &LinkedChunkArena<FastEvRec>,
     user_alias_table: &UserAliasTable,
     user_key: u64,
     user_cap: u32,
@@ -355,7 +355,7 @@ unsafe fn process_ev_row_scalar(
     r: usize,
     w: &mut FastParseWorker,
     tid: usize,
-    ev_arena: &Arena<FastEvRec>,
+    ev_arena: &LinkedChunkArena<FastEvRec>,
     user_alias_table: &UserAliasTable,
     user_key: u64,
     event_key: u64,
@@ -397,7 +397,8 @@ unsafe fn process_ck_row_unscrambled(
     c_idx: u64,
     u_val: u64,
     w: &mut FastParseWorker,
-    ck_arena: &Arena<ClickSlot>,
+    ck_arena: &LinkedChunkArena<ClickSlot>,
+    ck_shift: u32,
     user_alias_table: &UserAliasTable,
     user_key: u64,
     user_cap: u32,
@@ -412,7 +413,7 @@ unsafe fn process_ck_row_unscrambled(
         if u_idx < user_cap as u64 && alias < 14 && c_idx < click_cap {
             w.ck_scatter.push(
                 ck_arena,
-                ((u_idx as usize) >> 4) & 127,
+                (u_idx as usize) >> ck_shift,
                 ClickSlot::new_parsed_cased(
                     b.ts[r],
                     b.campaign[r],
@@ -452,7 +453,8 @@ unsafe fn process_ck_row_scalar(
     b: &FastCkBatch,
     r: usize,
     w: &mut FastParseWorker,
-    ck_arena: &Arena<ClickSlot>,
+    ck_arena: &LinkedChunkArena<ClickSlot>,
+    ck_shift: u32,
     user_alias_table: &UserAliasTable,
     user_key: u64,
     click_key: u64,
@@ -476,6 +478,7 @@ unsafe fn process_ck_row_scalar(
         u_val,
         w,
         ck_arena,
+        ck_shift,
         user_alias_table,
         user_key,
         user_cap,
@@ -502,7 +505,7 @@ fn process_lk_row_unscrambled(
         let ab = vb & 511;
         if ua == ub && ua < user_cap as u64 && aa < 14 && ab < 14 {
             if aa != ab {
-                w.intra_buckets[(ua as usize) >> 10].push(IntraEdge::new(
+                w.intra_buckets[(ua as usize) >> UB_SHIFT].push(IntraEdge::new(
                     ua as u32,
                     aa as u8,
                     ab as u8,
@@ -615,12 +618,11 @@ pub(crate) fn try_run_fast(
         return false;
     }
 
-    let rows_guess = (event_input.bytes / 78) as usize;
     let event_cap = keys.event_cap.max(1 << 16).min(1u64 << 30);
     let user_cap = keys.user_cap.max(1 << 16).min((1 << 23) - 1);
     let click_cap = keys.click_cap.max(1 << 16).min(1u64 << 29);
     let num_ev_blocks = ((event_cap as usize) + BLOCK_MASK) >> BLOCK_SHIFT;
-    let num_user_buckets = (user_cap as usize).div_ceil(1024);
+    let num_user_buckets = (user_cap as usize).div_ceil(UB_USERS);
 
     let count = || counters.as_ref().map_or([0; 4], |c| c.read());
     let mark = |name| (name, t0.elapsed().as_secs_f64(), sys::rusage(), count());
@@ -684,74 +686,139 @@ pub(crate) fn try_run_fast(
     };
 
     let user_alias_table = UserAliasTable::new(user_cap as usize, keys.user_key);
-    let clicks_guess = (click_input.bytes as usize / 42).max(1 << 16);
-    let ck_records_cap =
-        (click_input.bytes as usize / 32).max(1 << 16) + (threads * CK_BUCKETS + 2) * CK_CHUNK;
-    let ck_arena = Arena::<ClickSlot>::new(ck_records_cap, CK_CHUNK);
+    let ck_shift: u32 = if (user_cap as usize) <= (1 << 20) {
+        UB_SHIFT as u32
+    } else {
+        (user_cap as usize)
+            .div_ceil(256)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(UB_SHIFT as u32)
+    };
+    let ck_buckets = (user_cap as usize).div_ceil(1 << ck_shift).max(1);
+    let ck_reserve = (click_input.bytes as usize * 2).max(64 << 20) + threads * (8 << 20);
+    let ck_arena = LinkedChunkArena::<ClickSlot>::with_reserve(ck_buckets, ck_reserve);
     let ck_csr_cap = (click_input.bytes as usize / 32).max(1 << 16);
-    let ck_csr_base = sys::map_zeroed(ck_csr_cap * std::mem::size_of::<ClickSlot>()) as *mut ClickSlot;
-    let ev_chunk = std::env::var("SS_EV_CHUNK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| (v.max(64) + 3) & !3)
-        .unwrap_or(EV_CHUNK);
-    let ev_records_cap =
-        (event_input.bytes as usize / 32).max(rows_guess) + (threads * num_ev_blocks + 2) * ev_chunk;
-    let ev_arena = Arena::<FastEvRec>::new(ev_records_cap, ev_chunk);
-
-    let ev_pop_bytes =
-        ((rows_guess + threads * num_ev_blocks * ev_chunk / 2) * 16).min(ev_arena.cap_bytes());
-    let ck_pop_bytes =
-        ((clicks_guess + threads * CK_BUCKETS * CK_CHUNK / 2) * 16).min(ck_arena.cap_bytes());
-    let ck_csr_pop_bytes = (clicks_guess * 16).min(ck_csr_cap * 16);
-    {
-        const PIECE: usize = 4 << 20;
-        let regions = [
-            (ev_arena.base as usize, ev_pop_bytes),
-            (ck_arena.base as usize, ck_pop_bytes),
-            (ck_csr_base as usize, ck_csr_pop_bytes),
-        ];
-        let pieces: Vec<(usize, usize)> = regions
-            .iter()
-            .flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at))))
-            .collect();
-        let next = AtomicUsize::new(0);
-        par(threads, |_| loop {
-            let i = next.fetch_add(1, Relaxed);
-            let Some(&(at, n)) = pieces.get(i) else { break };
-            sys::populate(at as *mut u8, n);
-        });
-    }
+    let ck_csr_base =
+        sys::map_zeroed_huge(ck_csr_cap * std::mem::size_of::<ClickSlot>()) as *mut ClickSlot;
+    let ev_reserve = (event_input.bytes as usize * 2).max(64 << 20) + threads * (8 << 20);
+    let ev_arena = LinkedChunkArena::<FastEvRec>::with_reserve(num_ev_blocks, ev_reserve);
     marks.push(mark("populate"));
     log_stage(&marks);
 
-    // Step 2: Unified Stage 1 Parse (Links first, then Clicks + Events sorted descending by size)
-    let mut work: Vec<WorkKind> = (0..link_input.extents.len())
-        .map(WorkKind::Link)
+    // Step 2: Unified Stage 1 Parse (ALL Links first, then ALL Clicks sorted desc, then ALL Events sorted desc)
+    // Overlap ClickCsr bucket construction with the tail of Stage 1 as soon as Click scatter finishes.
+    let mut lk_work: Vec<(u64, WorkKind)> = (0..link_input.extents.len())
+        .map(|i| {
+            let x = &link_input.extents[i];
+            (x.to - x.from, WorkKind::Link(i))
+        })
         .collect();
-    let mut ck_ev_work: Vec<(u64, WorkKind)> = (0..click_input.extents.len())
+    lk_work.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut ck_work: Vec<(u64, WorkKind)> = (0..click_input.extents.len())
         .map(|i| {
             let x = &click_input.extents[i];
             (x.to - x.from, WorkKind::Click(i))
         })
-        .chain((0..event_input.extents.len()).map(|i| {
+        .collect();
+    ck_work.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut ev_work: Vec<(u64, WorkKind)> = (0..event_input.extents.len())
+        .map(|i| {
             let x = &event_input.extents[i];
             (x.to - x.from, WorkKind::Event(i))
-        }))
+        })
         .collect();
-    ck_ev_work.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    work.extend(ck_ev_work.into_iter().map(|(_, k)| k));
+    ev_work.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+    let mut work: Vec<WorkKind> = Vec::with_capacity(lk_work.len() + ck_work.len() + ev_work.len());
+    work.extend(lk_work.into_iter().map(|(_, k)| k));
+    work.extend(ck_work.into_iter().map(|(_, k)| k));
+    let num_lk_ck = work.len();
+    work.extend(ev_work.into_iter().map(|(_, k)| k));
+
+    struct SyncCell<T>(std::cell::UnsafeCell<T>);
+    unsafe impl<T> Sync for SyncCell<T> {}
+    impl<T> SyncCell<T> {
+        #[inline(always)]
+        unsafe fn set(&self, v: T) {
+            *self.0.get() = v;
+        }
+        #[inline(always)]
+        unsafe fn as_ref(&self) -> &T {
+            &*self.0.get()
+        }
+    }
 
     let parse_workers = PerThread::new(threads, |_| FastParseWorker::new(read_buf, num_user_buckets));
     let next_work = AtomicUsize::new(0);
+    let ck_flushed_threads = AtomicUsize::new(0);
+    let ck_ready = AtomicBool::new(false);
+    let ck_prep_cell: SyncCell<Option<ClickBucketPrep>> = SyncCell(std::cell::UnsafeCell::new(None));
+    let ck_prep_ref = &ck_prep_cell;
+    let ck_csr_addr = ck_csr_base as usize;
+    let next_ck_job = AtomicUsize::new(0);
+    let ck_n_jobs = AtomicUsize::new(0);
+    let ck_worker_whales: Vec<std::sync::Mutex<Vec<(usize, usize)>>> =
+        (0..threads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
 
     par(threads, |tid| unsafe {
         let w = parse_workers.get(tid);
         w.ev_scatter.reset(num_ev_blocks);
-        w.ck_scatter.reset(CK_BUCKETS);
+        w.ck_scatter.reset(ck_buckets);
+        let mut ck_flushed_local = false;
+        let mut ck_counts: Vec<u32> = Vec::new();
+        let mut local_ck_whales: Vec<(usize, usize)> = Vec::new();
+
+        let flush_clicks = |w: &mut FastParseWorker, ck_flushed_local: &mut bool| {
+            if !*ck_flushed_local {
+                w.ck_scatter.finish(&ck_arena);
+                *ck_flushed_local = true;
+                if ck_flushed_threads.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1 == threads {
+                    let prep = ClickCsr::prepare_contiguous_buckets_linked(
+                        &ck_arena,
+                        ck_shift,
+                        user_cap as usize,
+                        ck_csr_cap,
+                    );
+                    ck_n_jobs.store(prep.bucket_order.len(), Relaxed);
+                    ck_prep_ref.set(Some(prep));
+                    ck_ready.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        };
+
         loop {
             let wi = next_work.fetch_add(1, Relaxed);
-            let Some(&kind) = work.get(wi) else { break };
+            if wi >= num_lk_ck && !ck_flushed_local {
+                flush_clicks(w, &mut ck_flushed_local);
+            }
+            let Some(&kind) = work.get(wi) else {
+                if ck_ready.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Some(prep) = ck_prep_ref.as_ref().as_ref() {
+                        let nj = ck_n_jobs.load(Relaxed);
+                        if ck_counts.is_empty() && nj > 0 {
+                            ck_counts.resize(1usize << ck_shift, 0);
+                        }
+                        loop {
+                            let ji = next_ck_job.fetch_add(1, Relaxed);
+                            if ji >= nj {
+                                break;
+                            }
+                            ClickCsr::process_contiguous_bucket_linked(
+                                prep,
+                                ji,
+                                &ck_arena,
+                                ck_csr_addr as *mut ClickSlot,
+                                ck_shift,
+                                user_cap as usize,
+                                &mut ck_counts,
+                                &mut local_ck_whales,
+                            );
+                        }
+                    }
+                }
+                break;
+            };
             match kind {
                 WorkKind::Link(i) => {
                     let x = &link_input.extents[i];
@@ -788,7 +855,7 @@ pub(crate) fn try_run_fast(
                                         let ab = vb & 511;
                                         if ua == ub && ua < user_cap as u64 && aa < 14 && ab < 14 {
                                             if aa != ab {
-                                                w.intra_buckets[(ua as usize) >> 10].push(
+                                                w.intra_buckets[(ua as usize) >> UB_SHIFT].push(
                                                     IntraEdge::new(ua as u32, aa as u8, ab as u8),
                                                 );
                                             }
@@ -894,7 +961,7 @@ pub(crate) fn try_run_fast(
                                         {
                                             w.ck_scatter.push(
                                                 &ck_arena,
-                                                ((u_idx as usize) >> 4) & 127,
+                                                (u_idx as usize) >> ck_shift,
                                                 ClickSlot::new_parsed_cased(
                                                     b.ts[r],
                                                     b.campaign[r],
@@ -938,6 +1005,7 @@ pub(crate) fn try_run_fast(
                                             u_un[k],
                                             w,
                                             &ck_arena,
+                                            ck_shift,
                                             &user_alias_table,
                                             keys.user_key,
                                             user_cap,
@@ -953,6 +1021,7 @@ pub(crate) fn try_run_fast(
                                     idx,
                                     w,
                                     &ck_arena,
+                                    ck_shift,
                                     &user_alias_table,
                                     keys.user_key,
                                     keys.click_key,
@@ -1054,7 +1123,10 @@ pub(crate) fn try_run_fast(
             }
         }
         w.ev_scatter.finish(&ev_arena);
-        w.ck_scatter.finish(&ck_arena);
+        flush_clicks(w, &mut ck_flushed_local);
+        if !local_ck_whales.is_empty() {
+            *ck_worker_whales[tid].lock().unwrap() = local_ck_whales;
+        }
     });
     marks.push(mark("parse"));
     log_stage(&marks);
@@ -1142,28 +1214,64 @@ pub(crate) fn try_run_fast(
     marks.push(mark("links"));
     log_stage(&marks);
 
-    let ck_logs: Vec<&Vec<(u32, u32, u32)>> = (0..threads)
-        .map(|t| unsafe { &parse_workers.get(t).ck_scatter.log })
-        .collect();
-    let ck_chunks = by_partition(&ck_logs, CK_BUCKETS);
+    let ck_prep = ck_prep_cell
+        .0
+        .into_inner()
+        .expect("ClickBucketPrep initialized in Stage 1");
+    let ck_nj = ck_prep.bucket_order.len();
+    if next_ck_job.load(Relaxed) < ck_nj {
+        let prep_ref = &ck_prep;
+        let max_u_len = 1usize << ck_shift;
+        let rem_whales: Vec<std::sync::Mutex<Vec<(usize, usize)>>> =
+            (0..threads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        let ck_arena_ref = &ck_arena;
+        par(threads, |tid| unsafe {
+            let mut counts = vec![0u32; max_u_len];
+            let mut local_whales: Vec<(usize, usize)> = Vec::new();
+            loop {
+                let ji = next_ck_job.fetch_add(1, Relaxed);
+                if ji >= ck_nj {
+                    break;
+                }
+                ClickCsr::process_contiguous_bucket_linked(
+                    prep_ref,
+                    ji,
+                    ck_arena_ref,
+                    ck_csr_addr as *mut ClickSlot,
+                    ck_shift,
+                    user_cap as usize,
+                    &mut counts,
+                    &mut local_whales,
+                );
+            }
+            if !local_whales.is_empty() {
+                *rem_whales[tid].lock().unwrap() = local_whales;
+            }
+        });
+        for rw in rem_whales {
+            ck_worker_whales[0]
+                .lock()
+                .unwrap()
+                .extend(rw.into_inner().unwrap());
+        }
+    }
+    let mut all_ck_whales: Vec<(usize, usize)> = Vec::new();
+    for w in ck_worker_whales {
+        all_ck_whales.extend(w.into_inner().unwrap());
+    }
     let click_csr = unsafe {
-        ClickCsr::from_bucketed_arena_into(
-            ck_arena.base,
-            &ck_chunks,
-            user_cap as usize,
-            threads,
+        ClickCsr::finish_contiguous_buckets(
+            ck_prep,
             ck_csr_base,
-            ck_csr_cap,
+            user_cap as usize,
+            &all_ck_whales,
+            threads,
         )
     };
     marks.push(mark("clicks"));
     log_stage(&marks);
 
     // Step 4: Stage 3A (16K L2-Resident Block Dedup & Sessionize) + Stage 3B (Parallel Boundary Stitch)
-    let ev_logs: Vec<&Vec<(u32, u32, u32)>> = (0..threads)
-        .map(|t| unsafe { &parse_workers.get(t).ev_scatter.log })
-        .collect();
-    let ev_chunks = by_partition(&ev_logs, num_ev_blocks);
     let claimed_users: Vec<std::sync::atomic::AtomicU64> = (0..(user_cap as usize).div_ceil(64))
         .map(|_| std::sync::atomic::AtomicU64::new(0))
         .collect();
@@ -1190,8 +1298,8 @@ pub(crate) fn try_run_fast(
             if b >= num_ev_blocks {
                 break;
             }
-            if !ev_chunks[b].is_empty() {
-                sw.process_block_32k_chunks(b as u32, ev_arena_ref.base, &ev_chunks[b], &cfg);
+            if !ev_arena_ref.is_partition_empty(b) {
+                sw.process_block_linked(b as u32, ev_arena_ref.chunks(b), &cfg);
             }
         }
     });
@@ -1413,15 +1521,6 @@ pub(crate) fn try_run_fast(
         )
     });
 
-    const REL_PIECE: usize = 32 << 20;
-    let ev_rel_bytes = ev_arena.used_bytes().max(ev_pop_bytes).min(ev_arena.cap_bytes());
-    let ev_rel_pieces: Vec<(usize, usize)> = (0..ev_rel_bytes)
-        .step_by(REL_PIECE)
-        .map(|at| (ev_arena.base as usize + at, REL_PIECE.min(ev_rel_bytes - at)))
-        .collect();
-    let release = std::env::var_os("SS_NORELEASE").is_none();
-    let ev_rel_next = AtomicUsize::new(0);
-
     let next_cx = AtomicUsize::new(0);
     par(threads, |t| unsafe {
         let g = groupers.get(t);
@@ -1435,75 +1534,40 @@ pub(crate) fn try_run_fast(
         let out = std::mem::replace(&mut g.out, group::UserOut::new(PathBuf::new()));
         let extra = sess_workers.get(t).user_out.as_cols(&cat_data, &cat_off);
         out.finish_with_extra(&extra, t == 0);
-        while release {
-            let Some(&(at, n)) = ev_rel_pieces.get(ev_rel_next.fetch_add(1, Relaxed)) else {
-                break;
-            };
-            sys::release(at as *mut u8, n);
-        }
     });
     marks.push(mark("complex"));
     log_stage(&marks);
 
-    let (ck_raw_base, ck_raw_bytes) = click_csr.raw_region();
-    let mut live_regions: Vec<(usize, usize)> = vec![
-        (sh.p_arena.base as usize, sh.p_arena.used_bytes().min(sh.p_arena.cap_bytes())),
-        (sh.c_arena.base as usize, sh.c_arena.used_bytes().min(sh.c_arena.cap_bytes())),
-        (ck_arena.base as usize, ck_arena.used_bytes().max(ck_pop_bytes).min(ck_arena.cap_bytes())),
-        (ck_raw_base, ck_raw_bytes.max(ck_csr_pop_bytes)),
-    ];
-    for m in link_input
-        .files
-        .iter()
-        .chain(click_input.files.iter())
-        .chain(event_input.files.iter())
-    {
-        if m.1 > 0 {
-            live_regions.push((m.0 as usize, m.1));
+    enum CellRef<'a> {
+        Borrowed(&'a [Cell]),
+        Owned(Vec<Cell>),
+    }
+    impl AsRef<[Cell]> for CellRef<'_> {
+        #[inline(always)]
+        fn as_ref(&self) -> &[Cell] {
+            match self {
+                CellRef::Borrowed(s) => s,
+                CellRef::Owned(v) => v,
+            }
         }
     }
-    let cx_live_pieces: Vec<(usize, usize)> = live_regions
-        .iter()
-        .flat_map(|&(b, n)| (0..n).step_by(REL_PIECE).map(move |at| (b + at, REL_PIECE.min(n - at))))
-        .collect();
-    let cx_live_next = AtomicUsize::new(0);
-    const REL_SWEEP: usize = 1 << 16;
-    let rel_sweeps = sh.links.slots().div_ceil(REL_SWEEP);
-    let links_rel_next = AtomicUsize::new(0);
-
-    par(threads, |t| unsafe {
-        if t == 0 {
-            let mut all_cells: Vec<Vec<Cell>> = Vec::with_capacity(threads * 2);
-            for tid in 0..threads {
-                all_cells.push(sess_workers.get(tid).finalize_cells().to_vec());
-                if cx_ev_count > 0 {
-                    all_cells.push(groupers.get(tid).take_cells());
-                }
+    let mut all_cells: Vec<CellRef<'_>> = Vec::with_capacity(threads * 2);
+    for tid in 0..threads {
+        unsafe {
+            all_cells.push(CellRef::Borrowed(sess_workers.get(tid).finalize_cells()));
+            if cx_ev_count > 0 {
+                all_cells.push(CellRef::Owned(groupers.get(tid).take_cells()));
             }
-            write_campaigns(
-                &sh,
-                &output.join("campaign_daily").join("part-000.parquet"),
-                &all_cells,
-            );
         }
-        while release {
-            let i = ev_rel_next.fetch_add(1, Relaxed);
-            if let Some(&(at, n)) = ev_rel_pieces.get(i) {
-                sys::release(at as *mut u8, n);
-                continue;
-            }
-            let li = links_rel_next.fetch_add(1, Relaxed);
-            if li < rel_sweeps {
-                sh.links
-                    .release(li * REL_SWEEP, ((li + 1) * REL_SWEEP).min(sh.links.slots()));
-                continue;
-            }
-            let Some(&(at, n)) = cx_live_pieces.get(cx_live_next.fetch_add(1, Relaxed)) else {
-                break;
-            };
-            sys::release(at as *mut u8, n);
-        }
-    });
+    }
+    write_campaigns_sharded(
+        &sh.campaigns,
+        sh.first_day as i32,
+        sh.days,
+        &output.join("campaign_daily"),
+        &all_cells,
+        threads,
+    );
     marks.push(mark("campaigns"));
     log_stage(&marks);
 

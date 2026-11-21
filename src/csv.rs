@@ -34,9 +34,143 @@ impl Reader {
     }
 
     /// Indexes the `n` bytes at `buf`, which start at a line start and end
-    /// with a newline.
+    /// with a newline. Dispatches to AVX-512BW when supported and enabled, else AVX2.
     #[inline(always)]
     unsafe fn index(&mut self, buf: *const u8, n: usize) {
+        if crate::unscramble::use_avx512() {
+            self.index_avx512(buf, n);
+            return;
+        }
+        self.index_avx2(buf, n);
+    }
+
+    #[inline(always)]
+    unsafe fn index_step(
+        &mut self,
+        buf: *const u8,
+        p: *const u8,
+        left: usize,
+        mut d: u64,
+        mut q: u64,
+        dst: &mut *mut u32,
+        fdst: &mut *mut u32,
+        pd: &mut u64,
+        pq: &mut u64,
+        pfs: &mut u64,
+        carry: &mut u64,
+    ) {
+        if left < 64 {
+            d = _bzhi_u64(d, left as u32);
+            q = _bzhi_u64(q, left as u32);
+        }
+        let s: u64;
+        // Entries hold the low 32 bits of the delimiter's address. Seven
+        // delimiters cover all but 0.04% of words. Hand-written because
+        // LLVM's generic tuning adds a dependency-breaking xor and splits
+        // the lea, three more instructions per delimiter.
+        std::arch::asm!(
+            "tzcnt {t}, {s}",
+            "lea {v:e}, [{src} + {t}]",
+            "mov dword ptr [{dst}], {v:e}",
+            "mov {v:e}, dword ptr [{src} + {t} - 1]",
+            "mov dword ptr [{fdst}], {v:e}",
+            "blsr {s}, {s}",
+            "tzcnt {t}, {s}",
+            "lea {v:e}, [{src} + {t}]",
+            "mov dword ptr [{dst} + 4], {v:e}",
+            "mov {v:e}, dword ptr [{src} + {t} - 1]",
+            "mov dword ptr [{fdst} + 4], {v:e}",
+            "blsr {s}, {s}",
+            "tzcnt {t}, {s}",
+            "lea {v:e}, [{src} + {t}]",
+            "mov dword ptr [{dst} + 8], {v:e}",
+            "mov {v:e}, dword ptr [{src} + {t} - 1]",
+            "mov dword ptr [{fdst} + 8], {v:e}",
+            "blsr {s}, {s}",
+            "tzcnt {t}, {s}",
+            "lea {v:e}, [{src} + {t}]",
+            "mov dword ptr [{dst} + 12], {v:e}",
+            "mov {v:e}, dword ptr [{src} + {t} - 1]",
+            "mov dword ptr [{fdst} + 12], {v:e}",
+            "blsr {s}, {s}",
+            "tzcnt {t}, {s}",
+            "lea {v:e}, [{src} + {t}]",
+            "mov dword ptr [{dst} + 16], {v:e}",
+            "mov {v:e}, dword ptr [{src} + {t} - 1]",
+            "mov dword ptr [{fdst} + 16], {v:e}",
+            "blsr {s}, {s}",
+            "tzcnt {t}, {s}",
+            "lea {v:e}, [{src} + {t}]",
+            "mov dword ptr [{dst} + 20], {v:e}",
+            "mov {v:e}, dword ptr [{src} + {t} - 1]",
+            "mov dword ptr [{fdst} + 20], {v:e}",
+            "blsr {s}, {s}",
+            "tzcnt {t}, {s}",
+            "lea {v:e}, [{src} + {t}]",
+            "mov dword ptr [{dst} + 24], {v:e}",
+            "mov {v:e}, dword ptr [{src} + {t} - 1]",
+            "mov dword ptr [{fdst} + 24], {v:e}",
+            "blsr {s}, {s}",
+            s = inout(reg) d => s,
+            t = out(reg) _,
+            v = out(reg) _,
+            dst = in(reg) *dst,
+            fdst = in(reg) *fdst,
+            src = in(reg) p,
+            options(nostack),
+        );
+        let found = d.count_ones() as usize;
+        if found > 7 {
+            Self::dense(*dst, *fdst, p, s, found);
+        }
+        let stray = *pq & !(*pfs ^ (*pd >> 1 | d << 63));
+        if stray != 0 {
+            self.note(stray, p.sub(64).offset_from(buf) as u32);
+        }
+        *pfs = d << 1 | *carry;
+        *carry = d >> 63;
+        *pd = d;
+        *pq = q;
+        *dst = dst.add(found);
+        *fdst = fdst.add(found);
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,bmi2,lzcnt")]
+    unsafe fn index_avx512(&mut self, buf: *const u8, n: usize) {
+        let ent = self.ent.as_mut_ptr();
+        let flags = self.flags.as_mut_ptr();
+        let comma = _mm512_set1_epi8(b',' as i8);
+        let newline = _mm512_set1_epi8(b'\n' as i8);
+        let quote = _mm512_set1_epi8(b'"' as i8);
+        *ent = (buf as u32).wrapping_sub(1);
+        *flags = (b'\n' as u32) << 8 | (*buf as u32) << 16 | (*buf.add(1) as u32) << 24;
+        self.strays.clear();
+        let (mut dst, mut fdst) = (ent.add(1), flags.add(1));
+        let (mut pd, mut pq, mut pfs) = (0u64, 0u64, 0u64);
+        let mut carry = 1u64;
+        let mut p = buf;
+        let end = buf.add(n);
+        while p < end {
+            let v = _mm512_loadu_si512(p as *const __m512i);
+            let d = _mm512_cmpeq_epi8_mask(v, comma) | _mm512_cmpeq_epi8_mask(v, newline);
+            let q = _mm512_cmpeq_epi8_mask(v, quote);
+            let left = end.offset_from(p) as usize;
+            self.index_step(
+                buf, p, left, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,
+            );
+            p = p.add(64);
+        }
+        let stray = pq & !(pfs ^ (pd >> 1));
+        if stray != 0 {
+            self.note(stray, p.sub(64).offset_from(buf) as u32);
+        }
+        self.count = dst.offset_from(ent) as usize;
+        if !self.strays.is_empty() {
+            self.patch(buf as u32);
+        }
+    }
+
+    unsafe fn index_avx2(&mut self, buf: *const u8, n: usize) {
         let ent = self.ent.as_mut_ptr();
         let flags = self.flags.as_mut_ptr();
         let comma = _mm256_set1_epi8(b',' as i8);
@@ -57,84 +191,13 @@ impl Reader {
             let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
             let da = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, newline));
             let db = _mm256_or_si256(_mm256_cmpeq_epi8(b, comma), _mm256_cmpeq_epi8(b, newline));
-            let mut d = (_mm256_movemask_epi8(da) as u32 as u64) | (_mm256_movemask_epi8(db) as u32 as u64) << 32;
-            let mut q = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)) as u32 as u64)
+            let d = (_mm256_movemask_epi8(da) as u32 as u64) | (_mm256_movemask_epi8(db) as u32 as u64) << 32;
+            let q = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)) as u32 as u64)
                 | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)) as u32 as u64) << 32;
             let left = end.offset_from(p) as usize;
-            if left < 64 {
-                d = _bzhi_u64(d, left as u32);
-                q = _bzhi_u64(q, left as u32);
-            }
-            let s: u64;
-            // Entries hold the low 32 bits of the delimiter's address. Seven
-            // delimiters cover all but 0.04% of words. Hand-written because
-            // LLVM's generic tuning adds a dependency-breaking xor and splits
-            // the lea, three more instructions per delimiter.
-            std::arch::asm!(
-                "tzcnt {t}, {s}",
-                "lea {v:e}, [{src} + {t}]",
-                "mov dword ptr [{dst}], {v:e}",
-                "mov {v:e}, dword ptr [{src} + {t} - 1]",
-                "mov dword ptr [{fdst}], {v:e}",
-                "blsr {s}, {s}",
-                "tzcnt {t}, {s}",
-                "lea {v:e}, [{src} + {t}]",
-                "mov dword ptr [{dst} + 4], {v:e}",
-                "mov {v:e}, dword ptr [{src} + {t} - 1]",
-                "mov dword ptr [{fdst} + 4], {v:e}",
-                "blsr {s}, {s}",
-                "tzcnt {t}, {s}",
-                "lea {v:e}, [{src} + {t}]",
-                "mov dword ptr [{dst} + 8], {v:e}",
-                "mov {v:e}, dword ptr [{src} + {t} - 1]",
-                "mov dword ptr [{fdst} + 8], {v:e}",
-                "blsr {s}, {s}",
-                "tzcnt {t}, {s}",
-                "lea {v:e}, [{src} + {t}]",
-                "mov dword ptr [{dst} + 12], {v:e}",
-                "mov {v:e}, dword ptr [{src} + {t} - 1]",
-                "mov dword ptr [{fdst} + 12], {v:e}",
-                "blsr {s}, {s}",
-                "tzcnt {t}, {s}",
-                "lea {v:e}, [{src} + {t}]",
-                "mov dword ptr [{dst} + 16], {v:e}",
-                "mov {v:e}, dword ptr [{src} + {t} - 1]",
-                "mov dword ptr [{fdst} + 16], {v:e}",
-                "blsr {s}, {s}",
-                "tzcnt {t}, {s}",
-                "lea {v:e}, [{src} + {t}]",
-                "mov dword ptr [{dst} + 20], {v:e}",
-                "mov {v:e}, dword ptr [{src} + {t} - 1]",
-                "mov dword ptr [{fdst} + 20], {v:e}",
-                "blsr {s}, {s}",
-                "tzcnt {t}, {s}",
-                "lea {v:e}, [{src} + {t}]",
-                "mov dword ptr [{dst} + 24], {v:e}",
-                "mov {v:e}, dword ptr [{src} + {t} - 1]",
-                "mov dword ptr [{fdst} + 24], {v:e}",
-                "blsr {s}, {s}",
-                s = inout(reg) d => s,
-                t = out(reg) _,
-                v = out(reg) _,
-                dst = in(reg) dst,
-                fdst = in(reg) fdst,
-                src = in(reg) p,
-                options(nostack),
+            self.index_step(
+                buf, p, left, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,
             );
-            let found = d.count_ones() as usize;
-            if found > 7 {
-                Self::dense(dst, fdst, p, s, found);
-            }
-            let stray = pq & !(pfs ^ (pd >> 1 | d << 63));
-            if stray != 0 {
-                self.note(stray, p.sub(64).offset_from(buf) as u32);
-            }
-            pfs = d << 1 | carry;
-            carry = d >> 63;
-            pd = d;
-            pq = q;
-            dst = dst.add(found);
-            fdst = fdst.add(found);
             p = p.add(64);
         }
         let stray = pq & !(pfs ^ (pd >> 1));
