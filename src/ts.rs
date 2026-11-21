@@ -292,47 +292,6 @@ pub unsafe fn parse_f1_rel(p: *const u8, len: usize, lut: &DateLut, dc: &mut Dat
     }
 }
 
-#[inline(never)]
-unsafe fn offset_form_rel(p: *const u8, lut: &DateLut, dc: &mut DateCache, base_s: i64) -> i64 {
-    let slot = _pext_u32((p.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
-    let entry = lut.0.get_unchecked(slot);
-    let d_bad = _mm_and_si128(
-        _mm_xor_si128(_mm_loadu_si128(p as *const __m128i), _mm_load_si128(entry as *const DateSlot as *const __m128i)),
-        _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0),
-    );
-    let s_rel = if _mm_testz_si128(d_bad, d_bad) != 0 {
-        let y = (p.add(11) as *const u64).read_unaligned() ^ 0x3030_3A30_303A_3030;
-        if (y | y.wrapping_add(0x0606_0F06_060F_0606)) & 0xF0F0_F0F0_F0F0_F0F0 != 0 {
-            return BAD;
-        }
-        let pairs = y.wrapping_mul(10).wrapping_add(y >> 8);
-        let h = (pairs & 0xFF) as i64;
-        let m = ((pairs >> 24) & 0xFF) as i64;
-        let s = ((pairs >> 48) & 0xFF) as i64;
-        if h > 23 || m > 59 || s > 59 {
-            return BAD;
-        }
-        entry.sec_rel as i64 + h * 3600 + m * 60 + s
-    } else {
-        let s = datetime19(p, dc);
-        if s == BAD {
-            return BAD;
-        }
-        s - base_s
-    };
-    let o = std::slice::from_raw_parts(p.add(19), 6);
-    if o[3] != b':' || ![o[1], o[2], o[4], o[5]].iter().all(u8::is_ascii_digit) {
-        return BAD;
-    }
-    let oh = ((o[1] - b'0') * 10 + (o[2] - b'0')) as i64;
-    let om = ((o[4] - b'0') * 10 + (o[5] - b'0')) as i64;
-    if oh > 23 || om > 59 {
-        return BAD;
-    }
-    let off = oh * 3600 + om * 60;
-    (if o[0] == b'+' { s_rel - off } else { s_rel + off }) * 1000
-}
-
 #[cold]
 #[inline(never)]
 unsafe fn parse_ts_slow_rel(p: *const u8, len: usize, dc: &mut DateCache, base_ms: i64) -> i64 {
@@ -340,22 +299,75 @@ unsafe fn parse_ts_slow_rel(p: *const u8, len: usize, dc: &mut DateCache, base_m
     if t == BAD { BAD } else { t - base_ms }
 }
 
+static F3_13_MASK: [u8; 16] = [0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255];
+
+/// Exactly 13 ASCII digits at `p` as a number. Reads the 3 bytes before `p`.
+#[inline(always)]
+unsafe fn f3_13(p: *const u8) -> Option<u64> {
+    let m = _mm_loadu_si128(F3_13_MASK.as_ptr() as *const __m128i);
+    let d = _mm_sub_epi8(_mm_loadu_si128(p.sub(3) as *const __m128i), _mm_set1_epi8(b'0' as i8));
+    let over = _mm_and_si128(_mm_subs_epu8(d, _mm_set1_epi8(9)), m);
+    if _mm_testz_si128(over, over) == 0 {
+        return None;
+    }
+    let d = _mm_and_si128(d, m);
+    let t = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let t = _mm_madd_epi16(t, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let t = _mm_packus_epi32(t, t);
+    let t = _mm_madd_epi16(t, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let hi = _mm_cvtsi128_si32(t) as u32 as u64;
+    let lo = _mm_extract_epi32(t, 1) as u32 as u64;
+    Some(hi * 100_000_000 + lo)
+}
+
+/// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` whose date is in `lut`, as seconds relative to `base_s`.
+/// Reads 27 bytes from `p`.
+#[inline(always)]
+unsafe fn f2_lut(p: *const u8, lut: &DateLut) -> Option<i32> {
+    let slot = _pext_u32((p.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
+    let entry = lut.0.get_unchecked(slot);
+    let d_bad = _mm_and_si128(
+        _mm_xor_si128(_mm_loadu_si128(p as *const __m128i), _mm_load_si128(entry as *const DateSlot as *const __m128i)),
+        _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0),
+    );
+    // Bytes 11..25: HH:MM:SS, the sign (checked below), OH:OM.
+    let c = _mm_sub_epi8(
+        _mm_loadu_si128(p.add(11) as *const __m128i),
+        _mm_setr_epi8(48, 48, 58, 48, 48, 58, 48, 48, 0, 48, 48, 58, 48, 48, 0, 0),
+    );
+    let c_bad = _mm_subs_epu8(c, _mm_setr_epi8(2, 9, 0, 5, 9, 0, 5, 9, -1, 2, 9, 0, 5, 9, -1, -1));
+    let bad = _mm_or_si128(d_bad, c_bad);
+    let sign = *p.add(19);
+    if (_mm_testz_si128(bad, bad) == 0) | (sign.wrapping_sub(b'+') & 0xFD != 0) {
+        return None;
+    }
+    let c = _mm_and_si128(c, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, -1, 0, 0));
+    let t = _mm_madd_epi16(
+        _mm_maddubs_epi16(c, _mm_setr_epi8(10, 1, 0, 10, 1, 0, 10, 1, 0, 10, 1, 0, 10, 1, 0, 0)),
+        _mm_setr_epi16(3600, 60, 60, 1, 3600, 3600, 60, 0),
+    );
+    let sec = (_mm_cvtsi128_si32(t) + _mm_extract_epi32(t, 1)) as u32;
+    let off = (_mm_extract_epi32(t, 2) + _mm_extract_epi32(t, 3)) as u32;
+    if (sec >= 86_400) | (off >= 86_400) {
+        return None;
+    }
+    let local = entry.sec_rel + sec as i32;
+    Some(if sign == b'+' { local - off as i32 } else { local + off as i32 })
+}
+
 /// A `ts` field as milliseconds relative to `base_ms` (where `base_ms == base_s * 1000`), or BAD.
-/// Needs 16 readable bytes before the field's end and 16 after `p` / `p + 11` for F1/F2.
+/// Needs 16 readable bytes before the field's end, 3 before `p` and 27 after it.
 #[inline(always)]
 pub unsafe fn parse_ts_rel(p: *const u8, len: usize, lut: &DateLut, dc: &mut DateCache, base_ms: i64) -> i64 {
-    if len == 20 && *p.add(19) == b'Z' {
-        return match parse_f1_lut(p, lut) {
-            Some(s) => (s as i64) * 1000,
-            None => parse_ts_slow_rel(p, len, dc, base_ms),
-        };
-    }
-    if len == 25 && (*p.add(19) == b'+' || *p.add(19) == b'-') {
-        return offset_form_rel(p, lut, dc, base_ms / 1000);
-    }
-    match digits(p, len) {
-        Some(v) => (v as i64) - base_ms,
-        None => BAD,
+    let fast = match len {
+        20 => parse_f1_lut(p, lut).map(|s| s as i64 * 1000),
+        13 => f3_13(p).map(|v| v as i64 - base_ms),
+        25 => f2_lut(p, lut).map(|s| s as i64 * 1000),
+        _ => None,
+    };
+    match fast {
+        Some(t) => t,
+        None => parse_ts_slow_rel(p, len, dc, base_ms),
     }
 }
 
@@ -398,6 +410,67 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ts_rel_fuzz() {
+        let ws = days_from_civil(2028, 2, 20) * DAY_MS;
+        let we = days_from_civil(2028, 3, 5) * DAY_MS;
+        let base_ms = ws - 7 * DAY_MS;
+        let lut = DateLut::new(ws, we, base_ms / 1000);
+        let mut dc1 = DateCache::new();
+        let mut dc2 = DateCache::new();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789:-+TZz \r\n\0,\"./e";
+        for i in 0..3_000_000u64 {
+            let t = (base_ms + (rnd() % (30 * DAY_MS as u64)) as i64) / 1000;
+            let day = t.div_euclid(86_400);
+            let (y, m, d) = civil_from_days(day);
+            let sod = t.rem_euclid(86_400);
+            let mut s = match i % 3 {
+                0 => format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", sod / 3600, sod / 60 % 60, sod % 60),
+                1 => {
+                    let oh = rnd() % 26;
+                    let om = rnd() % 61;
+                    let sg = if rnd() & 1 == 0 { '+' } else { '-' };
+                    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}{sg}{oh:02}:{om:02}", sod / 3600, sod / 60 % 60, sod % 60)
+                }
+                _ => format!("{}", t * 1000 + (rnd() % 1000) as i64),
+            }
+            .into_bytes();
+            let muts = rnd() % 4;
+            for _ in 0..muts {
+                if s.is_empty() {
+                    break;
+                }
+                let k = (rnd() as usize) % s.len();
+                match rnd() % 5 {
+                    0 => s[k] = alphabet[(rnd() as usize) % alphabet.len()],
+                    1 => s[k] = (rnd() & 0xFF) as u8,
+                    2 => {
+                        s.remove(k);
+                    }
+                    3 => s.insert(k, b'0'),
+                    _ => s[k] = s[k].wrapping_add(1),
+                }
+            }
+            if s.len() > 32 {
+                continue;
+            }
+            let mut buf = [b'x'; 96];
+            buf[32..32 + s.len()].copy_from_slice(&s);
+            let p = unsafe { buf.as_ptr().add(32) };
+            let ts_old = unsafe { parse_ts(p, s.len(), &mut dc1) };
+            let ts_exp = if ts_old == BAD { BAD } else { ts_old - base_ms };
+            let ts_new = unsafe { parse_ts_rel(p, s.len(), &lut, &mut dc2, base_ms) };
+            assert_eq!(ts_new, ts_exp, "parse_ts_rel mismatch on {:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
+    #[test]
     fn test_parse_rel_equivalence() {
         let ws = days_from_civil(2028, 2, 20) * DAY_MS; // crosses 2028-02-29!
         let we = days_from_civil(2028, 3, 5) * DAY_MS;
@@ -433,6 +506,24 @@ mod tests {
             b"2028-02-29T19:58:10+24:00",
             b"2028-02-29T19:58:10+05:60",
             b"2028-02-29T19:58:10+0200",
+            b"2028-02-29T19:58:10*04:00",
+            b"2028-02-29T19:58:10,04:00",
+            b"2028-02-29T19:58:10+04;00",
+            b"2028-02-29T19:58:10+4:000",
+            b"2028-02-29T23:59:59-23:59",
+            b"2028-02-21T00:00:00+12:00",
+            b"2028-02-29T24:00:00+00:00",
+            b"2028-02-29T19:60:10+00:00",
+            b"2028-02-29T19:58:10+00:00\r",
+            b"2027-02-29T19:58:10+00:00",
+            b"2028-02-29T19:58:10Z+0:00",
+            b"1791071890000",
+            b"0791071890000",
+            b"179107189000a",
+            b"17910718900 0",
+            b"1791071890000\r",
+            b"0000000000000",
+            b"9999999999999",
             b"1791071890000",
             b"00000001791071890000",
             b"0000000000001791071890000",
