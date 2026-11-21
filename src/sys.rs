@@ -150,11 +150,6 @@ pub fn mix(x: u64) -> u64 {
     x ^ (x >> 32)
 }
 
-#[inline(always)]
-pub fn part_of(h: u64, nparts: usize) -> usize {
-    (((h >> 32) * nparts as u64) >> 32) as usize
-}
-
 pub fn peak_rss_kb() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()

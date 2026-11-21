@@ -15,12 +15,12 @@ use group::{Cell, Grouper};
 use ids::tok;
 use links::LinkTable;
 use parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
-use scatter::{by_partition, Arena, Scatter};
+use scatter::{by_partition, part_of_key, Arena, Scatter};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
-use sys::{mix, par, part_of, PerThread};
+use sys::{mix, par, PerThread};
 use ts::{DateCache, BAD, DAY_MS};
 
 /// Dedup stream: one per parsed event line, partitioned by event_id.
@@ -88,6 +88,8 @@ pub struct Shared {
 struct PendingEvent {
     event: u64,
     user: u64,
+    /// `mix(user)`, computed once for the prefetch and the lookup.
+    user_hash: u64,
     ingest: i32,
     ts: u32,
     payload: u32,
@@ -98,6 +100,7 @@ struct PendingEvent {
 struct PendingClick {
     click: u64,
     user: u64,
+    user_hash: u64,
     ts: u32,
     campaign: u32,
 }
@@ -203,12 +206,12 @@ unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
 unsafe fn flush_events(sh: &Shared, d: &mut Scatter<DRec, 4>, p: &mut Scatter<PRec, 4>, batch: &[PendingEvent]) {
     for e in batch {
         let payload = if e.valid {
-            let person = sh.links.person(e.user);
-            p.push(&sh.p_arena, part_of(mix(person), sh.p_parts), PRec { person, ts: e.ts, payload: e.payload })
+            let person = sh.links.person_hashed(e.user, e.user_hash);
+            p.push(&sh.p_arena, part_of_key(person, sh.p_parts), PRec { person, ts: e.ts, payload: e.payload })
         } else {
             NONE
         };
-        d.push(&sh.d_arena, part_of(mix(e.event), sh.d_parts), DRec { event: e.event, ingest: e.ingest, payload });
+        d.push(&sh.d_arena, part_of_key(e.event, sh.d_parts), DRec { event: e.event, ingest: e.ingest, payload });
     }
 }
 
@@ -217,7 +220,7 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let Worker { reader, dates, d, p, .. } = w;
-    let mut batch = [PendingEvent { event: 0, user: 0, ingest: 0, ts: 0, payload: 0, valid: false }; BATCH];
+    let mut batch = [PendingEvent { event: 0, user: 0, user_hash: 0, ingest: 0, ts: 0, payload: 0, valid: false }; BATCH];
     let mut pending = 0;
     let base_s = sh.base_ms.div_euclid(1000);
     reader.scan::<7>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
@@ -228,7 +231,7 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
         }
         let event = tok(at(0), len(0));
         let ingest_s = ts::parse_f1(at(3), len(3), dates);
-        let mut out = PendingEvent { event, user: 0, ingest: i32::MAX, ts: 0, payload: 0, valid: false };
+        let mut out = PendingEvent { event, user: 0, user_hash: 0, ingest: i32::MAX, ts: 0, payload: 0, valid: false };
         if ingest_s != BAD {
             // Only the order of copies matters here; the lateness test below uses the exact value.
             out.ingest = (ingest_s - base_s).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
@@ -265,7 +268,8 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
                 _ => break 'valid,
             }
             out.user = tok(at(1), len(1));
-            sh.links.prefetch(out.user);
+            out.user_hash = mix(out.user);
+            sh.links.prefetch_hashed(out.user_hash);
             out.ts = (t - sh.base_ms) as u32;
             out.valid = true;
         }
@@ -282,15 +286,15 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
 #[inline(always)]
 unsafe fn flush_clicks(sh: &Shared, c: &mut Scatter<CRec, 8>, batch: &[PendingClick]) {
     for k in batch {
-        let person = sh.links.person(k.user);
+        let person = sh.links.person_hashed(k.user, k.user_hash);
         let rec = CRec { person, click: k.click, ts: k.ts, campaign: k.campaign };
-        c.push(&sh.c_arena, part_of(mix(person), sh.p_parts), rec);
+        c.push(&sh.c_arena, part_of_key(person, sh.p_parts), rec);
     }
 }
 
 unsafe fn parse_clicks(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
     let Worker { reader, dates, c, .. } = w;
-    let mut batch = [PendingClick { click: 0, user: 0, ts: 0, campaign: 0 }; BATCH];
+    let mut batch = [PendingClick { click: 0, user: 0, user_hash: 0, ts: 0, campaign: 0 }; BATCH];
     let mut pending = 0;
     reader.scan::<4>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
         let at = |k: usize| buf.add(s[k] as usize);
@@ -304,9 +308,10 @@ unsafe fn parse_clicks(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
         }
         let Some(campaign) = sh.campaign_ids.get(at(2), len(2)) else { return };
         let user = tok(at(1), len(1));
-        sh.links.prefetch(user);
+        let user_hash = mix(user);
+        sh.links.prefetch_hashed(user_hash);
         *batch.get_unchecked_mut(pending) =
-            PendingClick { click: tok(at(0), len(0)), user, ts: (t - sh.base_ms) as u32, campaign };
+            PendingClick { click: tok(at(0), len(0)), user, user_hash, ts: (t - sh.base_ms) as u32, campaign };
         pending += 1;
         if pending == BATCH {
             flush_clicks(sh, c, &batch);
