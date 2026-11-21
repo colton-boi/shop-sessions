@@ -10,3 +10,6 @@ codegen-units = 1
 panic = "abort"
 debug = false
 strip = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(pgo_gen)"] }

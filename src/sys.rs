@@ -5,6 +5,7 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
     fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+    fn mallopt(param: c_int, value: c_int) -> c_int;
     fn syscall(number: i64, ...) -> i64;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn getrusage(who: c_int, usage: *mut [i64; 18]) -> c_int;
@@ -265,30 +266,49 @@ mod pool {
         /// with the wrong generation.
         epoch: AtomicU32,
         pending: AtomicU32,
+        /// Threads inside `futex_wait` or about to enter it; a wake is a syscall, skipped when none.
+        sleepers: AtomicU32,
+        spin: u32,
     }
 
     static POOL: OnceLock<Pool> = OnceLock::new();
-    const SPIN: u32 = 1 << 14;
 
     fn futex_wait(word: &AtomicU32, value: u32) {
         unsafe { super::syscall(202, word as *const AtomicU32, 128, value, std::ptr::null::<u8>()) };
     }
 
-    fn futex_wake(word: &AtomicU32) {
-        unsafe { super::syscall(202, word as *const AtomicU32, 129, i32::MAX) };
+    /// Wakes the waiters on `word`, which the caller has just changed with a SeqCst store or RMW.
+    fn futex_wake(pool: &Pool, word: &AtomicU32) {
+        // Pairs with the SeqCst increment in `wait_change`: either the waiter sees the new value
+        // before sleeping, or this load sees the waiter.
+        if pool.sleepers.load(SeqCst) != 0 {
+            unsafe { super::syscall(202, word as *const AtomicU32, 129, i32::MAX) };
+        }
     }
 
     /// Waits until `word` differs from `value`.
-    fn wait_change(word: &AtomicU32, value: u32) {
-        for _ in 0..SPIN {
+    fn wait_change(pool: &Pool, word: &AtomicU32, value: u32) {
+        for _ in 0..pool.spin {
             if word.load(Acquire) != value {
                 return;
             }
             std::hint::spin_loop();
         }
         while word.load(Acquire) == value {
-            futex_wait(word, value);
+            pool.sleepers.fetch_add(1, SeqCst);
+            if word.load(SeqCst) == value {
+                futex_wait(word, value);
+            }
+            pool.sleepers.fetch_sub(1, SeqCst);
         }
+    }
+
+    /// PAUSE takes about 140 cycles on Intel since Skylake and about 65 on Zen, so the spin before
+    /// sleeping is about the same time on both (~0.1 ms at 3 GHz).
+    fn spin_count() -> u32 {
+        let v = std::arch::x86_64::__cpuid(0);
+        let intel = (v.ebx, v.edx, v.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+        if intel { 2048 } else { 1 << 14 }
     }
 
     /// Starts `workers` threads, once; later calls keep the first pool.
@@ -299,6 +319,8 @@ mod pool {
                 job: AtomicPtr::new(std::ptr::null_mut()),
                 epoch: AtomicU32::new(0),
                 pending: AtomicU32::new(0),
+                sleepers: AtomicU32::new(0),
+                spin: spin_count(),
             };
             for t in 1..=workers {
                 std::thread::Builder::new()
@@ -307,13 +329,13 @@ mod pool {
                         let pool = POOL.wait();
                         let mut seen = 0;
                         loop {
-                            wait_change(&pool.epoch, seen);
+                            wait_change(pool, &pool.epoch, seen);
                             seen = pool.epoch.load(Acquire);
                             if (t as u32) < seen & 1023 {
                                 let job = unsafe { *pool.job.load(Acquire) };
                                 job(t);
-                                if pool.pending.fetch_sub(1, AcqRel) == 1 {
-                                    futex_wake(&pool.pending);
+                                if pool.pending.fetch_sub(1, SeqCst) == 1 {
+                                    futex_wake(pool, &pool.pending);
                                 }
                             }
                         }
@@ -334,15 +356,15 @@ mod pool {
         pool.job.store(job as *mut Job<'static>, Release);
         pool.pending.store(n as u32 - 1, Release);
         let epoch = pool.epoch.load(Relaxed);
-        pool.epoch.store(((epoch >> 10).wrapping_add(1) << 10) | n as u32, Release);
-        futex_wake(&pool.epoch);
+        pool.epoch.store(((epoch >> 10).wrapping_add(1) << 10) | n as u32, SeqCst);
+        futex_wake(pool, &pool.epoch);
         f(0);
         loop {
             let left = pool.pending.load(Acquire);
             if left == 0 {
                 break;
             }
-            wait_change(&pool.pending, left);
+            wait_change(pool, &pool.pending, left);
         }
         true
     }
@@ -390,6 +412,30 @@ pub fn mix(x: u64) -> u64 {
     let x = (x ^ (x >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let x = (x ^ (x >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x ^ (x >> 32)
+}
+
+/// Large buffers come from the heap and stay there when freed, instead of a fresh mmap (faults,
+/// zeroing) and a munmap (TLB shootdown) each time a growing Vec moves.
+pub fn tune_malloc() {
+    if std::env::var_os("SS_MALLOC_DEFAULT").is_some() {
+        return;
+    }
+    unsafe {
+        mallopt(-3, 32 << 20); // M_MMAP_THRESHOLD, at its maximum
+        mallopt(-1, -1); // M_TRIM_THRESHOLD: never trim
+        mallopt(-2, 16 << 20); // M_TOP_PAD
+    }
+}
+
+/// Ends the process at once: every output file is written and closed by now, and nothing else
+/// needs flushing, so libc's exit handlers are skipped.
+pub fn exit_now() -> ! {
+    // A PGO training build writes its profile from an exit handler.
+    if cfg!(pgo_gen) {
+        std::process::exit(0);
+    }
+    unsafe { syscall(231, 0) };
+    unreachable!()
 }
 
 pub fn peak_rss_kb() -> u64 {
