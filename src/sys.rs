@@ -52,6 +52,119 @@ impl Counters {
 
 const HUGE: usize = 2 << 20;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SimdTier {
+    Avx2,
+    ClxAvx512,
+    IcxAvx512,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThpPolicy {
+    DefaultHuge,
+    AdviseHuge,
+    NoHuge,
+}
+
+/// What the host offers, probed once at startup in well under 100 us.
+#[derive(Clone, Copy, Debug)]
+pub struct HostProfile {
+    pub simd: SimdTier,
+    pub thp: ThpPolicy,
+    pub file_huge_ok: bool,
+    pub fs_magic: i64,
+    pub kern_major: u32,
+    pub kern_minor: u32,
+    pub order9_free: u32,
+}
+
+static HOST_PROFILE: std::sync::OnceLock<HostProfile> = std::sync::OnceLock::new();
+
+extern "C" {
+    fn statfs(path: *const std::os::raw::c_char, buf: *mut [i64; 16]) -> c_int;
+}
+
+fn bracketed(s: &str, tag: &str) -> bool {
+    s.split_whitespace().any(|w| w.strip_prefix('[').and_then(|w| w.strip_suffix(']')) == Some(tag))
+}
+
+fn probe_simd() -> SimdTier {
+    use std::arch::x86_64::{__cpuid, __cpuid_count, _xgetbv};
+    let (l1, l7) = (__cpuid(1), __cpuid_count(7, 0));
+    let zmm_os = (l1.ecx >> 27) & 1 != 0 && (unsafe { _xgetbv(0) } & 0xE6) == 0xE6;
+    let bit = |reg: u32, b: u32| (reg >> b) & 1 != 0;
+    let clx = zmm_os && bit(l7.ebx, 16) && bit(l7.ebx, 17) && bit(l7.ebx, 30) && bit(l7.ebx, 31);
+    let icx = clx && bit(l7.ecx, 6) && bit(l7.ecx, 10) && bit(l7.ecx, 12);
+    if icx {
+        SimdTier::IcxAvx512
+    } else if clx {
+        SimdTier::ClxAvx512
+    } else {
+        SimdTier::Avx2
+    }
+}
+
+/// Free order-9 (2 MiB) pages, or `u32::MAX` when `/proc/buddyinfo` cannot be read.
+fn order9_free() -> u32 {
+    let Ok(s) = std::fs::read_to_string("/proc/buddyinfo") else { return u32::MAX };
+    let mut total = 0u64;
+    let mut any = false;
+    for line in s.lines() {
+        // "Node 0, zone   Normal  a b c d e f g h i j k": order 9 is the 10th count.
+        if let Some(v) = line.split_whitespace().skip(4).nth(9).and_then(|v| v.parse::<u64>().ok()) {
+            total += v;
+            any = true;
+        }
+    }
+    if any {
+        total.min(u32::MAX as u64 - 1) as u32
+    } else {
+        u32::MAX
+    }
+}
+
+fn probe_host(data_dir: &std::path::Path) -> HostProfile {
+    let en = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
+    let df = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/defrag").unwrap_or_default();
+    let o9 = order9_free();
+    let thp = if std::env::var_os("SS_NOHUGE").is_some() {
+        ThpPolicy::NoHuge
+    } else if bracketed(&en, "always") {
+        // Without MADV_HUGEPAGE the kernel allocates huge pages opportunistically and never stalls to compact.
+        ThpPolicy::DefaultHuge
+    } else if bracketed(&en, "madvise") {
+        // The scorer's mode: MADV_HUGEPAGE is the only way to get huge pages (turning THP off costs +148 ms).
+        ThpPolicy::AdviseHuge
+    } else if bracketed(&en, "never") {
+        ThpPolicy::NoHuge
+    } else {
+        ThpPolicy::AdviseHuge
+    };
+    let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut it = rel.trim().split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse::<u32>().unwrap_or(0));
+    let (kern_major, kern_minor) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+    let mut fs_magic = 0i64;
+    if let Ok(c) = std::ffi::CString::new(data_dir.as_os_str().as_encoded_bytes()) {
+        let mut buf = [0i64; 16];
+        if unsafe { statfs(c.as_ptr(), &mut buf) } == 0 {
+            fs_magic = buf[0];
+        }
+    }
+    let kern = (kern_major, kern_minor);
+    let file_huge_ok = (fs_magic == 0x0102_1994 && kern >= (5, 15))
+        || (fs_magic == 0x5846_5342 && kern >= (5, 18))
+        || (fs_magic == 0xEF53 && kern >= (6, 8));
+    HostProfile { simd: probe_simd(), thp, file_huge_ok, fs_magic, kern_major, kern_minor, order9_free: o9 }
+}
+
+pub fn init_host_profile(data_dir: &std::path::Path) -> &'static HostProfile {
+    HOST_PROFILE.get_or_init(|| probe_host(data_dir))
+}
+
+pub fn host_profile() -> &'static HostProfile {
+    HOST_PROFILE.get_or_init(|| probe_host(std::path::Path::new("/data")))
+}
+
 /// A whole file mapped copy-on-write, with a zero page of slack on both sides
 /// and a newline written after the last byte when the file lacks one.
 pub fn map_file(file: &std::fs::File, size: usize) -> (*const u8, usize) {
@@ -112,8 +225,12 @@ pub fn map_zeroed(bytes: usize) -> *mut u8 {
         panic!("mmap of {len} bytes failed");
     }
     if bytes >= HUGE {
-        // MADV_HUGEPAGE; SS_NOHUGE=1 forces 4 KB pages (MADV_NOHUGEPAGE) to model a host without THP.
-        unsafe { madvise(p, len, if std::env::var_os("SS_NOHUGE").is_some() { 15 } else { 14 }) };
+        // MADV_HUGEPAGE / MADV_NOHUGEPAGE per the host's THP policy (SS_NOHUGE=1 models a host without THP).
+        match host_profile().thp {
+            ThpPolicy::AdviseHuge => unsafe { madvise(p, len, 14) },
+            ThpPolicy::NoHuge => unsafe { madvise(p, len, 15) },
+            ThpPolicy::DefaultHuge => 0,
+        };
     }
     p as *mut u8
 }

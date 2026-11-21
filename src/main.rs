@@ -399,6 +399,9 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .clamp(1, 256);
+    sys::init_host_profile(&data);
+    // Counters must open before the pool starts so every worker thread inherits them.
+    let counters = verbose.then(sys::Counters::open);
     sys::start_pool(threads);
     diag::host(threads);
 
@@ -436,7 +439,6 @@ fn main() {
         c: Scatter::new(),
         busy: [[0.0; 3]; 8],
     });
-    let counters = verbose.then(sys::Counters::open);
     let count = || counters.as_ref().map_or([0; 4], |c| c.read());
     let mark = |name| (name, t0.elapsed().as_secs_f64(), sys::rusage(), count());
     let mut marks: Vec<Mark> = vec![mark("setup")];

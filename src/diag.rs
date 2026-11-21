@@ -97,13 +97,21 @@ pub fn host(threads: usize) {
     let online = unsafe { sysconf(84) }; // _SC_NPROCESSORS_ONLN
     let (cpu_max, mem_max) = (cgroup("cpu.max"), cgroup("memory.max"));
     let mem = mem_max.parse::<u64>().map_or(mem_max.clone(), |b| format!("{}M", b >> 20));
+    let hp = crate::sys::host_profile();
     emit(format!(
-        "ss host cpu=\"{}\" avx512={} nproc={online} affinity={aff}({n_aff}) threads={threads} cpu.max={} memory.max={mem} thp={}/{}\n",
+        "ss host cpu=\"{}\" avx512={} nproc={online} affinity={aff}({n_aff}) threads={threads} cpu.max={} memory.max={mem} thp={}/{} kern={}.{} fs={:#x} o9={} simd={:?} thp_pol={:?} fhuge={}\n",
         cpu_brand(),
         avx512(),
         cpu_max.replace(' ', "/"),
         thp("enabled"),
         thp("defrag"),
+        hp.kern_major,
+        hp.kern_minor,
+        hp.fs_magic,
+        hp.order9_free,
+        hp.simd,
+        hp.thp,
+        hp.file_huge_ok,
     ));
 }
 
