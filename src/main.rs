@@ -72,9 +72,11 @@ pub struct Shared {
     pub days: usize,
     products: KeyMap,
     product_category: Vec<u8>,
+    direct_prod_cat: Vec<u8>,
     unknown_category: u8,
     pub categories: Vec<Vec<u8>>,
     campaign_ids: KeyMap,
+    direct_camp: Vec<u16>,
     pub campaigns: Vec<(Vec<u8>, Vec<u8>)>,
     links: LinkTable,
     d_arena: Arena<DRec>,
@@ -82,6 +84,29 @@ pub struct Shared {
     pub c_arena: Arena<CRec>,
     d_parts: usize,
     p_parts: usize,
+}
+
+impl Shared {
+    #[inline(always)]
+    unsafe fn product_cat(&self, p: *const u8, len: usize) -> u8 {
+        if !self.direct_prod_cat.is_empty() {
+            dims::lookup_prod_direct(&self.direct_prod_cat, self.unknown_category, p, len)
+        } else {
+            match self.products.get(p, len) {
+                Some(i) => *self.product_category.get_unchecked(i as usize),
+                None => self.unknown_category,
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn campaign_id(&self, p: *const u8, len: usize) -> Option<u32> {
+        if !self.direct_camp.is_empty() {
+            dims::lookup_camp_direct(&self.direct_camp, p, len)
+        } else {
+            self.campaign_ids.get(p, len)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -259,10 +284,7 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
                         Some(v) if (1..=10_000_000).contains(&v) => v as u32,
                         _ => break 'valid,
                     };
-                    let category = match sh.products.get(at(5), len(5)) {
-                        Some(i) => *sh.product_category.get_unchecked(i as usize),
-                        None => sh.unknown_category,
-                    };
+                    let category = sh.product_cat(at(5), len(5));
                     out.payload = (category as u32) << 24 | price;
                 }
                 _ => break 'valid,
@@ -306,7 +328,7 @@ unsafe fn parse_clicks(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
         if t < sh.base_ms || t >= sh.window_end {
             return;
         }
-        let Some(campaign) = sh.campaign_ids.get(at(2), len(2)) else { return };
+        let Some(campaign) = sh.campaign_id(at(2), len(2)) else { return };
         let user = tok(at(1), len(1));
         let user_hash = mix(user);
         sh.links.prefetch_hashed(user_hash);
@@ -518,9 +540,11 @@ fn main() {
         days,
         products: dims.products,
         product_category: dims.product_category,
+        direct_prod_cat: dims.direct_prod_cat,
         unknown_category: dims.unknown_category,
         categories: dims.categories,
         campaign_ids: dims.campaign_ids,
+        direct_camp: dims.direct_camp,
         campaigns: dims.campaigns,
         links,
         d_arena: Arena::new(d_recs, D_CHUNK),
