@@ -18,6 +18,14 @@ impl<T> Arena<T> {
         Arena { base: map_zeroed(cap * std::mem::size_of::<T>()) as *mut T, cap, next: AtomicUsize::new(0), chunk }
     }
 
+    pub fn cap_bytes(&self) -> usize {
+        self.cap * std::mem::size_of::<T>()
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        self.next.load(Relaxed).min(self.cap) * std::mem::size_of::<T>()
+    }
+
     fn take(&self) -> usize {
         let at = self.next.fetch_add(self.chunk, Relaxed);
         assert!(at + self.chunk <= self.cap, "record arena overflow");

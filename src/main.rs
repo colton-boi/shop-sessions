@@ -157,7 +157,6 @@ unsafe impl Send for Mapped {}
 
 struct Input {
     files: Vec<Mapped>,
-    sizes: Vec<usize>,
     /// Extents of each file not yet parsed; the last one to finish unmaps the file.
     remaining: Vec<AtomicUsize>,
     extents: Vec<Extent>,
@@ -167,8 +166,19 @@ struct Input {
 impl Input {
     fn done(&self, x: &Extent) {
         if self.remaining[x.file].fetch_sub(1, Relaxed) == 1 {
-            sys::unmap_file(self.files[x.file].0, self.sizes[x.file]);
+            sys::unmap_file(self.files[x.file].0, self.files[x.file].1);
         }
+    }
+
+    /// Makes file `i` end with a newline, as `csv::Reader` needs.
+    fn end_line(&mut self, i: usize) {
+        let Mapped(data, size) = self.files[i];
+        self.files[i].1 = unsafe { sys::end_line(data, size) };
+    }
+
+    fn lacks_newline(&self, i: usize) -> bool {
+        let Mapped(data, size) = self.files[i];
+        size != 0 && unsafe { *data.add(size - 1) } != b'\n'
     }
 }
 
@@ -182,7 +192,7 @@ fn list_csv(dir: &Path, extent: u64) -> Input {
         Err(_) => Vec::new(),
     };
     paths.sort();
-    let mut input = Input { files: Vec::new(), sizes: Vec::new(), remaining: Vec::new(), extents: Vec::new(), bytes: 0 };
+    let mut input = Input { files: Vec::new(), remaining: Vec::new(), extents: Vec::new(), bytes: 0 };
     for p in paths {
         let file = File::open(&p).expect("open input");
         let size = file.metadata().unwrap().len();
@@ -195,10 +205,8 @@ fn list_csv(dir: &Path, extent: u64) -> Input {
             from = to;
         }
         input.remaining.push(AtomicUsize::new(input.extents.len() - first));
-        input.sizes.push(size as usize);
         input.bytes += size;
-        let (data, len) = sys::map_file(&file, size as usize);
-        input.files.push(Mapped(data, len));
+        input.files.push(Mapped(sys::map_file(&file, size as usize), size as usize));
     }
     input
 }
@@ -222,7 +230,11 @@ unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
         reader.scan::<2>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
             let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
             if la != 0 && lb != 0 {
-                pairs.push((tok(buf.add(s[0] as usize), la), tok(buf.add(s[1] as usize), lb)));
+                let a = tok(buf.add(s[0] as usize), la);
+                let b = tok(buf.add(s[1] as usize), lb);
+                if a != b {
+                    pairs.push((a, b));
+                }
             }
         });
         sh_files.done(x);
@@ -492,9 +504,13 @@ fn main() {
     let knob = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
     let extent = knob("SS_EXTENT", EXTENT);
     let read_buf = knob("SS_READ_BUF", READ_BUF as u64) as usize;
-    let link_input = list_csv(&data.join("links"), extent.min(256 << 10));
-    let event_input = list_csv(&data.join("events"), extent);
-    let click_input = list_csv(&data.join("clicks"), extent);
+    let mut link_input = list_csv(&data.join("links"), extent.min(256 << 10));
+    let mut event_input = list_csv(&data.join("events"), extent);
+    let mut click_input = list_csv(&data.join("clicks"), extent);
+    // The links are parsed first; the other files' last bytes are read in parallel during that parse.
+    for i in 0..link_input.files.len() {
+        link_input.end_line(i);
+    }
     std::fs::create_dir_all(output.join("user_daily")).expect("create output");
     std::fs::create_dir_all(output.join("campaign_daily")).expect("create output");
 
@@ -534,7 +550,32 @@ fn main() {
     };
 
     let next = AtomicUsize::new(0);
-    phase(0, &|t| unsafe { parse_links(&link_input, &next, workers.get(t)) });
+    let tails = event_input.files.len() + click_input.files.len();
+    let next_tail = AtomicUsize::new(0);
+    let unended: Vec<std::sync::atomic::AtomicBool> = (0..tails).map(|_| Default::default()).collect();
+    phase(0, &|t| unsafe {
+        loop {
+            let i = next_tail.fetch_add(1, Relaxed);
+            if i >= tails {
+                break;
+            }
+            let lacks = match i.checked_sub(event_input.files.len()) {
+                None => event_input.lacks_newline(i),
+                Some(k) => click_input.lacks_newline(k),
+            };
+            unended[i].store(lacks, Relaxed);
+        }
+        parse_links(&link_input, &next, workers.get(t))
+    });
+    // Rare, and done before the populate so no mapping change contends with it for the mmap lock.
+    for (i, u) in unended.iter().enumerate() {
+        if u.load(Relaxed) {
+            match i.checked_sub(event_input.files.len()) {
+                None => event_input.end_line(i),
+                Some(k) => click_input.end_line(k),
+            }
+        }
+    }
     marks.push(mark("links parse"));
     log_stage(&marks);
 
@@ -554,7 +595,7 @@ fn main() {
         let list = pair_lists[t];
         unsafe { links.link_all(&list[from..(from + LINK_BLOCK).min(list.len())]) };
     });
-    const SWEEP: usize = 1 << 16;
+    const SWEEP: usize = 1 << 14;
     let sweeps = links.slots().div_ceil(SWEEP);
     let sweep = |f: &(dyn Fn(usize, usize) + Sync)| {
         let next = AtomicUsize::new(0);
@@ -566,8 +607,7 @@ fn main() {
             f(i * SWEEP, ((i + 1) * SWEEP).min(links.slots()));
         });
     };
-    sweep(&|from, to| unsafe { links.compress(from, to) });
-    sweep(&|from, to| unsafe { links.resolve(from, to) });
+    sweep(&|from, to| unsafe { links.compress_and_resolve(from, to) });
     marks.push(mark("links join"));
     log_stage(&marks);
 
@@ -577,8 +617,8 @@ fn main() {
     let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
     let dims = dims_loader.join().expect("loading products and campaigns");
     let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
-    let p_recs = event_input.bytes as usize / 40 + (threads * p_parts + 2) * P_CHUNK;
-    let c_recs = click_input.bytes as usize / 20 + (threads * p_parts + 2) * C_CHUNK;
+    let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
+    let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
     let use_rel = base_ms % 1000 == 0;
     let date_lut = DateLut::new(window_start, window_end, base_ms.div_euclid(1000));
     let sh = Shared {
@@ -607,12 +647,13 @@ fn main() {
 
     // Committing the expected arena in 4 MB blocks costs about a third of the kernel
     // time that eight threads faulting it in page by page take during the parse.
+    let populated = [rows_guess * 17, rows_guess * 17, click_input.bytes as usize / 46 * 25];
     {
         const PIECE: usize = 4 << 20;
         let regions = [
-            (sh.d_arena.base as usize, rows_guess * 17),
-            (sh.p_arena.base as usize, rows_guess * 17),
-            (sh.c_arena.base as usize, click_input.bytes as usize / 46 * 25),
+            (sh.d_arena.base as usize, populated[0]),
+            (sh.p_arena.base as usize, populated[1]),
+            (sh.c_arena.base as usize, populated[2]),
         ];
         let pieces: Vec<(usize, usize)> = regions
             .iter()
@@ -685,6 +726,34 @@ fn main() {
     let size_of = |chunks: &Vec<(u32, u32)>| chunks.iter().map(|c| c.1 as u64).sum::<u64>();
     let mut order: Vec<usize> = (0..sh.p_parts).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(size_of(&p_chunks[i]) + size_of(&c_chunks[i])));
+    // Tearing memory down at exit is serial and on the clock, so it is freed in parallel: what is dead
+    // by now (links table, dedup arena) by threads that run out of sessions work, the rest while
+    // thread 0 writes the campaign table. Only pages ever touched are walked.
+    const PIECE: usize = 32 << 20;
+    let touched = |base: usize, used: usize, populated: usize, cap: usize| (base, used.max(populated).min(cap));
+    let split = |regions: &[(usize, usize)]| -> Vec<(usize, usize)> {
+        regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect()
+    };
+    let dead_pieces = split(&[touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes())]);
+    let live_pieces = split(&[
+        touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes()),
+        touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes()),
+    ]);
+    let release = std::env::var_os("SS_NORELEASE").is_none();
+    let (dead_next, live_next) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    const REL_SWEEP: usize = 1 << 16;
+    let rel_sweeps = sh.links.slots().div_ceil(REL_SWEEP);
+    let drain_dead = || {
+        while release {
+            let i = dead_next.fetch_add(1, Relaxed);
+            if i < rel_sweeps {
+                sh.links.release(i * REL_SWEEP, ((i + 1) * REL_SWEEP).min(sh.links.slots()));
+                continue;
+            }
+            let Some(&(at, n)) = dead_pieces.get(i - rel_sweeps) else { break };
+            sys::release(at as *mut u8, n);
+        }
+    };
     let groupers = PerThread::new(threads, |t| {
         Grouper::new(output.join("user_daily").join(format!("part-{t:03}.parquet")), (sh.campaigns.len() + 1) * days)
     });
@@ -697,34 +766,19 @@ fn main() {
             g.partition(&sh, &p_chunks[part], &c_chunks[part]);
         }
         std::mem::replace(&mut g.out, group::UserOut::new(PathBuf::new())).finish(t == 0);
+        drain_dead();
     });
     marks.push(mark("sessions"));
     log_stage(&marks);
 
-    // Tearing memory down at exit is serial and on the clock, so the other threads free the dead arenas
-    // and links table while thread 0 writes the campaign table.
-    const PIECE: usize = 32 << 20;
-    let regions = [
-        (sh.d_arena.base as usize, d_recs * std::mem::size_of::<DRec>()),
-        (sh.p_arena.base as usize, p_recs * std::mem::size_of::<PRec>()),
-        (sh.c_arena.base as usize, c_recs * std::mem::size_of::<CRec>()),
-    ];
-    let pieces: Vec<(usize, usize)> =
-        regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect();
-    let release = std::env::var_os("SS_NORELEASE").is_none();
-    let next = AtomicUsize::new(0);
     phase(7, &|t| {
         if t == 0 {
             let cells: Vec<Vec<Cell>> = (0..threads).map(|t| unsafe { groupers.get(t).take_cells() }).collect();
             write_campaigns(&sh, &output.join("campaign_daily").join("part-000.parquet"), &cells);
         }
+        drain_dead();
         while release {
-            let i = next.fetch_add(1, Relaxed);
-            if i < sweeps {
-                sh.links.release(i * SWEEP, ((i + 1) * SWEEP).min(sh.links.slots()));
-                continue;
-            }
-            let Some(&(at, n)) = pieces.get(i - sweeps) else { break };
+            let Some(&(at, n)) = live_pieces.get(live_next.fetch_add(1, Relaxed)) else { break };
             sys::release(at as *mut u8, n);
         }
     });
