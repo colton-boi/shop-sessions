@@ -3,6 +3,8 @@ use crate::sys::{map_zeroed, mix, release};
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+const SWEEP_AHEAD: usize = 16;
+
 #[repr(C)]
 struct Slot {
     key: AtomicU64,
@@ -95,9 +97,32 @@ impl LinkTable {
         }
     }
 
+    /// Links every pair, prefetching the table slots of pairs a few ahead.
+    pub unsafe fn link_all(&self, pairs: &[(u64, u64)]) {
+        const AHEAD: usize = 8;
+        for (k, &(a, b)) in pairs.iter().enumerate() {
+            if let Some(&(na, nb)) = pairs.get(k + AHEAD) {
+                self.prefetch(na);
+                self.prefetch(nb);
+            }
+            self.link(a, b);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn prefetch_parent(&self, i: usize, to: usize) {
+        if i < to {
+            let p = self.slot(i).val.load(Relaxed);
+            if p != 0 {
+                _mm_prefetch(self.slots.add(p as usize - 1) as *const i8, _MM_HINT_T0);
+            }
+        }
+    }
+
     /// First sweep after all links: point every slot straight at its root.
     pub unsafe fn compress(&self, from: usize, to: usize) {
         for i in from..to {
+            self.prefetch_parent(i + SWEEP_AHEAD, to);
             if self.slot(i).key.load(Relaxed) != 0 {
                 let r = self.find(i);
                 if r != i {
@@ -110,6 +135,7 @@ impl LinkTable {
     /// Second sweep: replace the root index by the root's token.
     pub unsafe fn resolve(&self, from: usize, to: usize) {
         for i in from..to {
+            self.prefetch_parent(i + SWEEP_AHEAD, to);
             let s = self.slot(i);
             let k = s.key.load(Relaxed);
             if k != 0 {

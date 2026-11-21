@@ -519,9 +519,7 @@ fn main() {
         let i = next.fetch_add(1, Relaxed);
         let Some(&(t, from)) = blocks.get(i) else { break };
         let list = pair_lists[t];
-        for &(a, b) in &list[from..(from + LINK_BLOCK).min(list.len())] {
-            unsafe { links.link(a, b) };
-        }
+        unsafe { links.link_all(&list[from..(from + LINK_BLOCK).min(list.len())]) };
     });
     const SWEEP: usize = 1 << 16;
     let sweeps = links.slots().div_ceil(SWEEP);
