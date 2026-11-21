@@ -508,8 +508,8 @@ fn main() {
     let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
     let dims = dims_loader.join().expect("loading products and campaigns");
     let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
-    let p_recs = event_input.bytes as usize / 40 + (threads * p_parts + 2) * P_CHUNK;
-    let c_recs = click_input.bytes as usize / 20 + (threads * p_parts + 2) * C_CHUNK;
+    let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
+    let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
     let sh = Shared {
         window_start,
         window_end,
