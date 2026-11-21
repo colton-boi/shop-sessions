@@ -661,7 +661,7 @@ fn main() {
     marks.push(mark("sessions"));
     log_stage(&marks);
 
-    let cells: Vec<Vec<Cell>> = groupers.into_vec().into_iter().map(|g| g.cells).collect();
+    let cells: Vec<Vec<Cell>> = groupers.into_vec().into_iter().map(|g| g.into_cells()).collect();
     write_campaigns(&sh, &output.join("campaign_daily").join("part-000.parquet"), &cells);
     marks.push(mark("campaigns"));
     log_stage(&marks);

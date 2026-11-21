@@ -142,12 +142,16 @@ pub struct Grouper {
     ck_sorted: Vec<Click>,
     starts: Vec<u32>,
     day_rows: Vec<DayRow>,
-    by_campaign: Vec<u64>,
+    sess_row: Vec<u32>,
+    covered: Vec<u64>,
+    generation: u32,
     cat_sum: [u64; 256],
     cats: Vec<u8>,
     name: Vec<u8>,
     pub out: UserOut,
-    pub cells: Vec<Cell>,
+    cells: Vec<Cell>,
+    /// Kept apart from `cells` so the per-click updates touch a smaller table.
+    assisted: Vec<u32>,
 }
 
 impl Grouper {
@@ -166,12 +170,15 @@ impl Grouper {
             ck_sorted: Vec::new(),
             starts: Vec::new(),
             day_rows: Vec::new(),
-            by_campaign: Vec::new(),
+            sess_row: Vec::new(),
+            covered: Vec::new(),
+            generation: 0,
             cat_sum: [0; 256],
             cats: Vec::new(),
             name: Vec::new(),
             out: UserOut::new(path),
             cells: vec![Cell::default(); cells],
+            assisted: vec![0; cells],
         }
     }
 
@@ -219,6 +226,9 @@ impl Grouper {
 
     /// Group one partition's live events and clicks by person, then emit each person.
     pub unsafe fn partition(&mut self, sh: &Shared, events: &[(u32, u32)], clicks: &[(u32, u32)]) {
+        if self.covered.len() < sh.campaigns.len() {
+            self.covered.resize(sh.campaigns.len(), 0);
+        }
         self.keys.fill(0);
         self.people.clear();
         self.ev_count.clear();
@@ -288,6 +298,13 @@ impl Grouper {
         self.ck_sorted = clicks;
     }
 
+    pub fn into_cells(mut self) -> Vec<Cell> {
+        for (c, &a) in self.cells.iter_mut().zip(&self.assisted) {
+            c.assisted = a;
+        }
+        self.cells
+    }
+
     fn flush_day(&mut self, sh: &Shared, day: u32, sessions: u32, events: u32, revenue: u64) {
         let mut best: Option<u8> = None;
         for &c in &self.cats {
@@ -311,25 +328,10 @@ impl Grouper {
         tok_bytes_fast(person, &mut self.name);
         let nck = clicks.len();
         if nck > 0 {
-            self.by_campaign.clear();
-            self.by_campaign.extend(clicks.iter().map(|c| (c.campaign as u64) << 32 | c.ts as u64));
             clicks.sort_unstable_by_key(|c| c.ts);
-            // The last click of each equal-ts run takes the campaign of the run's
-            // smallest click_id, so crediting only ever looks at one click.
-            let mut i = 0;
-            while i < nck {
-                let (mut j, mut winner) = (i + 1, i);
-                while j < nck && clicks[j].ts == clicks[i].ts {
-                    if tok_less(clicks[j].id, clicks[winner].id) {
-                        winner = j;
-                    }
-                    j += 1;
-                }
-                clicks[j - 1].campaign = clicks[winner].campaign;
-                i = j;
-            }
         }
         self.starts.clear();
+        self.sess_row.clear();
         self.day_rows.clear();
         let days = sh.days;
         let organic = sh.campaigns.len();
@@ -356,7 +358,7 @@ impl Grouper {
                 next_click += 1;
             }
             let campaign = if next_click > 0 && start - clicks.get_unchecked(next_click - 1).ts <= WEEK {
-                clicks.get_unchecked(next_click - 1).campaign as usize
+                credit(&clicks[..next_click])
             } else {
                 organic
             };
@@ -390,6 +392,7 @@ impl Grouper {
             session_index += 1;
             if nck > 0 {
                 self.starts.push(start);
+                self.sess_row.push(self.day_rows.len() as u32);
             }
         }
         self.flush_day(sh, day, day_sessions, day_events, day_revenue);
@@ -397,38 +400,61 @@ impl Grouper {
             return;
         }
         self.day_rows.push(DayRow { day, first: day_first, end: session_index });
-        self.assists(days);
+        self.assists(days, clicks);
     }
 
-    /// For each campaign, the union of [click, click + 7 days] covers exactly the
-    /// session starts it assists; count the sessions under each stretch per day.
-    fn assists(&mut self, days: usize) {
-        self.by_campaign.sort_unstable();
-        let keys = &self.by_campaign;
-        let n = keys.len();
-        let mut i = 0;
-        while i < n {
-            let campaign = (keys[i] >> 32) as usize;
-            let from = keys[i] as u32;
-            let mut to = from as u64 + WEEK as u64;
-            i += 1;
-            while i < n && (keys[i] >> 32) as usize == campaign && keys[i] as u32 as u64 <= to {
-                to = keys[i] as u32 as u64 + WEEK as u64;
-                i += 1;
+    /// Click k assists the sessions [lo_k, hi_k) with start in [ts, ts + 7 days].
+    /// Both ends only grow with ts, so for one campaign everything below the
+    /// previous click's hi is already counted.
+    fn assists(&mut self, days: usize, clicks: &[Click]) {
+        self.generation += 1;
+        let gen = (self.generation as u64) << 32;
+        let starts = &self.starts;
+        let ns = starts.len();
+        let (mut lo, mut hi) = (0usize, 0usize);
+        for c in clicks {
+            while lo < ns && starts[lo] < c.ts {
+                lo += 1;
             }
-            let lo = self.starts.partition_point(|&s| s < from) as u32;
-            let hi = self.starts.partition_point(|&s| s as u64 <= to) as u32;
-            if lo >= hi {
+            let reach = c.ts as u64 + WEEK as u64;
+            while hi < ns && starts[hi] as u64 <= reach {
+                hi += 1;
+            }
+            let slot = &mut self.covered[c.campaign as usize];
+            let from = if *slot >> 32 == gen >> 32 { lo.max(*slot as u32 as usize) } else { lo };
+            *slot = gen | hi as u64;
+            if from >= hi {
                 continue;
             }
-            for row in &self.day_rows {
-                let (a, b) = (lo.max(row.first), hi.min(row.end));
-                if a < b {
-                    self.cells[campaign * days + row.day as usize].assisted += b - a;
+            let base = c.campaign as usize * days;
+            let mut r = self.sess_row[from] as usize;
+            loop {
+                let row = &self.day_rows[r];
+                let end = (row.end as usize).min(hi);
+                self.assisted[base + row.day as usize] += (end - from.max(row.first as usize)) as u32;
+                if end == hi {
+                    break;
                 }
+                r += 1;
             }
         }
     }
+}
+
+/// The campaign of the latest click; on a tie in ts, the smallest click_id.
+#[inline(always)]
+fn credit(clicks: &[Click]) -> usize {
+    let last = clicks.len() - 1;
+    let ts = clicks[last].ts;
+    let mut best = last;
+    let mut k = last;
+    while k > 0 && clicks[k - 1].ts == ts {
+        k -= 1;
+        if tok_less(clicks[k].id, clicks[best].id) {
+            best = k;
+        }
+    }
+    clicks[best].campaign as usize
 }
 
 #[inline(always)]
