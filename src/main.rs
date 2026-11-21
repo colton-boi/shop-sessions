@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 use sys::{mix, par, PerThread};
-use ts::{DateCache, BAD, DAY_MS};
+use ts::{DateCache, DateLut, BAD, DAY_MS};
 
 /// Dedup stream: one per parsed event line, partitioned by event_id.
 #[derive(Clone, Copy)]
@@ -68,13 +68,17 @@ pub struct Shared {
     window_end: i64,
     /// Every stored `ts` is milliseconds after this: window_start - 7 days.
     pub base_ms: i64,
+    use_rel: bool,
+    date_lut: DateLut,
     pub first_day: i64,
     pub days: usize,
     products: KeyMap,
     product_category: Vec<u8>,
+    direct_prod_cat: Vec<u8>,
     unknown_category: u8,
     pub categories: Vec<Vec<u8>>,
     campaign_ids: KeyMap,
+    direct_camp: Vec<u16>,
     pub campaigns: Vec<(Vec<u8>, Vec<u8>)>,
     links: LinkTable,
     d_arena: Arena<DRec>,
@@ -82,6 +86,29 @@ pub struct Shared {
     pub c_arena: Arena<CRec>,
     d_parts: usize,
     p_parts: usize,
+}
+
+impl Shared {
+    #[inline(always)]
+    unsafe fn product_cat(&self, p: *const u8, len: usize) -> u8 {
+        if !self.direct_prod_cat.is_empty() {
+            dims::lookup_prod_direct(&self.direct_prod_cat, self.unknown_category, p, len)
+        } else {
+            match self.products.get(p, len) {
+                Some(i) => *self.product_category.get_unchecked(i as usize),
+                None => self.unknown_category,
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn campaign_id(&self, p: *const u8, len: usize) -> Option<u32> {
+        if !self.direct_camp.is_empty() {
+            dims::lookup_camp_direct(&self.direct_camp, p, len)
+        } else {
+            self.campaign_ids.get(p, len)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -202,7 +229,7 @@ unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
     }
 }
 
-#[inline(always)]
+#[inline(never)]
 unsafe fn flush_events(sh: &Shared, d: &mut Scatter<DRec, 4>, p: &mut Scatter<PRec, 4>, batch: &[PendingEvent]) {
     for e in batch {
         let payload = if e.valid {
@@ -215,7 +242,16 @@ unsafe fn flush_events(sh: &Shared, d: &mut Scatter<DRec, 4>, p: &mut Scatter<PR
     }
 }
 
-unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
+unsafe fn parse_events(sh: &Shared, file: Mapped, x: &Extent, w: &mut Worker) {
+    if sh.use_rel {
+        parse_events_impl::<true>(sh, file, x, w);
+    } else {
+        parse_events_impl::<false>(sh, file, x, w);
+    }
+}
+
+#[inline(never)]
+unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -223,6 +259,7 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
     let mut batch = [PendingEvent { event: 0, user: 0, user_hash: 0, ingest: 0, ts: 0, payload: 0, valid: false }; BATCH];
     let mut pending = 0;
     let base_s = sh.base_ms.div_euclid(1000);
+    let event_win_ms = (sh.window_end - sh.window_start) as u64;
     reader.scan::<7>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
         let at = |k: usize| buf.add(s[k] as usize);
         let len = |k: usize| (e[k] - s[k]) as usize;
@@ -230,20 +267,36 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
             return;
         }
         let event = tok(at(0), len(0));
-        let ingest_s = ts::parse_f1(at(3), len(3), dates);
         let mut out = PendingEvent { event, user: 0, user_hash: 0, ingest: i32::MAX, ts: 0, payload: 0, valid: false };
-        if ingest_s != BAD {
-            // Only the order of copies matters here; the lateness test below uses the exact value.
-            out.ingest = (ingest_s - base_s).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
-        }
         'valid: {
-            if len(1) == 0 || len(5) == 0 || ingest_s == BAD {
-                break 'valid;
-            }
-            let t = ts::parse_ts(at(2), len(2), dates);
-            if t < sh.window_start || t >= sh.window_end || ingest_s * 1000 - t > DAY_MS {
-                break 'valid;
-            }
+            let ts_u32 = if REL {
+                let ingest_s_rel = ts::parse_f1_rel(at(3), len(3), &sh.date_lut, dates, base_s);
+                out.ingest = ingest_s_rel;
+                if len(1) == 0 || len(5) == 0 || ingest_s_rel == i32::MAX {
+                    break 'valid;
+                }
+                let ts_rel = ts::parse_ts_rel(at(2), len(2), &sh.date_lut, dates, sh.base_ms);
+                let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
+                let late_bad = (ingest_s_rel as i64).wrapping_mul(1000).wrapping_sub(ts_rel) > DAY_MS;
+                if win_bad | late_bad {
+                    break 'valid;
+                }
+                ts_rel as u32
+            } else {
+                let ingest_s = ts::parse_f1(at(3), len(3), dates);
+                if ingest_s != BAD {
+                    // Only the order of copies matters here; the lateness test below uses the exact value.
+                    out.ingest = (ingest_s - base_s).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
+                }
+                if len(1) == 0 || len(5) == 0 || ingest_s == BAD {
+                    break 'valid;
+                }
+                let t = ts::parse_ts(at(2), len(2), dates);
+                if t < sh.window_start || t >= sh.window_end || ingest_s * 1000 - t > DAY_MS {
+                    break 'valid;
+                }
+                (t - sh.base_ms) as u32
+            };
             match len(4) {
                 4 => {
                     let ty = (at(4) as *const u32).read_unaligned();
@@ -259,10 +312,7 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
                         Some(v) if (1..=10_000_000).contains(&v) => v as u32,
                         _ => break 'valid,
                     };
-                    let category = match sh.products.get(at(5), len(5)) {
-                        Some(i) => *sh.product_category.get_unchecked(i as usize),
-                        None => sh.unknown_category,
-                    };
+                    let category = sh.product_cat(at(5), len(5));
                     out.payload = (category as u32) << 24 | price;
                 }
                 _ => break 'valid,
@@ -270,7 +320,7 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
             out.user = tok(at(1), len(1));
             out.user_hash = mix(out.user);
             sh.links.prefetch_hashed(out.user_hash);
-            out.ts = (t - sh.base_ms) as u32;
+            out.ts = ts_u32;
             out.valid = true;
         }
         *batch.get_unchecked_mut(pending) = out;
@@ -283,7 +333,7 @@ unsafe fn parse_events(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
     flush_events(sh, d, p, &batch[..pending]);
 }
 
-#[inline(always)]
+#[inline(never)]
 unsafe fn flush_clicks(sh: &Shared, c: &mut Scatter<CRec, 8>, batch: &[PendingClick]) {
     for k in batch {
         let person = sh.links.person_hashed(k.user, k.user_hash);
@@ -292,26 +342,45 @@ unsafe fn flush_clicks(sh: &Shared, c: &mut Scatter<CRec, 8>, batch: &[PendingCl
     }
 }
 
-unsafe fn parse_clicks(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
+unsafe fn parse_clicks(sh: &Shared, file: Mapped, x: &Extent, w: &mut Worker) {
+    if sh.use_rel {
+        parse_clicks_impl::<true>(sh, file, x, w);
+    } else {
+        parse_clicks_impl::<false>(sh, file, x, w);
+    }
+}
+
+#[inline(never)]
+unsafe fn parse_clicks_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
     let Worker { reader, dates, c, .. } = w;
     let mut batch = [PendingClick { click: 0, user: 0, user_hash: 0, ts: 0, campaign: 0 }; BATCH];
     let mut pending = 0;
+    let click_win_ms = (sh.window_end - sh.base_ms) as u64;
     reader.scan::<4>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
         let at = |k: usize| buf.add(s[k] as usize);
         let len = |k: usize| (e[k] - s[k]) as usize;
         if len(0) == 0 || len(1) == 0 {
             return;
         }
-        let t = ts::parse_ts(at(3), len(3), dates);
-        if t < sh.base_ms || t >= sh.window_end {
-            return;
-        }
-        let Some(campaign) = sh.campaign_ids.get(at(2), len(2)) else { return };
+        let ts_u32 = if REL {
+            let ts_rel = ts::parse_ts_rel(at(3), len(3), &sh.date_lut, dates, sh.base_ms);
+            if (ts_rel as u64) >= click_win_ms {
+                return;
+            }
+            ts_rel as u32
+        } else {
+            let t = ts::parse_ts(at(3), len(3), dates);
+            if t < sh.base_ms || t >= sh.window_end {
+                return;
+            }
+            (t - sh.base_ms) as u32
+        };
+        let Some(campaign) = sh.campaign_id(at(2), len(2)) else { return };
         let user = tok(at(1), len(1));
         let user_hash = mix(user);
         sh.links.prefetch_hashed(user_hash);
         *batch.get_unchecked_mut(pending) =
-            PendingClick { click: tok(at(0), len(0)), user, user_hash, ts: (t - sh.base_ms) as u32, campaign };
+            PendingClick { click: tok(at(0), len(0)), user, user_hash, ts: ts_u32, campaign };
         pending += 1;
         if pending == BATCH {
             flush_clicks(sh, c, &batch);
@@ -510,17 +579,23 @@ fn main() {
     let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
     let p_recs = event_input.bytes as usize / 40 + (threads * p_parts + 2) * P_CHUNK;
     let c_recs = click_input.bytes as usize / 20 + (threads * p_parts + 2) * C_CHUNK;
+    let use_rel = base_ms % 1000 == 0;
+    let date_lut = DateLut::new(window_start, window_end, base_ms.div_euclid(1000));
     let sh = Shared {
         window_start,
         window_end,
         base_ms,
+        use_rel,
+        date_lut,
         first_day,
         days,
         products: dims.products,
         product_category: dims.product_category,
+        direct_prod_cat: dims.direct_prod_cat,
         unknown_category: dims.unknown_category,
         categories: dims.categories,
         campaign_ids: dims.campaign_ids,
+        direct_camp: dims.direct_camp,
         campaigns: dims.campaigns,
         links,
         d_arena: Arena::new(d_recs, D_CHUNK),
