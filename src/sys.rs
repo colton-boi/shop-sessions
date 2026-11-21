@@ -388,8 +388,9 @@ pub fn peak_rss_kb() -> u64 {
 /// SIGPROF sampler for `SS_PROF=<file>`: records the interrupted user RIP of
 /// whichever thread is running, so samples follow CPU time.
 pub mod prof {
+    use std::alloc::{alloc_zeroed, Layout};
     use std::os::raw::{c_int, c_void};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
 
     extern "C" {
         fn sigaction(sig: c_int, act: *const [u64; 19], old: *mut [u64; 19]) -> c_int;
@@ -397,14 +398,18 @@ pub mod prof {
     }
 
     const CAP: usize = 1 << 22;
-    static SAMPLES: [AtomicU64; CAP] = [const { AtomicU64::new(0) }; CAP];
+    static SAMPLES: AtomicPtr<AtomicU64> = AtomicPtr::new(std::ptr::null_mut());
     static COUNT: AtomicUsize = AtomicUsize::new(0);
 
     extern "C" fn on_prof(_sig: c_int, _info: *mut c_void, ctx: *mut c_void) {
+        let p = SAMPLES.load(Acquire);
+        if p.is_null() {
+            return;
+        }
         let rip = unsafe { *(ctx as *const u8).add(168).cast::<u64>() };
         let i = COUNT.fetch_add(1, Relaxed);
         if i < CAP {
-            SAMPLES[i].store(rip, Relaxed);
+            unsafe { (*p.add(i)).store(rip, Relaxed) };
         }
     }
 
@@ -412,6 +417,9 @@ pub mod prof {
         if std::env::var_os("SS_PROF").is_none() {
             return;
         }
+        let p = unsafe { alloc_zeroed(Layout::array::<AtomicU64>(CAP).unwrap()) as *mut AtomicU64 };
+        assert!(!p.is_null(), "SS_PROF buffer alloc failed");
+        SAMPLES.store(p, Release);
         let mut act = [0u64; 19];
         act[0] = on_prof as *const () as u64;
         act[17] = 0x4 | 0x1000_0000; // SA_SIGINFO | SA_RESTART
@@ -424,6 +432,10 @@ pub mod prof {
     pub fn finish() {
         let Some(path) = std::env::var_os("SS_PROF") else { return };
         unsafe { setitimer(2, &[0; 4], std::ptr::null_mut()) };
+        let p = SAMPLES.load(Acquire);
+        if p.is_null() {
+            return;
+        }
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
         let exe = std::fs::read_link("/proc/self/exe").unwrap_or_default();
         let base = maps
@@ -433,7 +445,8 @@ pub mod prof {
             .unwrap_or(0);
         let n = COUNT.load(Relaxed).min(CAP);
         let mut out = format!("{base:x}\n");
-        for s in &SAMPLES[..n] {
+        let samples = unsafe { std::slice::from_raw_parts(p, n) };
+        for s in samples {
             out.push_str(&format!("{:x}\n", s.load(Relaxed)));
         }
         std::fs::write(path, out).unwrap();
