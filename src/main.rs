@@ -316,50 +316,6 @@ unsafe fn parse_clicks(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &
     flush_clicks(sh, c, &batch[..pending]);
 }
 
-/// Keeps, per event_id, the copy with the smallest ingest_ts and kills the
-/// payload record of every other copy.
-unsafe fn dedup(sh: &Shared, chunks: &[(u32, u32)], table: &mut Vec<u64>) {
-    let total: usize = chunks.iter().map(|c| c.1 as usize).sum();
-    let cap = (total * 2).next_power_of_two().max(16);
-    table.clear();
-    table.resize(cap, 0);
-    let mask = cap - 1;
-    let base = sh.d_arena.base;
-    let kill = |r: &DRec| {
-        if r.payload != NONE {
-            (*sh.p_arena.base.add(r.payload as usize)).person = DEAD;
-        }
-    };
-    for &(first, count) in chunks {
-        for at in first..first + count {
-            let r = &*base.add(at as usize);
-            let h = mix(r.event);
-            let tag = ((h >> 20) as u32 | 1) as u64;
-            let mut slot = h as usize & mask;
-            loop {
-                let entry = *table.get_unchecked(slot);
-                if entry == 0 {
-                    *table.get_unchecked_mut(slot) = tag << 32 | at as u64;
-                    break;
-                }
-                if entry >> 32 == tag {
-                    let other = &*base.add(entry as u32 as usize);
-                    if other.event == r.event {
-                        if r.ingest < other.ingest {
-                            kill(other);
-                            *table.get_unchecked_mut(slot) = tag << 32 | at as u64;
-                        } else {
-                            kill(r);
-                        }
-                        break;
-                    }
-                }
-                slot = (slot + 1) & mask;
-            }
-        }
-    }
-}
-
 static CAMPAIGN_COLS: [Col; 7] = [
     Col { name: "campaign_id", ty: BYTES, kind: Kind::Utf8 },
     Col { name: "channel", ty: BYTES, kind: Kind::Utf8 },
@@ -632,11 +588,11 @@ fn main() {
 
     let next = AtomicUsize::new(0);
     phase(4, &|_| {
-        let mut table = Vec::new();
+        let mut work = group::Dedup::default();
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(chunks) = d_chunks.get(i) else { break };
-            unsafe { dedup(&sh, chunks, &mut table) };
+            unsafe { work.partition(&sh, chunks) };
         }
     });
     marks.push(mark("dedup"));

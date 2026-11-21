@@ -1,7 +1,8 @@
 use crate::ids::{tok_bytes, tok_less};
 use crate::parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
 use crate::ts::DAY_MS;
-use crate::{CRec, PRec, Shared, DEAD};
+use crate::sys::mix;
+use crate::{CRec, DRec, PRec, Shared, DEAD, NONE};
 use std::path::PathBuf;
 
 const SESSION_GAP: u32 = 1_800_000;
@@ -383,6 +384,8 @@ impl Grouper {
             } else {
                 organic
             };
+            let cell = self.cells.as_ptr().add(campaign * days + start_day as usize);
+            std::arch::x86_64::_mm_prefetch(cell as *const i8, std::arch::x86_64::_MM_HINT_T0);
             let (mut prev, mut count, mut revenue) = (start, 0u32, 0u64);
             while i < n {
                 let e = *events.get_unchecked(i);
@@ -469,7 +472,8 @@ fn slot_of(person: u64, mask: usize) -> usize {
     (person.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask
 }
 
-const RADIX: usize = 2048;
+const DIGIT: u32 = 11;
+const RADIX: usize = 1 << DIGIT;
 /// Sort keys hold ts << 1 in bits 1..32. The two ts digits skip its low
 /// TS_SKIP bits; `fix_order` repairs the rare inversions that leaves.
 const TS_SKIP: u32 = 9;
@@ -481,7 +485,7 @@ fn digit0(key: u64) -> usize {
 
 #[inline(always)]
 fn digit1(key: u64) -> usize {
-    (key >> (1 + TS_SKIP + 11)) as usize & (RADIX - 1)
+    (key >> (1 + TS_SKIP + DIGIT)) as usize & (RADIX - 1)
 }
 
 /// Stable LSD passes from `a` into `b`: two ts digits, then the local person
@@ -574,4 +578,92 @@ unsafe fn credit(sh: &Shared, clicks: &[Click]) -> usize {
 #[inline(always)]
 fn tok_bytes_fast(t: u64, out: &mut Vec<u8>) {
     tok_bytes(t, out)
+}
+
+/// One thread's working memory for event_id dedup.
+#[derive(Default)]
+pub struct Dedup {
+    once: Vec<u64>,
+    twice: Vec<u64>,
+    buckets: Vec<u32>,
+    candidates: Vec<u32>,
+    table: Vec<u64>,
+}
+
+impl Dedup {
+    /// Keeps, per event_id, the copy with the smallest ingest_ts and kills the
+    /// payload record of every other copy. Two bitmaps over a hash of the ID
+    /// mark the buckets hit more than once; only records in those buckets,
+    /// which include every copy of every duplicate, go through the exact table.
+    pub unsafe fn partition(&mut self, sh: &Shared, chunks: &[(u32, u32)]) {
+        let total: usize = chunks.iter().map(|c| c.1 as usize).sum();
+        let bits = (total * 8).next_power_of_two().max(64);
+        let mask = bits - 1;
+        self.once.clear();
+        self.once.resize(bits / 64, 0);
+        self.twice.clear();
+        self.twice.resize(bits / 64, 0);
+        self.buckets.clear();
+        self.buckets.reserve(total);
+        let base = sh.d_arena.base;
+        let (once, twice, buckets) = (self.once.as_mut_ptr(), self.twice.as_mut_ptr(), self.buckets.as_mut_ptr());
+        let mut k = 0;
+        for &(first, count) in chunks {
+            for at in first..first + count {
+                let b = mix((*base.add(at as usize)).event) as usize & mask;
+                *buckets.add(k) = b as u32;
+                k += 1;
+                let (w, bit) = (b / 64, 1u64 << (b % 64));
+                *twice.add(w) |= *once.add(w) & bit;
+                *once.add(w) |= bit;
+            }
+        }
+        self.candidates.clear();
+        let mut k = 0;
+        for &(first, count) in chunks {
+            for at in first..first + count {
+                let b = *buckets.add(k) as usize;
+                k += 1;
+                if *twice.add(b / 64) & (1u64 << (b % 64)) != 0 {
+                    self.candidates.push(at);
+                }
+            }
+        }
+        let cap = (self.candidates.len() * 2).next_power_of_two().max(16);
+        self.table.clear();
+        self.table.resize(cap, 0);
+        let mask = cap - 1;
+        let table = self.table.as_mut_ptr();
+        let kill = |r: &DRec| {
+            if r.payload != NONE {
+                (*sh.p_arena.base.add(r.payload as usize)).person = DEAD;
+            }
+        };
+        for &at in &self.candidates {
+            let r = &*base.add(at as usize);
+            let h = mix(r.event).rotate_left(32);
+            let tag = ((h >> 20) as u32 | 1) as u64;
+            let mut slot = h as usize & mask;
+            loop {
+                let entry = *table.add(slot);
+                if entry == 0 {
+                    *table.add(slot) = tag << 32 | at as u64;
+                    break;
+                }
+                if entry >> 32 == tag {
+                    let other = &*base.add(entry as u32 as usize);
+                    if other.event == r.event {
+                        if r.ingest < other.ingest {
+                            kill(other);
+                            *table.add(slot) = tag << 32 | at as u64;
+                        } else {
+                            kill(r);
+                        }
+                        break;
+                    }
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+    }
 }
