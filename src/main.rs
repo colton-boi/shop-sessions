@@ -1,6 +1,11 @@
 mod csv;
 mod diag;
 mod dims;
+pub mod fast_links;
+pub mod fast_parquet;
+pub mod fast_parse;
+pub mod fast_pipeline;
+pub mod fast_sess;
 mod group;
 mod ids;
 mod links;
@@ -8,6 +13,7 @@ mod parquet;
 mod scatter;
 mod sys;
 mod ts;
+pub mod unscramble;
 
 use csv::Reader;
 use dims::KeyMap;
@@ -54,38 +60,38 @@ pub struct CRec {
 
 const NONE: u32 = u32::MAX;
 pub const DEAD: u64 = u64::MAX;
-const WEEK_MS: i64 = 7 * DAY_MS;
+pub(crate) const WEEK_MS: i64 = 7 * DAY_MS;
 
 const READ_BUF: usize = 64 << 10;
 const EXTENT: u64 = 2 << 20;
 const D_CHUNK: usize = 512;
-const P_CHUNK: usize = 512;
-const C_CHUNK: usize = 256;
+pub(crate) const P_CHUNK: usize = 512;
+pub(crate) const C_CHUNK: usize = 256;
 const BATCH: usize = 32;
 
 pub struct Shared {
-    window_start: i64,
-    window_end: i64,
+    pub(crate) window_start: i64,
+    pub(crate) window_end: i64,
     /// Every stored `ts` is milliseconds after this: window_start - 7 days.
     pub base_ms: i64,
-    use_rel: bool,
-    date_lut: DateLut,
+    pub(crate) use_rel: bool,
+    pub(crate) date_lut: DateLut,
     pub first_day: i64,
     pub days: usize,
-    products: KeyMap,
-    product_category: Vec<u8>,
-    direct_prod_cat: Vec<u8>,
-    unknown_category: u8,
+    pub(crate) products: KeyMap,
+    pub(crate) product_category: Vec<u8>,
+    pub(crate) direct_prod_cat: Vec<u8>,
+    pub(crate) unknown_category: u8,
     pub categories: Vec<Vec<u8>>,
-    campaign_ids: KeyMap,
-    direct_camp: Vec<u16>,
+    pub(crate) campaign_ids: KeyMap,
+    pub(crate) direct_camp: Vec<u16>,
     pub campaigns: Vec<(Vec<u8>, Vec<u8>)>,
-    links: LinkTable,
-    d_arena: Arena<DRec>,
+    pub(crate) links: LinkTable,
+    pub(crate) d_arena: Arena<DRec>,
     pub p_arena: Arena<PRec>,
     pub c_arena: Arena<CRec>,
-    d_parts: usize,
-    p_parts: usize,
+    pub(crate) d_parts: usize,
+    pub(crate) p_parts: usize,
 }
 
 impl Shared {
@@ -143,40 +149,40 @@ struct Worker {
     busy: [[f64; 3]; 8],
 }
 
-struct Extent {
-    file: usize,
-    from: u64,
-    to: u64,
+pub(crate) struct Extent {
+    pub(crate) file: usize,
+    pub(crate) from: u64,
+    pub(crate) to: u64,
 }
 
 /// A mapped input file: see `sys::map_file`.
 #[derive(Clone, Copy)]
-struct Mapped(*const u8, usize);
+pub(crate) struct Mapped(pub(crate) *const u8, pub(crate) usize);
 unsafe impl Sync for Mapped {}
 unsafe impl Send for Mapped {}
 
-struct Input {
-    files: Vec<Mapped>,
+pub(crate) struct Input {
+    pub(crate) files: Vec<Mapped>,
     /// Extents of each file not yet parsed; the last one to finish unmaps the file.
     remaining: Vec<AtomicUsize>,
-    extents: Vec<Extent>,
-    bytes: u64,
+    pub(crate) extents: Vec<Extent>,
+    pub(crate) bytes: u64,
 }
 
 impl Input {
-    fn done(&self, x: &Extent) {
+    pub(crate) fn done(&self, x: &Extent) {
         if self.remaining[x.file].fetch_sub(1, Relaxed) == 1 {
             sys::unmap_file(self.files[x.file].0, self.files[x.file].1);
         }
     }
 
     /// Makes file `i` end with a newline, as `csv::Reader` needs.
-    fn end_line(&mut self, i: usize) {
+    pub(crate) fn end_line(&mut self, i: usize) {
         let Mapped(data, size) = self.files[i];
         self.files[i].1 = unsafe { sys::end_line(data, size) };
     }
 
-    fn lacks_newline(&self, i: usize) -> bool {
+    pub(crate) fn lacks_newline(&self, i: usize) -> bool {
         let Mapped(data, size) = self.files[i];
         size != 0 && unsafe { *data.add(size - 1) } != b'\n'
     }
@@ -411,7 +417,7 @@ static CAMPAIGN_COLS: [Col; 7] = [
     Col { name: "assisted_sessions", ty: INT64, kind: Kind::Plain },
 ];
 
-fn write_campaigns(sh: &Shared, path: &Path, per_thread: &[Vec<Cell>]) {
+pub(crate) fn write_campaigns(sh: &Shared, path: &Path, per_thread: &[Vec<Cell>]) {
     let mut cols: [Vec<u8>; 7] = Default::default();
     let mut rows = 0;
     let string = |b: &mut Vec<u8>, s: &[u8]| {
@@ -497,22 +503,46 @@ fn main() {
 
     if verbose { eprintln!("  manifest {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
     // Products and campaigns are first needed by the event parse; load them beside the links.
-    let dims_loader = {
+    let mut dims_loader = Some({
         let data = data.clone();
         std::thread::spawn(move || dims::load(&data))
-    };
+    });
+    let mut dims_fallback: Option<dims::Dims> = None;
     let knob = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
     let extent = knob("SS_EXTENT", EXTENT);
     let read_buf = knob("SS_READ_BUF", READ_BUF as u64) as usize;
     let mut link_input = list_csv(&data.join("links"), extent.min(256 << 10));
     let mut event_input = list_csv(&data.join("events"), extent);
     let mut click_input = list_csv(&data.join("clicks"), extent);
+    std::fs::create_dir_all(output.join("user_daily")).expect("create output");
+    std::fs::create_dir_all(output.join("campaign_daily")).expect("create output");
+
+    if fast_pipeline::try_run_fast(
+        t0,
+        &output,
+        threads,
+        verbose,
+        counters.as_ref(),
+        window_start,
+        window_end,
+        base_ms,
+        first_day,
+        days,
+        read_buf,
+        &mut dims_loader,
+        &mut dims_fallback,
+        &mut link_input,
+        &mut event_input,
+        &mut click_input,
+    ) {
+        sys::prof::finish();
+        sys::exit_now();
+    }
+
     // The links are parsed first; the other files' last bytes are read in parallel during that parse.
     for i in 0..link_input.files.len() {
         link_input.end_line(i);
     }
-    std::fs::create_dir_all(output.join("user_daily")).expect("create output");
-    std::fs::create_dir_all(output.join("campaign_daily")).expect("create output");
 
     if verbose { eprintln!("  listed {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
     let workers = PerThread::new(threads, |_| Worker {
@@ -615,7 +645,13 @@ fn main() {
     let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
     let (d_parts, p_parts) = (parts(16_384), parts(16_384));
     let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
-    let dims = dims_loader.join().expect("loading products and campaigns");
+    let dims = dims_fallback.unwrap_or_else(|| {
+        dims_loader
+            .take()
+            .expect("dims_loader")
+            .join()
+            .expect("loading products and campaigns")
+    });
     let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
     let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
     let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
@@ -755,7 +791,11 @@ fn main() {
         }
     };
     let groupers = PerThread::new(threads, |t| {
-        Grouper::new(output.join("user_daily").join(format!("part-{t:03}.parquet")), (sh.campaigns.len() + 1) * days)
+        Grouper::new(
+            output.join("user_daily").join(format!("part-{t:03}.parquet")),
+            (sh.campaigns.len() + 1) * days,
+            &sh.categories,
+        )
     });
     let next = AtomicUsize::new(0);
     phase(5, &|t| unsafe {

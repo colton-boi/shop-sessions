@@ -193,6 +193,136 @@ pub fn map_file(file: &std::fs::File, size: usize) -> *const u8 {
     }
 }
 
+/// Contiguous 2 MiB-aligned virtual region covering multiple input CSV files.
+#[allow(dead_code)]
+pub struct ContiguousMappedFile {
+    pub ptr: *const u8,
+    pub rel_offset: u64,
+    pub size: usize,
+}
+unsafe impl Send for ContiguousMappedFile {}
+unsafe impl Sync for ContiguousMappedFile {}
+
+#[allow(dead_code)]
+pub struct ContiguousInputRegion {
+    pub reserve_base: *mut u8,
+    pub reserve_len: usize,
+    pub region_base: *const u8,
+    pub total_span: usize,
+    pub files: Vec<ContiguousMappedFile>,
+}
+unsafe impl Send for ContiguousInputRegion {}
+unsafe impl Sync for ContiguousInputRegion {}
+
+/// Reserves one anonymous virtual range covering all `files` padded to 2 MiB boundaries
+/// (with a leading 2 MiB zero guard) and maps each non-empty file into its 2 MiB-aligned slot
+/// using `MAP_PRIVATE | MAP_FIXED`.
+#[allow(dead_code)]
+pub fn map_files_contiguous(files: &[std::path::PathBuf]) -> ContiguousInputRegion {
+    use std::os::unix::io::AsRawFd;
+    if files.is_empty() {
+        return ContiguousInputRegion {
+            reserve_base: std::ptr::null_mut(),
+            reserve_len: 0,
+            region_base: std::ptr::null(),
+            total_span: 0,
+            files: Vec::new(),
+        };
+    }
+    let mut opened = Vec::with_capacity(files.len());
+    let mut rel_offset = 0usize;
+    for path in files {
+        let f = std::fs::File::open(path).expect("open input file");
+        let size = f.metadata().expect("stat input file").len() as usize;
+        // Leave at least one trailing zero page after each file and align the next slot to 2 MiB.
+        let slot_span = ((size + PAGE).max(1) + HUGE - 1) & !(HUGE - 1);
+        opened.push((f, size, rel_offset));
+        rel_offset += slot_span;
+    }
+    let total_span = rel_offset;
+    let reserve_len = HUGE + total_span + HUGE;
+    unsafe {
+        // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+        let raw = mmap(std::ptr::null_mut(), reserve_len, 1, 0x02 | 0x20 | 0x4000, -1, 0);
+        assert!(raw as isize != -1, "contiguous mmap reserve failed");
+        let region_base = ((raw as usize + HUGE) & !(HUGE - 1)) as *const u8;
+        let mut mapped = Vec::with_capacity(opened.len());
+        for (f, size, off) in opened {
+            let slot_ptr = region_base.add(off);
+            if size > 0 {
+                let p = mmap(slot_ptr as *mut c_void, size, 1, 0x02 | 0x10, f.as_raw_fd(), 0);
+                assert!(p as usize == slot_ptr as usize, "contiguous MAP_FIXED input mmap failed");
+            }
+            mapped.push(ContiguousMappedFile {
+                ptr: slot_ptr,
+                rel_offset: off as u64,
+                size,
+            });
+        }
+        ContiguousInputRegion {
+            reserve_base: raw as *mut u8,
+            reserve_len,
+            region_base,
+            total_span,
+            files: mapped,
+        }
+    }
+}
+
+/// Thread-safe huge-page-backed bump allocator over a `map_zeroed` virtual arena.
+#[allow(dead_code)]
+pub struct HugeBump {
+    base: *mut u8,
+    cap: usize,
+    next: std::sync::atomic::AtomicUsize,
+}
+unsafe impl Send for HugeBump {}
+unsafe impl Sync for HugeBump {}
+
+#[allow(dead_code)]
+impl HugeBump {
+    pub fn new(cap_bytes: usize) -> Self {
+        let cap = (cap_bytes.max(1) + HUGE - 1) & !(HUGE - 1);
+        HugeBump {
+            base: map_zeroed(cap),
+            cap,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[inline(always)]
+    pub fn alloc_aligned(&self, bytes: usize, align: usize) -> *mut u8 {
+        debug_assert!(align.is_power_of_two());
+        let mask = align - 1;
+        let mut cur = self.next.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let aligned = (cur + mask) & !mask;
+            let end = aligned + bytes;
+            assert!(end <= self.cap, "HugeBump arena overflow");
+            match self.next.compare_exchange_weak(
+                cur,
+                end,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return unsafe { self.base.add(aligned) },
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        self.next.load(std::sync::atomic::Ordering::Relaxed).min(self.cap)
+    }
+
+    pub fn release_used(&self) {
+        let used = (self.used_bytes() + PAGE - 1) & !(PAGE - 1);
+        if used > 0 {
+            release(self.base, used);
+        }
+    }
+}
+
 /// The length of a `map_file` mapping once it ends with a newline: when the file lacks one, a
 /// newline is written after its last byte (into a private copy of that page).
 pub unsafe fn end_line(data: *const u8, size: usize) -> usize {

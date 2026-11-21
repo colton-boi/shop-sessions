@@ -316,7 +316,7 @@ mod tests {
             let table = LinkTable::new(pairs.len());
             std::thread::scope(|sc| {
                 for chunk in pairs.chunks(1024) {
-                    sc.spawn(|| unsafe { table.link_all(chunk) });
+                    sc.spawn(|| table.link_all(chunk));
                 }
             });
             let total_slots = table.slots();
@@ -324,7 +324,7 @@ mod tests {
             std::thread::scope(|sc| {
                 for from in (0..total_slots).step_by(16384) {
                     let to = (from + 16384).min(total_slots);
-                    sc.spawn(move || unsafe { tref.compress_and_resolve(from, to) });
+                    sc.spawn(move || tref.compress_and_resolve(from, to));
                 }
             });
             for &id in &ids {

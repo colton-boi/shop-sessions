@@ -286,4 +286,30 @@ impl Reader {
             start += next;
         }
     }
+
+    #[cfg(test)]
+    pub unsafe fn bench_index_only(&mut self, data: *const u8, size: usize) -> usize {
+        let mut start = 0usize;
+        let mut total_delims = 0usize;
+        while start < size {
+            let mut n = self.window.min(size - start);
+            let eof = start + n == size;
+            let buf = data.add(start);
+            if !eof {
+                let mut m = n;
+                while m > 0 && *buf.add(m - 1) != b'\n' {
+                    m -= 1;
+                }
+                if m == 0 {
+                    self.resize(self.window * 2);
+                    continue;
+                }
+                n = m;
+            }
+            self.index(buf, n);
+            total_delims += self.count;
+            start += n;
+        }
+        total_delims
+    }
 }
