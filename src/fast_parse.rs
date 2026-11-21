@@ -12,7 +12,7 @@ use crate::dims;
 use crate::fast_links::encode_base36_token;
 use crate::ids::tok_pair;
 use crate::ts::{self, DateCache, DateLut, BAD, DAY_MS};
-use crate::unscramble::{unscramble40, unscramble40_x8_avx512, MASK40};
+use crate::unscramble::{unscramble40, unscramble40_x8_scalar, MASK40};
 use crate::Shared;
 use std::arch::x86_64::*;
 
@@ -464,12 +464,9 @@ pub unsafe fn parse_product_cat_wq(
     }
 }
 
-/// Parses `"HH:MM:SSZ"` at `p + 11..20` via a single 8-byte SWAR load, returning seconds in day (`0..86_400`).
+/// Parses `"HH:MM:SS"` at `p + 11..19` via a single 8-byte SWAR load, returning seconds in day (`0..86_400`).
 #[inline(always)]
-unsafe fn parse_f1_swar_hms(p: *const u8) -> Option<i32> {
-    if *p.add(19) != b'Z' {
-        return None;
-    }
+unsafe fn parse_swar_hms(p: *const u8) -> Option<i32> {
     let y = (p.add(11) as *const u64).read_unaligned() ^ 0x3030_3A30_303A_3030;
     if (y | y.wrapping_add(0x0606_0F06_060F_0606)) & 0xF0F0_F0F0_F0F0_F0F0 != 0 {
         return None;
@@ -482,6 +479,82 @@ unsafe fn parse_f1_swar_hms(p: *const u8) -> Option<i32> {
         return None;
     }
     Some(h * 3600 + m * 60 + s)
+}
+
+/// Parses `"HH:MM:SSZ"` at `p + 11..20` via SWAR, returning seconds in day (`0..86_400`).
+#[inline(always)]
+unsafe fn parse_f1_swar_hms(p: *const u8) -> Option<i32> {
+    if *p.add(19) != b'Z' {
+        return None;
+    }
+    parse_swar_hms(p)
+}
+
+/// Parses 6-byte timezone offset `(+|-)HH:MM` at `p + 19..25`, returning signed seconds adjustment
+/// (`-(oh * 3600 + om * 60)` for `'+'`, `+(oh * 3600 + om * 60)` for `'-'`).
+#[inline(always)]
+unsafe fn parse_swar_tz_offset(p19: *const u8) -> Option<i32> {
+    let raw = (p19 as *const u64).read_unaligned();
+    let sign = (raw & 0xFF) as u8;
+    if (sign.wrapping_sub(b'+') & 0xFD) != 0 {
+        return None;
+    }
+    let d = (raw >> 8) & 0x00FF_FFFF_FFFF ^ 0x0000_0030_303A_3030;
+    if ((d | d.wrapping_add(0x0000_0006_060F_0606)) & 0x0000_00F0_F0F0_F0F0) != 0 {
+        return None;
+    }
+    let oh = ((d & 0xF) * 10 + ((d >> 8) & 0xF)) as i32;
+    let om = (((d >> 24) & 0xF) * 10 + ((d >> 32) & 0xF)) as i32;
+    if (oh > 23) | (om > 59) {
+        return None;
+    }
+    let off = oh * 3600 + om * 60;
+    Some(if sign == b'+' { -off } else { off })
+}
+
+/// Parses 13-digit epoch milliseconds at `p[0..13]` without reading before `p`.
+#[inline(always)]
+unsafe fn parse_f3_13(p: *const u8) -> Option<u64> {
+    let raw = _mm_slli_si128::<3>(_mm_loadu_si128(p as *const __m128i));
+    let m = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let d = _mm_sub_epi8(raw, _mm_set1_epi8(b'0' as i8));
+    let over = _mm_and_si128(_mm_subs_epu8(d, _mm_set1_epi8(9)), m);
+    if _mm_testz_si128(over, over) == 0 {
+        return None;
+    }
+    let d = _mm_and_si128(d, m);
+    let t = _mm_maddubs_epi16(
+        d,
+        _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1),
+    );
+    let t = _mm_madd_epi16(t, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let t = _mm_packus_epi32(t, t);
+    let t = _mm_madd_epi16(t, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let q = _mm_cvtsi128_si64(t) as u64;
+    Some((q & 0xFFFF_FFFF) * 100_000_000 + (q >> 32))
+}
+
+/// Looks up the 11-byte `YYYY-MM-DDT` prefix in the 1-entry register cache or `DateLut`.
+#[inline(always)]
+unsafe fn lookup_ymdt_cached(
+    p: *const u8,
+    lut: &DateLut,
+    cache: &mut (u64, u32, i32),
+) -> Option<i32> {
+    let d8 = (p as *const u64).read_unaligned();
+    let d4 = (p.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF;
+    if ((d8 ^ cache.0) | ((d4 ^ cache.1) as u64)) == 0 {
+        return Some(cache.2);
+    }
+    let slot = _pext_u32((p.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
+    let entry = lut.0.get_unchecked(slot);
+    let e8 = (entry.ymdt.as_ptr() as *const u64).read_unaligned();
+    let e4 = (entry.ymdt.as_ptr().add(8) as *const u32).read_unaligned();
+    if ((d8 ^ e8) | ((d4 ^ e4) as u64)) != 0 {
+        return None;
+    }
+    *cache = (d8, d4, entry.sec_rel);
+    Some(entry.sec_rel)
 }
 
 /// Parses 20-byte `YYYY-MM-DDTHH:MM:SSZ` via `DateLut` and SWAR `HH:MM:SS`.
@@ -507,68 +580,42 @@ unsafe fn parse_f1_swar_lut_cached(
     lut: &DateLut,
     cache: &mut (u64, u32, i32),
 ) -> Option<i32> {
-    let d8 = (p as *const u64).read_unaligned();
-    let d4 = (p.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF;
-    let base_sec_rel = if ((d8 ^ cache.0) | ((d4 ^ cache.1) as u64)) == 0 {
-        cache.2
-    } else {
-        let slot = _pext_u32((p.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
-        let entry = lut.0.get_unchecked(slot);
-        let e8 = (entry.ymdt.as_ptr() as *const u64).read_unaligned();
-        let e4 = (entry.ymdt.as_ptr().add(8) as *const u32).read_unaligned();
-        if ((d8 ^ e8) | ((d4 ^ e4) as u64)) != 0 {
-            return None;
-        }
-        *cache = (d8, d4, entry.sec_rel);
-        entry.sec_rel
-    };
+    let base_sec_rel = lookup_ymdt_cached(p, lut, cache)?;
     let tod = parse_f1_swar_hms(p)?;
     Some(base_sec_rel + tod)
 }
 
-/// Combined 20-byte F1 parser for `(ts, ingest_ts)` when both fields are 20 bytes.
-/// Checks whether both share the same 11-byte `YYYY-MM-DDT` date prefix so the date lookup
-/// runs once for both timestamps in the common case.
+/// Unified `F1 (20) / F2 (25) / F3 (13)` timestamp parser using the 1-entry `YYYY-MM-DDT` cache
+/// for both `F1` and `F2`, and direct `parse_f3_13` for 13-digit epoch ms, with cold `ts::parse_ts_rel` fallback.
 #[inline(always)]
-unsafe fn parse_ts_and_ingest_f1_cached(
-    p_ts: *const u8,
-    p_ing: *const u8,
+unsafe fn parse_ts_cached(
+    p: *const u8,
+    len: usize,
     lut: &DateLut,
+    dc: &mut DateCache,
     cache: &mut (u64, u32, i32),
-) -> Option<(i64, i32)> {
-    let ts_d8 = (p_ts as *const u64).read_unaligned();
-    let ts_d4 = (p_ts.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF;
-    let ing_d8 = (p_ing as *const u64).read_unaligned();
-    let ing_d4 = (p_ing.add(8) as *const u32).read_unaligned() & 0x00FF_FFFF;
-
-    if ((ts_d8 ^ ing_d8) | ((ts_d4 ^ ing_d4) as u64)) == 0 {
-        let base_sec_rel = if ((ing_d8 ^ cache.0) | ((ing_d4 ^ cache.1) as u64)) == 0 {
-            cache.2
-        } else {
-            let slot = _pext_u32((p_ing.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
-            let entry = lut.0.get_unchecked(slot);
-            let e8 = (entry.ymdt.as_ptr() as *const u64).read_unaligned();
-            let e4 = (entry.ymdt.as_ptr().add(8) as *const u32).read_unaligned();
-            if ((ing_d8 ^ e8) | ((ing_d4 ^ e4) as u64)) != 0 {
-                return None;
+    base_ms: i64,
+) -> i64 {
+    if len == 13 {
+        if let Some(v) = parse_f3_13(p) {
+            return v as i64 - base_ms;
+        }
+    } else if len == 20 || len == 25 {
+        if let (Some(base_sec_rel), Some(tod)) = (lookup_ymdt_cached(p, lut, cache), parse_swar_hms(p))
+        {
+            if len == 20 {
+                if *p.add(19) == b'Z' {
+                    return (base_sec_rel + tod) as i64 * 1000;
+                }
+            } else if let Some(off) = parse_swar_tz_offset(p.add(19)) {
+                return (base_sec_rel + tod + off) as i64 * 1000;
             }
-            *cache = (ing_d8, ing_d4, entry.sec_rel);
-            entry.sec_rel
-        };
-        let ts_tod = parse_f1_swar_hms(p_ts)?;
-        let ing_tod = parse_f1_swar_hms(p_ing)?;
-        return Some((
-            (base_sec_rel + ts_tod) as i64 * 1000,
-            base_sec_rel + ing_tod,
-        ));
+        }
     }
-
-    let ing_s = parse_f1_swar_lut_cached(p_ing, lut, cache)?;
-    let ts_s = parse_f1_swar_lut_cached(p_ts, lut, cache)?;
-    Some((ts_s as i64 * 1000, ing_s))
+    ts::parse_ts_rel(p, len, lut, dc, base_ms)
 }
 
-/// Fast timestamp parser with direct unquoted `len == 20 || len == 24` fast path,
+/// Fast timestamp parser with unquoted `F1/F2/F3` fast paths,
 /// falling back to `TS_WQ_LUT` for quoted/other widths.
 /// Returns milliseconds relative to `base_ms`, or `BAD` if invalid.
 #[inline(always)]
@@ -587,8 +634,10 @@ pub unsafe fn parse_ts_wq_rel(
             }
             return ts::parse_ts_rel(p, 20, lut, dc, base_ms);
         }
-        if raw_w == 24 {
-            return ts::parse_ts_rel(p, 24, lut, dc, base_ms);
+        if raw_w == 13 {
+            if let Some(v) = parse_f3_13(p) {
+                return v as i64 - base_ms;
+            }
         }
         return ts::parse_ts_rel(p, raw_w, lut, dc, base_ms);
     }
@@ -923,6 +972,8 @@ pub struct FastEvBatch {
     pub canonical_valid_mask: u64,
     /// Bitmask of rows that are valid events (whether canonical 40-bit or non-canonical fallback).
     pub valid_mask: u64,
+    /// Bitmask of rows whose `event_tok`/`user_tok` slots were populated by cold fallback.
+    pub tok_dirty_mask: u64,
     pub len: usize,
 }
 
@@ -944,12 +995,21 @@ impl FastEvBatch {
             payload: [0; FAST_BATCH],
             canonical_valid_mask: 0,
             valid_mask: 0,
+            tok_dirty_mask: 0,
             len: 0,
         }
     }
 
     #[inline(always)]
     pub fn clear(&mut self) {
+        let mut m = self.tok_dirty_mask;
+        while m != 0 {
+            let r = m.trailing_zeros() as usize;
+            m &= m - 1;
+            self.event_tok[r] = 0;
+            self.user_tok[r] = 0;
+        }
+        self.tok_dirty_mask = 0;
         self.canonical_valid_mask = 0;
         self.valid_mask = 0;
         self.len = 0;
@@ -994,6 +1054,7 @@ pub struct FastCkBatch {
     pub campaign: [u32; FAST_BATCH],
     pub canonical_mask: u64,
     pub upper_k_mask: u64,
+    pub tok_dirty_mask: u64,
     pub len: usize,
 }
 
@@ -1014,12 +1075,21 @@ impl FastCkBatch {
             campaign: [0; FAST_BATCH],
             canonical_mask: 0,
             upper_k_mask: 0,
+            tok_dirty_mask: 0,
             len: 0,
         }
     }
 
     #[inline(always)]
     pub fn clear(&mut self) {
+        let mut m = self.tok_dirty_mask;
+        while m != 0 {
+            let r = m.trailing_zeros() as usize;
+            m &= m - 1;
+            self.click_tok[r] = 0;
+            self.user_tok[r] = 0;
+        }
+        self.tok_dirty_mask = 0;
         self.canonical_mask = 0;
         self.upper_k_mask = 0;
         self.len = 0;
@@ -1057,6 +1127,7 @@ pub struct FastLkBatch {
     pub ua_tok: [u64; FAST_BATCH],
     pub ub_tok: [u64; FAST_BATCH],
     pub canonical_mask: u64,
+    pub tok_dirty_mask: u64,
     pub len: usize,
 }
 
@@ -1074,12 +1145,21 @@ impl FastLkBatch {
             ua_tok: [0; FAST_BATCH],
             ub_tok: [0; FAST_BATCH],
             canonical_mask: 0,
+            tok_dirty_mask: 0,
             len: 0,
         }
     }
 
     #[inline(always)]
     pub fn clear(&mut self) {
+        let mut m = self.tok_dirty_mask;
+        while m != 0 {
+            let r = m.trailing_zeros() as usize;
+            m &= m - 1;
+            self.ua_tok[r] = 0;
+            self.ub_tok[r] = 0;
+        }
+        self.tok_dirty_mask = 0;
         self.canonical_mask = 0;
         self.len = 0;
     }
@@ -1107,7 +1187,8 @@ fn make_fallback_ev(batch: &FastEvBatch, r: usize) -> FallbackEvRec {
     let valid = (batch.valid_mask & (1u64 << r)) != 0;
     let eid = batch.eid_b36[r];
     let uid = batch.uid_b36[r];
-    let event_tok = if batch.event_tok[r] != 0 {
+    let is_canon_valid = (batch.canonical_valid_mask & (1u64 << r)) != 0;
+    let event_tok = if !is_canon_valid && batch.event_tok[r] != 0 {
         batch.event_tok[r]
     } else if eid <= MASK40 {
         encode_base36_token(b'e', eid)
@@ -1116,7 +1197,7 @@ fn make_fallback_ev(batch: &FastEvBatch, r: usize) -> FallbackEvRec {
     };
     let user_tok = if !valid {
         0
-    } else if batch.user_tok[r] != 0 {
+    } else if !is_canon_valid && batch.user_tok[r] != 0 {
         batch.user_tok[r]
     } else if uid <= MASK40 {
         encode_base36_token(b'u', uid)
@@ -1196,7 +1277,7 @@ fn make_fallback_lk(batch: &FastLkBatch, r: usize) -> FallbackLkRec {
 }
 
 /// Vectorized 64-row event batch classifier:
-/// Unscrambles `eid_b36` and `uid_b36` 4 at a time (AVX2) or 8 at a time (AVX-512),
+/// Unscrambles `eid_b36` and `uid_b36` 8 at a time via ILP scalar `unscramble40_x8_scalar`,
 /// and partitions rows into `normal_out` (`valid && user_idx < user_cap && alias < 14 && event_idx < event_cap`)
 /// and `fallback_out` (all other rows).
 pub fn classify_ev_batch(
@@ -1208,23 +1289,6 @@ pub fn classify_ev_batch(
     normal_out: &mut Vec<NormalEvRec>,
     fallback_out: &mut Vec<FallbackEvRec>,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
-            unsafe {
-                classify_ev_batch_avx512(
-                    batch,
-                    user_key,
-                    event_key,
-                    user_cap,
-                    event_cap,
-                    normal_out,
-                    fallback_out,
-                );
-            }
-            return;
-        }
-    }
     classify_ev_batch_avx2(
         batch,
         user_key,
@@ -1250,11 +1314,11 @@ pub fn classify_ev_batch_avx2(
     while i + 8 <= n {
         let m8 = (batch.canonical_valid_mask >> i) & 0xFF;
         if m8 == 0xFF {
-            let e_un = crate::unscramble::unscramble40_x8_scalar(
+            let e_un = unscramble40_x8_scalar(
                 unsafe { *(batch.eid_b36.as_ptr().add(i) as *const [u64; 8]) },
                 event_key,
             );
-            let u_un = crate::unscramble::unscramble40_x8_scalar(
+            let u_un = unscramble40_x8_scalar(
                 unsafe { *(batch.uid_b36.as_ptr().add(i) as *const [u64; 8]) },
                 user_key,
             );
@@ -1328,77 +1392,8 @@ pub fn classify_ev_batch_avx2(
     }
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-pub unsafe fn classify_ev_batch_avx512(
-    batch: &FastEvBatch,
-    user_key: u64,
-    event_key: u64,
-    user_cap: u32,
-    event_cap: u64,
-    normal_out: &mut Vec<NormalEvRec>,
-    fallback_out: &mut Vec<FallbackEvRec>,
-) {
-    let n = batch.len;
-    let mut i = 0;
-    while i + 8 <= n {
-        let e_un = unscramble40_x8_avx512(
-            *(batch.eid_b36.as_ptr().add(i) as *const [u64; 8]),
-            event_key,
-        );
-        let u_un = unscramble40_x8_avx512(
-            *(batch.uid_b36.as_ptr().add(i) as *const [u64; 8]),
-            user_key,
-        );
-        for k in 0..8 {
-            let r = i + k;
-            if (batch.canonical_valid_mask & (1u64 << r)) != 0 {
-                let e_idx = e_un[k];
-                let u_val = u_un[k];
-                let u_idx = u_val >> 9;
-                let alias = u_val & 511;
-                if u_idx < (user_cap as u64) && alias < 14 && e_idx < event_cap {
-                    normal_out.push(NormalEvRec {
-                        event_idx: e_idx as u32,
-                        user_idx: u_idx as u32,
-                        alias: alias as u8,
-                        ingest: batch.ingest[r],
-                        ts: batch.ts[r],
-                        payload: batch.payload[r],
-                    });
-                    continue;
-                }
-            }
-            fallback_out.push(make_fallback_ev(batch, r));
-        }
-        i += 8;
-    }
-    while i < n {
-        let r = i;
-        if (batch.canonical_valid_mask & (1u64 << r)) != 0 {
-            let e_idx = unscramble40(batch.eid_b36[r], event_key);
-            let u_val = unscramble40(batch.uid_b36[r], user_key);
-            let u_idx = u_val >> 9;
-            let alias = u_val & 511;
-            if u_idx < (user_cap as u64) && alias < 14 && e_idx < event_cap {
-                normal_out.push(NormalEvRec {
-                    event_idx: e_idx as u32,
-                    user_idx: u_idx as u32,
-                    alias: alias as u8,
-                    ingest: batch.ingest[r],
-                    ts: batch.ts[r],
-                    payload: batch.payload[r],
-                });
-                i += 1;
-                continue;
-            }
-        }
-        fallback_out.push(make_fallback_ev(batch, r));
-        i += 1;
-    }
-}
-
-/// Vectorized 64-row click batch classifier:
-/// Unscrambles `cid_b36` and `uid_b36` 8 at a time and partitions into `normal_out`
+/// 64-row click batch classifier:
+/// Unscrambles `cid_b36` and `uid_b36` 8 at a time via `unscramble40_x8_scalar` and partitions into `normal_out`
 /// (`user_idx < user_cap && alias < 14 && click_idx < click_cap`) and `fallback_out`.
 pub fn classify_ck_batch(
     batch: &FastCkBatch,
@@ -1409,65 +1404,17 @@ pub fn classify_ck_batch(
     normal_out: &mut Vec<NormalCkRec>,
     fallback_out: &mut Vec<FallbackCkRec>,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
-            unsafe {
-                classify_ck_batch_impl::<true>(
-                    batch,
-                    user_key,
-                    click_key,
-                    user_cap,
-                    click_cap,
-                    normal_out,
-                    fallback_out,
-                );
-            }
-            return;
-        }
-    }
-    unsafe {
-        classify_ck_batch_impl::<false>(
-            batch,
-            user_key,
-            click_key,
-            user_cap,
-            click_cap,
-            normal_out,
-            fallback_out,
-        );
-    }
-}
-
-#[inline(always)]
-unsafe fn classify_ck_batch_impl<const AVX512: bool>(
-    batch: &FastCkBatch,
-    user_key: u64,
-    click_key: u64,
-    user_cap: u32,
-    click_cap: u64,
-    normal_out: &mut Vec<NormalCkRec>,
-    fallback_out: &mut Vec<FallbackCkRec>,
-) {
     let n = batch.len;
     let mut i = 0;
     while i + 8 <= n {
-        let c_un = if AVX512 {
-            unscramble40_x8_avx512(*(batch.cid_b36.as_ptr().add(i) as *const [u64; 8]), click_key)
-        } else {
-            crate::unscramble::unscramble40_x8_scalar(
-                *(batch.cid_b36.as_ptr().add(i) as *const [u64; 8]),
-                click_key,
-            )
-        };
-        let u_un = if AVX512 {
-            unscramble40_x8_avx512(*(batch.uid_b36.as_ptr().add(i) as *const [u64; 8]), user_key)
-        } else {
-            crate::unscramble::unscramble40_x8_scalar(
-                *(batch.uid_b36.as_ptr().add(i) as *const [u64; 8]),
-                user_key,
-            )
-        };
+        let c_un = unscramble40_x8_scalar(
+            unsafe { *(batch.cid_b36.as_ptr().add(i) as *const [u64; 8]) },
+            click_key,
+        );
+        let u_un = unscramble40_x8_scalar(
+            unsafe { *(batch.uid_b36.as_ptr().add(i) as *const [u64; 8]) },
+            user_key,
+        );
         for k in 0..8 {
             let r = i + k;
             if (batch.canonical_mask & (1u64 << r)) != 0 {
@@ -1516,8 +1463,8 @@ unsafe fn classify_ck_batch_impl<const AVX512: bool>(
     }
 }
 
-/// Vectorized 64-row link batch classifier:
-/// Unscrambles `ua_b36` and `ub_b36` 8 at a time and partitions into `normal_out`
+/// 64-row link batch classifier:
+/// Unscrambles `ua_b36` and `ub_b36` 8 at a time via `unscramble40_x8_scalar` and partitions into `normal_out`
 /// (`user_idx_a == user_idx_b && user_idx_a < user_cap && alias_a < 16 && alias_b < 16`)
 /// and `fallback_out` (chain users with `alias >= 16`, kiosk links with bit 39 set, or case variants).
 pub fn classify_lk_batch(
@@ -1527,47 +1474,17 @@ pub fn classify_lk_batch(
     normal_out: &mut Vec<NormalLkRec>,
     fallback_out: &mut Vec<FallbackLkRec>,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
-            unsafe {
-                classify_lk_batch_impl::<true>(batch, user_key, user_cap, normal_out, fallback_out);
-            }
-            return;
-        }
-    }
-    unsafe {
-        classify_lk_batch_impl::<false>(batch, user_key, user_cap, normal_out, fallback_out);
-    }
-}
-
-#[inline(always)]
-unsafe fn classify_lk_batch_impl<const AVX512: bool>(
-    batch: &FastLkBatch,
-    user_key: u64,
-    user_cap: u32,
-    normal_out: &mut Vec<NormalLkRec>,
-    fallback_out: &mut Vec<FallbackLkRec>,
-) {
     let n = batch.len;
     let mut i = 0;
     while i + 8 <= n {
-        let a_un = if AVX512 {
-            unscramble40_x8_avx512(*(batch.ua_b36.as_ptr().add(i) as *const [u64; 8]), user_key)
-        } else {
-            crate::unscramble::unscramble40_x8_scalar(
-                *(batch.ua_b36.as_ptr().add(i) as *const [u64; 8]),
-                user_key,
-            )
-        };
-        let b_un = if AVX512 {
-            unscramble40_x8_avx512(*(batch.ub_b36.as_ptr().add(i) as *const [u64; 8]), user_key)
-        } else {
-            crate::unscramble::unscramble40_x8_scalar(
-                *(batch.ub_b36.as_ptr().add(i) as *const [u64; 8]),
-                user_key,
-            )
-        };
+        let a_un = unscramble40_x8_scalar(
+            unsafe { *(batch.ua_b36.as_ptr().add(i) as *const [u64; 8]) },
+            user_key,
+        );
+        let b_un = unscramble40_x8_scalar(
+            unsafe { *(batch.ub_b36.as_ptr().add(i) as *const [u64; 8]) },
+            user_key,
+        );
         for k in 0..8 {
             let r = i + k;
             if (batch.canonical_mask & (1u64 << r)) != 0 {
@@ -1618,30 +1535,8 @@ unsafe fn classify_lk_batch_impl<const AVX512: bool>(
     }
 }
 
-#[cold]
-#[inline(never)]
-unsafe fn parse_ts_and_ingest_f1_fallback(
-    p_ts: *const u8,
-    p_ing: *const u8,
-    lut: &DateLut,
-    dc: &mut DateCache,
-    base_ms: i64,
-    base_s: i64,
-    cache: &mut (u64, u32, i32),
-) -> (i64, i32) {
-    let i_rel = match parse_f1_swar_lut_cached(p_ing, lut, cache) {
-        Some(s) => s,
-        None => ts::parse_f1_rel(p_ing, 20, lut, dc, base_s),
-    };
-    let t_rel = match parse_f1_swar_lut_cached(p_ts, lut, cache) {
-        Some(s) => s as i64 * 1000,
-        None => ts::parse_ts_rel(p_ts, 20, lut, dc, base_ms),
-    };
-    (t_rel, i_rel)
-}
-
 /// Scans an event extent `[from, to)` into 64-row `FastEvBatch` batches using our width+quote
-/// table-driven SIMD parser with 96% view/cart fast-skip and 100% exact cold fallback,
+/// table-driven SIMD parser with 97% view/cart fast-skip and 100% exact cold fallback,
 /// invoking `on_batch(&FastEvBatch)` whenever the batch fills or finishes.
 pub unsafe fn scan_events_fast(
     reader: &mut crate::csv::Reader,
@@ -1674,41 +1569,23 @@ pub unsafe fn scan_events_fast(
                 if let Some((eid_y, uid_y)) =
                     decode_id_pair_wq(at(0), len(0), 0, b'e', at(1), len(1), 0, b'u')
                 {
-                    let (ts_rel, ingest_s_rel) = if len(2) == 20 && len(3) == 20 {
-                        match parse_ts_and_ingest_f1_cached(
-                            at(2),
-                            at(3),
-                            &sh.date_lut,
-                            &mut last_date,
-                        ) {
-                            Some(pair) => pair,
-                            None => parse_ts_and_ingest_f1_fallback(
-                                at(2),
-                                at(3),
-                                &sh.date_lut,
-                                dates,
-                                sh.base_ms,
-                                base_s,
-                                &mut last_date,
-                            ),
+                    let ingest_s_rel = if len(3) == 20 {
+                        match parse_f1_swar_lut_cached(at(3), &sh.date_lut, &mut last_date) {
+                            Some(s) => s,
+                            None => ts::parse_f1_rel(at(3), 20, &sh.date_lut, dates, base_s),
                         }
                     } else {
-                        let i_rel = if len(3) == 20 {
-                            match parse_f1_swar_lut_cached(at(3), &sh.date_lut, &mut last_date) {
-                                Some(s) => s,
-                                None => ts::parse_f1_rel(at(3), 20, &sh.date_lut, dates, base_s),
-                            }
-                        } else {
-                            i32::MAX
-                        };
-                        let t_rel = if i_rel != i32::MAX {
-                            ts::parse_ts_rel(at(2), len(2), &sh.date_lut, dates, sh.base_ms)
-                        } else {
-                            0
-                        };
-                        (t_rel, i_rel)
+                        i32::MAX
                     };
                     if ingest_s_rel != i32::MAX {
+                        let ts_rel = parse_ts_cached(
+                            at(2),
+                            len(2),
+                            &sh.date_lut,
+                            dates,
+                            &mut last_date,
+                            sh.base_ms,
+                        );
                         let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
                         let late_bad = (ingest_s_rel as i64)
                             .wrapping_mul(1000)
@@ -1729,8 +1606,6 @@ pub unsafe fn scan_events_fast(
                             ) {
                                 batch.eid_b36[r] = eid_y;
                                 batch.uid_b36[r] = uid_y;
-                                batch.event_tok[r] = 0;
-                                batch.user_tok[r] = 0;
                                 batch.ingest[r] = ingest_s_rel;
                                 batch.ts[r] = ts_rel as u32;
                                 batch.payload[r] = payload;
@@ -1744,8 +1619,6 @@ pub unsafe fn scan_events_fast(
                         // without falling through to parse_event_row_cold.
                         batch.eid_b36[r] = eid_y;
                         batch.uid_b36[r] = uid_y;
-                        batch.event_tok[r] = 0;
-                        batch.user_tok[r] = 0;
                         batch.ingest[r] = ingest_s_rel;
                         batch.ts[r] = 0;
                         batch.payload[r] = 0;
@@ -1760,6 +1633,7 @@ pub unsafe fn scan_events_fast(
                 batch.uid_b36[r] = cold.uid_b36;
                 batch.event_tok[r] = cold.event_tok;
                 batch.user_tok[r] = cold.user_tok;
+                batch.tok_dirty_mask |= 1u64 << r;
                 batch.ingest[r] = cold.ingest;
                 batch.ts[r] = cold.ts;
                 batch.payload[r] = cold.payload;
@@ -1814,14 +1688,14 @@ pub unsafe fn scan_clicks_fast(
                 if let Some((cid_y, uid_y)) =
                     decode_id_pair_wq(at(0), len(0), 0, b'k', at(1), len(1), 0, b'u')
                 {
-                    let ts_rel = if len(3) == 20 {
-                        match parse_f1_swar_lut_cached(at(3), &sh.date_lut, &mut last_date) {
-                            Some(s) => s as i64 * 1000,
-                            None => ts::parse_ts_rel(at(3), 20, &sh.date_lut, dates, sh.base_ms),
-                        }
-                    } else {
-                        ts::parse_ts_rel(at(3), len(3), &sh.date_lut, dates, sh.base_ms)
-                    };
+                    let ts_rel = parse_ts_cached(
+                        at(3),
+                        len(3),
+                        &sh.date_lut,
+                        dates,
+                        &mut last_date,
+                        sh.base_ms,
+                    );
                     if (ts_rel as u64) < click_win_ms {
                         if let Some(camp) = parse_campaign_wq(
                             at(2),
@@ -1832,8 +1706,6 @@ pub unsafe fn scan_clicks_fast(
                         ) {
                             batch.cid_b36[r] = cid_y;
                             batch.uid_b36[r] = uid_y;
-                            batch.click_tok[r] = 0;
-                            batch.user_tok[r] = 0;
                             batch.ts[r] = ts_rel as u32;
                             batch.campaign[r] = camp;
                             batch.canonical_mask |= 1u64 << r;
@@ -1848,6 +1720,7 @@ pub unsafe fn scan_clicks_fast(
                 batch.uid_b36[r] = cold.uid_b36;
                 batch.click_tok[r] = cold.click_tok;
                 batch.user_tok[r] = cold.user_tok;
+                batch.tok_dirty_mask |= 1u64 << r;
                 batch.ts[r] = cold.ts;
                 batch.campaign[r] = cold.campaign;
                 if cold.cid_b36 <= MASK40 && cold.uid_b36 <= MASK40 {
@@ -1898,8 +1771,6 @@ pub unsafe fn scan_links_fast(
             }
             batch.ua_b36[r] = ya;
             batch.ub_b36[r] = yb;
-            batch.ua_tok[r] = 0;
-            batch.ub_tok[r] = 0;
             batch.canonical_mask |= 1u64 << r;
             batch.len = r + 1;
         } else {
@@ -1911,6 +1782,7 @@ pub unsafe fn scan_links_fast(
             batch.ub_b36[r] = crate::unscramble::decode_b36_ptr(pb, lb, b'u').unwrap_or(u64::MAX);
             batch.ua_tok[r] = ta;
             batch.ub_tok[r] = tb;
+            batch.tok_dirty_mask |= 1u64 << r;
             batch.len = r + 1;
         }
         if batch.len == FAST_BATCH {
@@ -2052,6 +1924,37 @@ mod tests {
             assert_eq!(decode_id_pair_wq(bad_pref.as_ptr(), 9, 0, b'e', good9.as_ptr(), 9, 0, b'e'), None);
             assert_eq!(decode_id_pair_wq(bad_char.as_ptr(), 9, 0, b'e', good9.as_ptr(), 9, 0, b'e'), None);
             assert_eq!(decode_id_pair_wq(over_40.as_ptr(), 9, 0, b'e', good9.as_ptr(), 9, 0, b'e'), None);
+
+            // Verify unified F1/F2/F3 timestamp parser matches ts::parse_ts_rel on valid and malformed forms
+            let ws = 1828500000_000i64 - (1828500000_000i64 % DAY_MS);
+            let we = ws + 14 * DAY_MS;
+            let base_ms = ws - WEEK_MS;
+            let lut = DateLut::new(ws, we, base_ms.div_euclid(1000));
+            let mut dc1 = DateCache::new();
+            let mut dc2 = DateCache::new();
+            let mut cache = (0u64, 0u32, 0i32);
+            let ts_cases: &[&[u8]] = &[
+                b"2027-12-12T04:10:10Z",
+                b"2027-12-09T19:21:09+05:30",
+                b"2027-12-09T19:21:09-10:00",
+                b"2027-12-09T19:21:09+24:00",
+                b"2027-12-09T19:21:09+05:60",
+                b"2027-12-09T19:21:09+05;00",
+                b"2027-12-12T04:10:10z",
+                b"2027-12-12T04:10:10",
+                b"2027-12-12T04:10:10.123Z",
+                b"1828801833000",
+                b"182880183300a",
+                b"2028-02-29T00:00:00Z",
+            ];
+            for &s in ts_cases {
+                let mut buf = [b' '; 64];
+                buf[16..16 + s.len()].copy_from_slice(s);
+                let p = buf.as_ptr().add(16);
+                let exp = ts::parse_ts_rel(p, s.len(), &lut, &mut dc1, base_ms);
+                let got = parse_ts_cached(p, s.len(), &lut, &mut dc2, &mut cache, base_ms);
+                assert_eq!(got, exp, "parse_ts_cached mismatch on {:?}", String::from_utf8_lossy(s));
+            }
         }
     }
 
@@ -2425,25 +2328,33 @@ mod tests {
                 });
             }
 
+            const REPS: usize = 8;
+            let ctrs = crate::sys::Counters::open();
+            let c0 = ctrs.read();
             let t0 = std::time::Instant::now();
-            unsafe {
-                scan_events_fast(&mut reader, &sh, &mut dates, ptr, sz, 0, sz, &mut batch, |b| {
-                    normal_evs.clear();
-                    fallback_evs.clear();
-                    classify_ev_batch(
-                        b,
-                        keys.user_key,
-                        keys.event_key,
-                        keys.user_cap,
-                        keys.event_cap,
-                        &mut normal_evs,
-                        &mut fallback_evs,
-                    );
-                    total_normal += normal_evs.len();
-                    total_fallback += fallback_evs.len();
-                });
+            for _ in 0..REPS {
+                total_normal = 0;
+                total_fallback = 0;
+                unsafe {
+                    scan_events_fast(&mut reader, &sh, &mut dates, ptr, sz, 0, sz, &mut batch, |b| {
+                        normal_evs.clear();
+                        fallback_evs.clear();
+                        classify_ev_batch(
+                            b,
+                            keys.user_key,
+                            keys.event_key,
+                            keys.user_cap,
+                            keys.event_cap,
+                            &mut normal_evs,
+                            &mut fallback_evs,
+                        );
+                        total_normal += normal_evs.len();
+                        total_fallback += fallback_evs.len();
+                    });
+                }
             }
-            let dt = t0.elapsed();
+            let dt = t0.elapsed() / REPS as u32;
+            let c1 = ctrs.read();
 
             let mut idx_reader = crate::csv::Reader::new(64 << 10);
             let t_idx0 = std::time::Instant::now();
@@ -2490,12 +2401,16 @@ mod tests {
             let dt_scan_body = dt_so.saturating_sub(dt_scan);
             let dt_classify = dt.saturating_sub(dt_so);
             eprintln!(
-                "[fast_parse bench] {dir_name}/events/part-00001.csv ({:.2} MiB, {} rows, {} delims): total={:?} ({:.1} MiB/s) | index={:?} ({:.1}%), line_loop={:?} ({:.1}%), scan_body={:?} ({:.1}%), classify={:?} ({:.1}%), scan_rows={}, so_rows={}",
+                "[fast_parse bench] {dir_name}/events/part-00001.csv ({:.2} MiB, {} rows, {} delims): total={:?} ({:.1} MiB/s) [Mcyc={:.3}, Minstr={:.3}, Mllc={:.3}, Mbr={:.3}] | index={:?} ({:.1}%), line_loop={:?} ({:.1}%), scan_body={:?} ({:.1}%), classify={:?} ({:.1}%), scan_rows={}, so_rows={}",
                 mb,
                 total_normal + total_fallback,
                 delims,
                 dt,
                 mb / dt.as_secs_f64(),
+                c1[0].saturating_sub(c0[0]) as f64 / (1e6 * REPS as f64),
+                c1[1].saturating_sub(c0[1]) as f64 / (1e6 * REPS as f64),
+                c1[2].saturating_sub(c0[2]) as f64 / (1e6 * REPS as f64),
+                c1[3].saturating_sub(c0[3]) as f64 / (1e6 * REPS as f64),
                 dt_idx,
                 dt_idx.as_secs_f64() * 100.0 / dt.as_secs_f64(),
                 dt_line,

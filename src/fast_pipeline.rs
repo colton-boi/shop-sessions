@@ -2,14 +2,16 @@ use crate::csv::Reader;
 use crate::diag;
 use crate::dims::Dims;
 use crate::fast_links::{
-    encode_base36_token, encode_upper_k_token, user_alias_token, ClickCsr, IntraEdge,
+    encode_base36_token, encode_upper_k_token, user_alias_token, ClickCsr, ClickSlot, IntraEdge,
     UserAliasTable, HAS_EXTRA_EVENTS, IS_COMPLEX, MASK40,
 };
 use crate::fast_parse::{
     scan_clicks_fast, scan_events_fast, scan_links_fast, FallbackEvRec, FastCkBatch, FastEvBatch,
     FastLkBatch,
 };
-use crate::fast_sess::{BoundaryEv, BoundarySeg, FastEvRec, FastSessConfig, FastSessWorker};
+use crate::fast_sess::{
+    BoundaryEv, BoundarySeg, FastEvRec, FastSessConfig, FastSessWorker, BLOCK_MASK, BLOCK_SHIFT,
+};
 use crate::group::{self, build_cat_dict, Cell, Grouper};
 use crate::links::LinkTable;
 use crate::scatter::{by_partition, part_of_key, Arena, Scatter};
@@ -21,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
-const EV_CHUNK: usize = 256;
+const EV_CHUNK: usize = 512;
+const CK_CHUNK: usize = 512;
+const CK_BUCKETS: usize = 128;
 const CX_PARTS: usize = 64;
 
 struct FastParseWorker {
@@ -34,6 +38,7 @@ struct FastParseWorker {
     complex_edges: Vec<(u64, u64)>,
     fallback_clicks: Vec<CRec>,
     ev_scatter: Scatter<FastEvRec, 4>,
+    ck_scatter: Scatter<ClickSlot, 4>,
     odd_user_tokens: Vec<u64>,
     odd_eid_events: Vec<FallbackEvRec>,
     parsed_ev_rows: u64,
@@ -53,6 +58,7 @@ impl FastParseWorker {
             complex_edges: Vec::new(),
             fallback_clicks: Vec::new(),
             ev_scatter: Scatter::new(),
+            ck_scatter: Scatter::new(),
             odd_user_tokens: Vec::new(),
             odd_eid_events: Vec::new(),
             parsed_ev_rows: 0,
@@ -108,7 +114,7 @@ unsafe fn push_odd_user_or_fallback(
     ingest: i32,
 ) {
     let seq = w.odd_user_tokens.len();
-    if tid < 64 && seq < (1 << 20) {
+    if tid < 32 && seq < (1 << 20) {
         w.odd_user_tokens.push(utok);
         let odd_handle = ((tid as u32) << 20) | (seq as u32);
         let price = payload & 0xFF_FFFF;
@@ -139,15 +145,98 @@ unsafe fn push_odd_user_or_fallback(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn process_ev_row_scalar(
+unsafe fn push_canonical_valid_ev(
     b: &FastEvBatch,
     r: usize,
+    e_idx: u64,
+    u_val: u64,
     w: &mut FastParseWorker,
     tid: usize,
     ev_arena: &Arena<FastEvRec>,
     user_alias_table: &UserAliasTable,
     user_key: u64,
-    event_key: u64,
+    user_cap: u32,
+    event_cap: u64,
+) {
+    let ingest = b.ingest[r];
+    if ingest == i32::MAX {
+        return;
+    }
+    let ts = b.ts[r];
+    let payload = b.payload[r];
+    if e_idx < event_cap {
+        let block = (e_idx >> BLOCK_SHIFT) as usize;
+        let slot = (e_idx & (BLOCK_MASK as u64)) as u16;
+        let ing_u32 = (ingest as i64 - 518_400).clamp(0, 0x1F_FFFF) as u32;
+        let u_idx = u_val >> 9;
+        let alias = u_val & 511;
+        if u_idx < user_cap as u64 && alias < 14 {
+            let price = payload & 0xFF_FFFF;
+            let cat = (payload >> 24) as u8;
+            w.ev_scatter.push(
+                ev_arena,
+                block,
+                FastEvRec::new_valid(ts, price, cat, alias as u8, u_idx as u32, ing_u32, slot),
+            );
+        } else {
+            mark_user_complex(user_alias_table, b.uid_b36[r], user_key, user_cap);
+            let utok = if b.user_tok[r] != 0 {
+                b.user_tok[r]
+            } else {
+                encode_base36_token(b'u', b.uid_b36[r])
+            };
+            push_odd_user_or_fallback(
+                w,
+                tid,
+                ev_arena,
+                block,
+                slot,
+                ts,
+                payload,
+                ing_u32,
+                utok,
+                b.eid_b36[r],
+                b.uid_b36[r],
+                b.event_tok[r],
+                ingest,
+            );
+        }
+    } else {
+        let etok = if b.event_tok[r] != 0 {
+            b.event_tok[r]
+        } else {
+            encode_base36_token(b'e', b.eid_b36[r])
+        };
+        let utok = if b.user_tok[r] != 0 {
+            b.user_tok[r]
+        } else {
+            encode_base36_token(b'u', b.uid_b36[r])
+        };
+        w.odd_eid_events.push(FallbackEvRec {
+            event_tok: etok,
+            user_tok: utok,
+            eid_b36: b.eid_b36[r],
+            uid_b36: b.uid_b36[r],
+            ingest,
+            ts,
+            payload,
+            valid: true,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn process_ev_row_unscrambled(
+    b: &FastEvBatch,
+    r: usize,
+    e_idx: u64,
+    u_val: u64,
+    w: &mut FastParseWorker,
+    tid: usize,
+    ev_arena: &Arena<FastEvRec>,
+    user_alias_table: &UserAliasTable,
+    user_key: u64,
     user_cap: u32,
     event_cap: u64,
 ) {
@@ -161,70 +250,49 @@ unsafe fn process_ev_row_scalar(
     if ingest == i32::MAX {
         return;
     }
-    if eid_b36 <= MASK40 {
-        let e_idx = unscramble40(eid_b36, event_key);
-        if e_idx < event_cap {
-            let block = (e_idx >> 15) as usize;
-            let slot = (e_idx & 32767) as u16;
-            let ing_u32 = (ingest as i64 - 518_400).clamp(0, 0x1F_FFFF) as u32;
-            if !valid {
-                w.ev_scatter
-                    .push(ev_arena, block, FastEvRec::new_invalid(0, ing_u32, slot));
-            } else if uid_b36 <= MASK40 {
-                let u_val = unscramble40(uid_b36, user_key);
-                let u_idx = u_val >> 9;
-                let alias = u_val & 511;
-                let ts = b.ts[r];
-                let payload = b.payload[r];
-                if u_idx < user_cap as u64 && alias < 14 {
-                    let price = payload & 0xFF_FFFF;
-                    let cat = (payload >> 24) as u8;
-                    w.ev_scatter.push(
-                        ev_arena,
-                        block,
-                        FastEvRec::new_valid(
-                            ts,
-                            price,
-                            cat,
-                            alias as u8,
-                            u_idx as u32,
-                            ing_u32,
-                            slot,
-                        ),
-                    );
-                } else {
-                    mark_user_complex(user_alias_table, uid_b36, user_key, user_cap);
-                    let utok = if b.user_tok[r] != 0 {
-                        b.user_tok[r]
-                    } else {
-                        encode_base36_token(b'u', uid_b36)
-                    };
-                    push_odd_user_or_fallback(
-                        w,
-                        tid,
-                        ev_arena,
-                        block,
-                        slot,
+    if eid_b36 <= MASK40 && e_idx < event_cap {
+        let block = (e_idx >> BLOCK_SHIFT) as usize;
+        let slot = (e_idx & (BLOCK_MASK as u64)) as u16;
+        let ing_u32 = (ingest as i64 - 518_400).clamp(0, 0x1F_FFFF) as u32;
+        if !valid {
+            w.ev_scatter
+                .push(ev_arena, block, FastEvRec::new_invalid(0, ing_u32, slot));
+        } else if uid_b36 <= MASK40 {
+            let u_idx = u_val >> 9;
+            let alias = u_val & 511;
+            let ts = b.ts[r];
+            let payload = b.payload[r];
+            if u_idx < user_cap as u64 && alias < 14 {
+                let price = payload & 0xFF_FFFF;
+                let cat = (payload >> 24) as u8;
+                w.ev_scatter.push(
+                    ev_arena,
+                    block,
+                    FastEvRec::new_valid(
                         ts,
-                        payload,
+                        price,
+                        cat,
+                        alias as u8,
+                        u_idx as u32,
                         ing_u32,
-                        utok,
-                        eid_b36,
-                        uid_b36,
-                        b.event_tok[r],
-                        ingest,
-                    );
-                }
+                        slot,
+                    ),
+                );
             } else {
-                let utok = b.user_tok[r];
+                mark_user_complex(user_alias_table, uid_b36, user_key, user_cap);
+                let utok = if b.user_tok[r] != 0 {
+                    b.user_tok[r]
+                } else {
+                    encode_base36_token(b'u', uid_b36)
+                };
                 push_odd_user_or_fallback(
                     w,
                     tid,
                     ev_arena,
                     block,
                     slot,
-                    b.ts[r],
-                    b.payload[r],
+                    ts,
+                    payload,
                     ing_u32,
                     utok,
                     eid_b36,
@@ -233,8 +301,25 @@ unsafe fn process_ev_row_scalar(
                     ingest,
                 );
             }
-            return;
+        } else {
+            let utok = b.user_tok[r];
+            push_odd_user_or_fallback(
+                w,
+                tid,
+                ev_arena,
+                block,
+                slot,
+                b.ts[r],
+                b.payload[r],
+                ing_u32,
+                utok,
+                eid_b36,
+                uid_b36,
+                b.event_tok[r],
+                ingest,
+            );
         }
+        return;
     }
 
     let etok = if b.event_tok[r] != 0 {
@@ -265,14 +350,56 @@ unsafe fn process_ev_row_scalar(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn process_ck_row_scalar(
-    b: &FastCkBatch,
+unsafe fn process_ev_row_scalar(
+    b: &FastEvBatch,
     r: usize,
     w: &mut FastParseWorker,
-    click_csr: &ClickCsr,
+    tid: usize,
+    ev_arena: &Arena<FastEvRec>,
     user_alias_table: &UserAliasTable,
     user_key: u64,
-    click_key: u64,
+    event_key: u64,
+    user_cap: u32,
+    event_cap: u64,
+) {
+    let eid_b36 = b.eid_b36[r];
+    let uid_b36 = b.uid_b36[r];
+    let e_idx = if eid_b36 <= MASK40 {
+        unscramble40(eid_b36, event_key)
+    } else {
+        u64::MAX
+    };
+    let u_val = if uid_b36 <= MASK40 {
+        unscramble40(uid_b36, user_key)
+    } else {
+        u64::MAX
+    };
+    process_ev_row_unscrambled(
+        b,
+        r,
+        e_idx,
+        u_val,
+        w,
+        tid,
+        ev_arena,
+        user_alias_table,
+        user_key,
+        user_cap,
+        event_cap,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn process_ck_row_unscrambled(
+    b: &FastCkBatch,
+    r: usize,
+    c_idx: u64,
+    u_val: u64,
+    w: &mut FastParseWorker,
+    ck_arena: &Arena<ClickSlot>,
+    user_alias_table: &UserAliasTable,
+    user_key: u64,
     user_cap: u32,
     click_cap: u64,
 ) {
@@ -280,19 +407,20 @@ unsafe fn process_ck_row_scalar(
     if ((b.canonical_mask & (1u64 << r)) != 0)
         || (is_upper_k && b.cid_b36[r] <= MASK40 && b.uid_b36[r] <= MASK40)
     {
-        let c_idx = unscramble40(b.cid_b36[r], click_key);
-        let u_val = unscramble40(b.uid_b36[r], user_key);
         let u_idx = u_val >> 9;
         let alias = u_val & 511;
         if u_idx < user_cap as u64 && alias < 14 && c_idx < click_cap {
-            click_csr.put_click_concurrent_cased(
-                c_idx as usize,
-                b.ts[r],
-                b.campaign[r],
-                alias as u8,
-                u_idx as u32,
-                b.cid_b36[r],
-                is_upper_k,
+            w.ck_scatter.push(
+                ck_arena,
+                ((u_idx as usize) >> 4) & 127,
+                ClickSlot::new_parsed_cased(
+                    b.ts[r],
+                    b.campaign[r],
+                    alias as u8,
+                    u_idx as u32,
+                    b.cid_b36[r],
+                    is_upper_k,
+                ),
             );
             return;
         }
@@ -318,18 +446,56 @@ unsafe fn process_ck_row_scalar(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn process_lk_row_scalar(
+unsafe fn process_ck_row_scalar(
+    b: &FastCkBatch,
+    r: usize,
+    w: &mut FastParseWorker,
+    ck_arena: &Arena<ClickSlot>,
+    user_alias_table: &UserAliasTable,
+    user_key: u64,
+    click_key: u64,
+    user_cap: u32,
+    click_cap: u64,
+) {
+    let c_idx = if b.cid_b36[r] <= MASK40 {
+        unscramble40(b.cid_b36[r], click_key)
+    } else {
+        u64::MAX
+    };
+    let u_val = if b.uid_b36[r] <= MASK40 {
+        unscramble40(b.uid_b36[r], user_key)
+    } else {
+        u64::MAX
+    };
+    process_ck_row_unscrambled(
+        b,
+        r,
+        c_idx,
+        u_val,
+        w,
+        ck_arena,
+        user_alias_table,
+        user_key,
+        user_cap,
+        click_cap,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn process_lk_row_unscrambled(
     b: &FastLkBatch,
     r: usize,
+    va: u64,
+    vb: u64,
     w: &mut FastParseWorker,
     user_alias_table: &UserAliasTable,
     user_key: u64,
     user_cap: u32,
 ) {
     if (b.canonical_mask & (1u64 << r)) != 0 {
-        let va = unscramble40(b.ua_b36[r], user_key);
-        let vb = unscramble40(b.ub_b36[r], user_key);
         let ua = va >> 9;
         let ub = vb >> 9;
         let aa = va & 511;
@@ -360,6 +526,28 @@ fn process_lk_row_scalar(
     if ta != tb {
         w.complex_edges.push((ta, tb));
     }
+}
+
+#[inline(always)]
+fn process_lk_row_scalar(
+    b: &FastLkBatch,
+    r: usize,
+    w: &mut FastParseWorker,
+    user_alias_table: &UserAliasTable,
+    user_key: u64,
+    user_cap: u32,
+) {
+    let va = if b.ua_b36[r] <= MASK40 {
+        unscramble40(b.ua_b36[r], user_key)
+    } else {
+        u64::MAX
+    };
+    let vb = if b.ub_b36[r] <= MASK40 {
+        unscramble40(b.ub_b36[r], user_key)
+    } else {
+        u64::MAX
+    };
+    process_lk_row_unscrambled(b, r, va, vb, w, user_alias_table, user_key, user_cap);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -395,15 +583,21 @@ pub(crate) fn try_run_fast(
     }
 
     const SAMPLE_BYTES: usize = 512 << 10;
-    let largest_slice = |files: &[Mapped]| -> &[u8] {
-        let best = files.iter().max_by_key(|m| m.1).unwrap();
-        unsafe { std::slice::from_raw_parts(best.0, best.1.min(SAMPLE_BYTES)) }
+    let largest_slices = |files: &[Mapped]| -> Vec<&[u8]> {
+        let mut by_sz: Vec<(usize, *const u8)> =
+            files.iter().filter(|m| m.1 > 0).map(|m| (m.1, m.0)).collect();
+        by_sz.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        by_sz
+            .into_iter()
+            .take(3)
+            .map(|(sz, p)| unsafe { std::slice::from_raw_parts(p, sz.min(SAMPLE_BYTES)) })
+            .collect()
     };
-    let ev_sample = largest_slice(&event_input.files);
-    let ck_sample = largest_slice(&click_input.files);
+    let ev_samples = largest_slices(&event_input.files);
+    let ck_samples = largest_slices(&click_input.files);
     let Some(keys) = recover_dataset_keys_from_slices(
-        &[ev_sample],
-        &[ck_sample],
+        &ev_samples,
+        &ck_samples,
         event_input.bytes,
         click_input.bytes,
     ) else {
@@ -425,7 +619,7 @@ pub(crate) fn try_run_fast(
     let event_cap = keys.event_cap.max(1 << 16).min(1u64 << 30);
     let user_cap = keys.user_cap.max(1 << 16).min((1 << 23) - 1);
     let click_cap = keys.click_cap.max(1 << 16).min(1u64 << 29);
-    let num_ev_blocks = ((event_cap as usize) + 32767) >> 15;
+    let num_ev_blocks = ((event_cap as usize) + BLOCK_MASK) >> BLOCK_SHIFT;
     let num_user_buckets = (user_cap as usize).div_ceil(1024);
 
     let count = || counters.as_ref().map_or([0; 4], |c| c.read());
@@ -490,18 +684,32 @@ pub(crate) fn try_run_fast(
     };
 
     let user_alias_table = UserAliasTable::new(user_cap as usize, keys.user_key);
-    let mut click_csr = ClickCsr::with_capacity(user_cap as usize, click_cap as usize);
+    let clicks_guess = (click_input.bytes as usize / 42).max(1 << 16);
+    let ck_records_cap =
+        (click_input.bytes as usize / 32).max(1 << 16) + (threads * CK_BUCKETS + 2) * CK_CHUNK;
+    let ck_arena = Arena::<ClickSlot>::new(ck_records_cap, CK_CHUNK);
+    let ck_csr_cap = (click_input.bytes as usize / 32).max(1 << 16);
+    let ck_csr_base = sys::map_zeroed(ck_csr_cap * std::mem::size_of::<ClickSlot>()) as *mut ClickSlot;
+    let ev_chunk = std::env::var("SS_EV_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| (v.max(64) + 3) & !3)
+        .unwrap_or(EV_CHUNK);
     let ev_records_cap =
-        (event_input.bytes as usize / 32).max(rows_guess) + (threads * num_ev_blocks + 2) * EV_CHUNK;
-    let ev_arena = Arena::<FastEvRec>::new(ev_records_cap, EV_CHUNK);
+        (event_input.bytes as usize / 32).max(rows_guess) + (threads * num_ev_blocks + 2) * ev_chunk;
+    let ev_arena = Arena::<FastEvRec>::new(ev_records_cap, ev_chunk);
 
-    let ev_pop_bytes = (rows_guess * 16).min(ev_arena.cap_bytes());
-    let ck_pop_bytes = (click_cap as usize) * 16;
+    let ev_pop_bytes =
+        ((rows_guess + threads * num_ev_blocks * ev_chunk / 2) * 16).min(ev_arena.cap_bytes());
+    let ck_pop_bytes =
+        ((clicks_guess + threads * CK_BUCKETS * CK_CHUNK / 2) * 16).min(ck_arena.cap_bytes());
+    let ck_csr_pop_bytes = (clicks_guess * 16).min(ck_csr_cap * 16);
     {
         const PIECE: usize = 4 << 20;
         let regions = [
             (ev_arena.base as usize, ev_pop_bytes),
-            (click_csr.csr.as_ptr() as usize, ck_pop_bytes),
+            (ck_arena.base as usize, ck_pop_bytes),
+            (ck_csr_base as usize, ck_csr_pop_bytes),
         ];
         let pieces: Vec<(usize, usize)> = regions
             .iter()
@@ -540,6 +748,7 @@ pub(crate) fn try_run_fast(
     par(threads, |tid| unsafe {
         let w = parse_workers.get(tid);
         w.ev_scatter.reset(num_ev_blocks);
+        w.ck_scatter.reset(CK_BUCKETS);
         loop {
             let wi = next_work.fetch_add(1, Relaxed);
             let Some(&kind) = work.get(wi) else { break };
@@ -560,15 +769,15 @@ pub(crate) fn try_run_fast(
                             let n = b.len;
                             let mut idx = 0;
                             while idx + 8 <= n {
+                                let a_un = unscramble40_x8(
+                                    *(b.ua_b36.as_ptr().add(idx) as *const [u64; 8]),
+                                    keys.user_key,
+                                );
+                                let b_un = unscramble40_x8(
+                                    *(b.ub_b36.as_ptr().add(idx) as *const [u64; 8]),
+                                    keys.user_key,
+                                );
                                 if ((b.canonical_mask >> idx) & 0xFF) == 0xFF {
-                                    let a_un = unscramble40_x8(
-                                        *(b.ua_b36.as_ptr().add(idx) as *const [u64; 8]),
-                                        keys.user_key,
-                                    );
-                                    let b_un = unscramble40_x8(
-                                        *(b.ub_b36.as_ptr().add(idx) as *const [u64; 8]),
-                                        keys.user_key,
-                                    );
                                     for k in 0..8 {
                                         let r = idx + k;
                                         let va = a_un[k];
@@ -611,18 +820,19 @@ pub(crate) fn try_run_fast(
                                             }
                                         }
                                     }
-                                    idx += 8;
-                                    continue;
-                                }
-                                for k in 0..8 {
-                                    process_lk_row_scalar(
-                                        b,
-                                        idx + k,
-                                        w,
-                                        &user_alias_table,
-                                        keys.user_key,
-                                        user_cap,
-                                    );
+                                } else {
+                                    for k in 0..8 {
+                                        process_lk_row_unscrambled(
+                                            b,
+                                            idx + k,
+                                            a_un[k],
+                                            b_un[k],
+                                            w,
+                                            &user_alias_table,
+                                            keys.user_key,
+                                            user_cap,
+                                        );
+                                    }
                                 }
                                 idx += 8;
                             }
@@ -641,7 +851,7 @@ pub(crate) fn try_run_fast(
                     );
                     w.reader = reader;
                     w.lk_batch = lk_batch;
-                    link_input.done(x);
+                    let _ = x;
                 }
                 WorkKind::Click(i) => {
                     let x = &click_input.extents[i];
@@ -663,15 +873,15 @@ pub(crate) fn try_run_fast(
                             w.parsed_ck_rows += n as u64;
                             let mut idx = 0;
                             while idx + 8 <= n {
+                                let c_un = unscramble40_x8(
+                                    *(b.cid_b36.as_ptr().add(idx) as *const [u64; 8]),
+                                    keys.click_key,
+                                );
+                                let u_un = unscramble40_x8(
+                                    *(b.uid_b36.as_ptr().add(idx) as *const [u64; 8]),
+                                    keys.user_key,
+                                );
                                 if ((b.canonical_mask >> idx) & 0xFF) == 0xFF {
-                                    let c_un = unscramble40_x8(
-                                        *(b.cid_b36.as_ptr().add(idx) as *const [u64; 8]),
-                                        keys.click_key,
-                                    );
-                                    let u_un = unscramble40_x8(
-                                        *(b.uid_b36.as_ptr().add(idx) as *const [u64; 8]),
-                                        keys.user_key,
-                                    );
                                     for k in 0..8 {
                                         let r = idx + k;
                                         let c_idx = c_un[k];
@@ -682,13 +892,17 @@ pub(crate) fn try_run_fast(
                                             && alias < 14
                                             && c_idx < click_cap
                                         {
-                                            click_csr.put_click_concurrent(
-                                                c_idx as usize,
-                                                b.ts[r],
-                                                b.campaign[r],
-                                                alias as u8,
-                                                u_idx as u32,
-                                                b.cid_b36[r],
+                                            w.ck_scatter.push(
+                                                &ck_arena,
+                                                ((u_idx as usize) >> 4) & 127,
+                                                ClickSlot::new_parsed_cased(
+                                                    b.ts[r],
+                                                    b.campaign[r],
+                                                    alias as u8,
+                                                    u_idx as u32,
+                                                    b.cid_b36[r],
+                                                    false,
+                                                ),
                                             );
                                         } else {
                                             mark_user_complex(
@@ -715,21 +929,21 @@ pub(crate) fn try_run_fast(
                                             });
                                         }
                                     }
-                                    idx += 8;
-                                    continue;
-                                }
-                                for k in 0..8 {
-                                    process_ck_row_scalar(
-                                        b,
-                                        idx + k,
-                                        w,
-                                        &click_csr,
-                                        &user_alias_table,
-                                        keys.user_key,
-                                        keys.click_key,
-                                        user_cap,
-                                        click_cap,
-                                    );
+                                } else {
+                                    for k in 0..8 {
+                                        process_ck_row_unscrambled(
+                                            b,
+                                            idx + k,
+                                            c_un[k],
+                                            u_un[k],
+                                            w,
+                                            &ck_arena,
+                                            &user_alias_table,
+                                            keys.user_key,
+                                            user_cap,
+                                            click_cap,
+                                        );
+                                    }
                                 }
                                 idx += 8;
                             }
@@ -738,7 +952,7 @@ pub(crate) fn try_run_fast(
                                     b,
                                     idx,
                                     w,
-                                    &click_csr,
+                                    &ck_arena,
                                     &user_alias_table,
                                     keys.user_key,
                                     keys.click_key,
@@ -752,7 +966,6 @@ pub(crate) fn try_run_fast(
                     w.reader = reader;
                     w.dates = dates;
                     w.ck_batch = ck_batch;
-                    click_input.done(x);
                 }
                 WorkKind::Event(i) => {
                     let x = &event_input.extents[i];
@@ -774,116 +987,46 @@ pub(crate) fn try_run_fast(
                             w.parsed_ev_rows += n as u64;
                             let mut idx = 0;
                             while idx + 8 <= n {
-                                if ((b.canonical_valid_mask >> idx) & 0xFF) == 0xFF {
-                                    w.valid_ev_rows += 8;
-                                    let e_un = unscramble40_x8(
-                                        *(b.eid_b36.as_ptr().add(idx) as *const [u64; 8]),
-                                        keys.event_key,
-                                    );
-                                    let u_un = unscramble40_x8(
-                                        *(b.uid_b36.as_ptr().add(idx) as *const [u64; 8]),
-                                        keys.user_key,
-                                    );
-                                    for k in 0..8 {
-                                        let r = idx + k;
-                                        let e_idx = e_un[k];
-                                        let u_val = u_un[k];
-                                        let u_idx = u_val >> 9;
-                                        let alias = u_val & 511;
-                                        let ingest = b.ingest[r];
-                                        if ingest == i32::MAX {
-                                            continue;
-                                        }
-                                        let ts = b.ts[r];
-                                        let payload = b.payload[r];
-                                        if e_idx < event_cap {
-                                            let block = (e_idx >> 15) as usize;
-                                            let slot = (e_idx & 32767) as u16;
-                                            let ing_u32 =
-                                                (ingest as i64 - 518_400).clamp(0, 0x1F_FFFF) as u32;
-                                            if u_idx < user_cap as u64 && alias < 14 {
-                                                let price = payload & 0xFF_FFFF;
-                                                let cat = (payload >> 24) as u8;
-                                                w.ev_scatter.push(
-                                                    &ev_arena,
-                                                    block,
-                                                    FastEvRec::new_valid(
-                                                        ts,
-                                                        price,
-                                                        cat,
-                                                        alias as u8,
-                                                        u_idx as u32,
-                                                        ing_u32,
-                                                        slot,
-                                                    ),
-                                                );
-                                            } else {
-                                                mark_user_complex(
-                                                    &user_alias_table,
-                                                    b.uid_b36[r],
-                                                    keys.user_key,
-                                                    user_cap,
-                                                );
-                                                let utok = if b.user_tok[r] != 0 {
-                                                    b.user_tok[r]
-                                                } else {
-                                                    encode_base36_token(b'u', b.uid_b36[r])
-                                                };
-                                                push_odd_user_or_fallback(
-                                                    w,
-                                                    tid,
-                                                    &ev_arena,
-                                                    block,
-                                                    slot,
-                                                    ts,
-                                                    payload,
-                                                    ing_u32,
-                                                    utok,
-                                                    b.eid_b36[r],
-                                                    b.uid_b36[r],
-                                                    b.event_tok[r],
-                                                    ingest,
-                                                );
-                                            }
-                                        } else {
-                                            let etok = if b.event_tok[r] != 0 {
-                                                b.event_tok[r]
-                                            } else {
-                                                encode_base36_token(b'e', b.eid_b36[r])
-                                            };
-                                            let utok = if b.user_tok[r] != 0 {
-                                                b.user_tok[r]
-                                            } else {
-                                                encode_base36_token(b'u', b.uid_b36[r])
-                                            };
-                                            w.odd_eid_events.push(FallbackEvRec {
-                                                event_tok: etok,
-                                                user_tok: utok,
-                                                eid_b36: b.eid_b36[r],
-                                                uid_b36: b.uid_b36[r],
-                                                ingest,
-                                                ts,
-                                                payload,
-                                                valid: true,
-                                            });
-                                        }
-                                    }
-                                    idx += 8;
-                                    continue;
-                                }
+                                let e_un = unscramble40_x8(
+                                    *(b.eid_b36.as_ptr().add(idx) as *const [u64; 8]),
+                                    keys.event_key,
+                                );
+                                let u_un = unscramble40_x8(
+                                    *(b.uid_b36.as_ptr().add(idx) as *const [u64; 8]),
+                                    keys.user_key,
+                                );
                                 for k in 0..8 {
-                                    process_ev_row_scalar(
-                                        b,
-                                        idx + k,
-                                        w,
-                                        tid,
-                                        &ev_arena,
-                                        &user_alias_table,
-                                        keys.user_key,
-                                        keys.event_key,
-                                        user_cap,
-                                        event_cap,
-                                    );
+                                    let r = idx + k;
+                                    if (b.canonical_valid_mask & (1u64 << r)) != 0 {
+                                        w.valid_ev_rows += 1;
+                                        push_canonical_valid_ev(
+                                            b,
+                                            r,
+                                            e_un[k],
+                                            u_un[k],
+                                            w,
+                                            tid,
+                                            &ev_arena,
+                                            &user_alias_table,
+                                            keys.user_key,
+                                            user_cap,
+                                            event_cap,
+                                        );
+                                    } else {
+                                        process_ev_row_unscrambled(
+                                            b,
+                                            r,
+                                            e_un[k],
+                                            u_un[k],
+                                            w,
+                                            tid,
+                                            &ev_arena,
+                                            &user_alias_table,
+                                            keys.user_key,
+                                            user_cap,
+                                            event_cap,
+                                        );
+                                    }
                                 }
                                 idx += 8;
                             }
@@ -907,11 +1050,11 @@ pub(crate) fn try_run_fast(
                     w.reader = reader;
                     w.dates = dates;
                     w.ev_batch = ev_batch;
-                    event_input.done(x);
                 }
             }
         }
         w.ev_scatter.finish(&ev_arena);
+        w.ck_scatter.finish(&ck_arena);
     });
     marks.push(mark("parse"));
     log_stage(&marks);
@@ -999,12 +1142,24 @@ pub(crate) fn try_run_fast(
     marks.push(mark("links"));
     log_stage(&marks);
 
-    let ok_csr = click_csr.finalize_and_sort_par(keys.click_key, threads);
-    assert!(ok_csr, "ClickCsr non-monotonic user_idx");
+    let ck_logs: Vec<&Vec<(u32, u32, u32)>> = (0..threads)
+        .map(|t| unsafe { &parse_workers.get(t).ck_scatter.log })
+        .collect();
+    let ck_chunks = by_partition(&ck_logs, CK_BUCKETS);
+    let click_csr = unsafe {
+        ClickCsr::from_bucketed_arena_into(
+            ck_arena.base,
+            &ck_chunks,
+            user_cap as usize,
+            threads,
+            ck_csr_base,
+            ck_csr_cap,
+        )
+    };
     marks.push(mark("clicks"));
     log_stage(&marks);
 
-    // Step 4: Stage 3A (32K Block Dedup & Sessionize) + Stage 3B (Parallel Boundary Stitch)
+    // Step 4: Stage 3A (16K L2-Resident Block Dedup & Sessionize) + Stage 3B (Parallel Boundary Stitch)
     let ev_logs: Vec<&Vec<(u32, u32, u32)>> = (0..threads)
         .map(|t| unsafe { &parse_workers.get(t).ev_scatter.log })
         .collect();
@@ -1290,13 +1445,27 @@ pub(crate) fn try_run_fast(
     marks.push(mark("complex"));
     log_stage(&marks);
 
-    let cx_live_pieces: Vec<(usize, usize)> = [
+    let (ck_raw_base, ck_raw_bytes) = click_csr.raw_region();
+    let mut live_regions: Vec<(usize, usize)> = vec![
         (sh.p_arena.base as usize, sh.p_arena.used_bytes().min(sh.p_arena.cap_bytes())),
         (sh.c_arena.base as usize, sh.c_arena.used_bytes().min(sh.c_arena.cap_bytes())),
-    ]
-    .iter()
-    .flat_map(|&(b, n)| (0..n).step_by(REL_PIECE).map(move |at| (b + at, REL_PIECE.min(n - at))))
-    .collect();
+        (ck_arena.base as usize, ck_arena.used_bytes().max(ck_pop_bytes).min(ck_arena.cap_bytes())),
+        (ck_raw_base, ck_raw_bytes.max(ck_csr_pop_bytes)),
+    ];
+    for m in link_input
+        .files
+        .iter()
+        .chain(click_input.files.iter())
+        .chain(event_input.files.iter())
+    {
+        if m.1 > 0 {
+            live_regions.push((m.0 as usize, m.1));
+        }
+    }
+    let cx_live_pieces: Vec<(usize, usize)> = live_regions
+        .iter()
+        .flat_map(|&(b, n)| (0..n).step_by(REL_PIECE).map(move |at| (b + at, REL_PIECE.min(n - at))))
+        .collect();
     let cx_live_next = AtomicUsize::new(0);
     const REL_SWEEP: usize = 1 << 16;
     let rel_sweeps = sh.links.slots().div_ceil(REL_SWEEP);
@@ -1384,5 +1553,6 @@ pub(crate) fn try_run_fast(
         [total_ev_rows, total_valid_rows, total_ck_rows],
     );
 
-    true
+    sys::prof::finish();
+    sys::exit_now();
 }

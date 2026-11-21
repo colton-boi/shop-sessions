@@ -643,6 +643,25 @@ impl ClickSlot {
     }
 
     #[inline(always)]
+    pub const fn new_parsed_cased(
+        rel_ts: u32,
+        camp: u32,
+        alias: u8,
+        user_idx: u32,
+        cid_b36: u64,
+        is_upper_k: bool,
+    ) -> Self {
+        let upper_bit = if is_upper_k { UPPER_K_KEY_BIT } else { 0 };
+        Self {
+            key_and_alias: ((rel_ts as u64) << 32)
+                | upper_bit
+                | (((camp as u64) & 0x07FF_FFFF) << 4)
+                | ((alias as u64) & 0xF),
+            user_or_cid: VALID_BIT | (((user_idx as u64) & 0x7F_FFFF) << 40) | (cid_b36 & MASK40),
+        }
+    }
+
+    #[inline(always)]
     pub const fn new_resolved(rel_ts: u32, camp: u32, alias: u8, scrambled_cid: u64) -> Self {
         Self {
             key_and_alias: ((rel_ts as u64) << 32)
@@ -693,19 +712,34 @@ impl ClickSlot {
 /// then compacting valid clicks in-place into per-user slices `csr[csr_off[u]..csr_end[u]]`.
 pub struct ClickCsr {
     pub csr: Vec<ClickSlot>,
+    data_ptr: *mut ClickSlot,
+    data_len: usize,
     pub csr_off: Vec<u32>,
     pub csr_end: Vec<u32>,
     pub user_cap: usize,
 }
 
+unsafe impl Send for ClickCsr {}
+unsafe impl Sync for ClickCsr {}
+
 impl ClickCsr {
     pub fn with_capacity(user_cap: usize, click_cap: usize) -> Self {
+        let mut csr = vec![ClickSlot::default(); click_cap];
+        let data_ptr = csr.as_mut_ptr();
+        let data_len = csr.len();
         Self {
-            csr: vec![ClickSlot::default(); click_cap],
+            csr,
+            data_ptr,
+            data_len,
             csr_off: vec![0u32; user_cap],
             csr_end: vec![0u32; user_cap],
             user_cap,
         }
+    }
+
+    #[inline(always)]
+    pub fn raw_region(&self) -> (usize, usize) {
+        (self.data_ptr as usize, self.data_len * std::mem::size_of::<ClickSlot>())
     }
 
     /// Writes a parsed click into `csr[click_idx]`. Duplicate clicks with the same `click_idx`
@@ -827,6 +861,8 @@ impl ClickCsr {
             self.csr_off.fill(0);
             self.csr_end.fill(0);
             self.csr.clear();
+            self.data_ptr = self.csr.as_mut_ptr();
+            self.data_len = 0;
             return true;
         }
         let threads = threads.max(1);
@@ -1065,7 +1101,204 @@ impl ClickCsr {
     pub fn csr_slice(&self, user_idx: usize) -> &[ClickSlot] {
         let start = self.csr_off[user_idx] as usize;
         let end = self.csr_end[user_idx] as usize;
-        &self.csr[start..end]
+        unsafe { &std::slice::from_raw_parts(self.data_ptr, self.data_len)[start..end] }
+    }
+
+    /// Builds a sorted `ClickCsr` in one parallel counting-sort pass over 128 cache-line-aligned
+    /// cyclic user buckets (`bucket = (user_idx >> 4) & 127`) scattered into `ck_arena`, allocating its own `Vec`.
+    pub unsafe fn from_bucketed_arena_par(
+        arena_base: *const ClickSlot,
+        ck_chunks: &[Vec<(u32, u32)>],
+        user_cap: usize,
+        threads: usize,
+    ) -> Self {
+        let total_clicks: usize = ck_chunks
+            .iter()
+            .map(|cs| cs.iter().map(|c| c.1 as usize).sum::<usize>())
+            .sum();
+        let mut csr: Vec<ClickSlot> = Vec::with_capacity(total_clicks);
+        csr.set_len(total_clicks);
+        let ptr = csr.as_mut_ptr();
+        let mut res = Self::from_bucketed_arena_into(
+            arena_base,
+            ck_chunks,
+            user_cap,
+            threads,
+            ptr,
+            total_clicks,
+        );
+        res.csr = csr;
+        res
+    }
+
+    /// Builds a sorted `ClickCsr` in one parallel counting-sort pass over 128 cache-line-aligned
+    /// cyclic user buckets (`bucket = (user_idx >> 4) & 127`, `lu = ((user_idx >> 11) << 4) | (user_idx & 15)`)
+    /// into caller-provided pre-populated hugepage memory.
+    pub unsafe fn from_bucketed_arena_into(
+        arena_base: *const ClickSlot,
+        ck_chunks: &[Vec<(u32, u32)>],
+        user_cap: usize,
+        threads: usize,
+        out_base: *mut ClickSlot,
+        out_cap: usize,
+    ) -> Self {
+        use std::sync::atomic::AtomicU32;
+        let num_buckets = ck_chunks.len();
+        debug_assert_eq!(num_buckets, 128);
+        let mut bucket_base = Vec::with_capacity(num_buckets + 1);
+        let mut bucket_sizes: Vec<(usize, usize)> = Vec::with_capacity(num_buckets);
+        let mut total_clicks = 0usize;
+        for (b, chunks) in ck_chunks.iter().enumerate() {
+            bucket_base.push(total_clicks as u32);
+            let cnt: usize = chunks.iter().map(|c| c.1 as usize).sum();
+            total_clicks += cnt;
+            if cnt > 0 {
+                bucket_sizes.push((cnt, b));
+            }
+        }
+        bucket_base.push(total_clicks as u32);
+
+        let mut csr_off = vec![0u32; user_cap];
+        let mut csr_end = vec![0u32; user_cap];
+        if total_clicks == 0 || user_cap == 0 {
+            return Self {
+                csr: Vec::new(),
+                data_ptr: out_base,
+                data_len: 0,
+                csr_off,
+                csr_end,
+                user_cap,
+            };
+        }
+        assert!(total_clicks <= out_cap, "ClickCsr output buffer overflow");
+
+        bucket_sizes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+        let arena_ptr = arena_base as usize;
+        let csr_ptr = out_base as usize;
+        let off_ptr = csr_off.as_mut_ptr() as usize;
+        let end_ptr = csr_end.as_mut_ptr() as usize;
+        let base_ref = &bucket_base;
+        let order_ref = &bucket_sizes;
+        let threads = threads.max(1);
+        let max_u_len = (user_cap.div_ceil(16 * 128) + 1) * 16;
+        let next_job = AtomicUsize::new(0);
+        let worker_whales: Vec<std::sync::Mutex<Vec<(usize, usize)>>> =
+            (0..threads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+
+        crate::sys::par(threads, |tid| {
+            let arena_base = arena_ptr as *const ClickSlot;
+            let csr_base = csr_ptr as *mut ClickSlot;
+            let off_base = off_ptr as *const AtomicU32;
+            let end_base = end_ptr as *const AtomicU32;
+            let mut counts = vec![0u32; max_u_len];
+            let mut local_whales: Vec<(usize, usize)> = Vec::new();
+            loop {
+                let ji = next_job.fetch_add(1, Relaxed);
+                let Some(&(_, b)) = order_ref.get(ji) else {
+                    break;
+                };
+                if (b << 4) >= user_cap {
+                    continue;
+                }
+                let max_local_chunk = ((user_cap - 1 - (b << 4)) >> 11) + 1;
+                let u_len = max_local_chunk << 4;
+                let chunks = &ck_chunks[b];
+
+                counts[..u_len].fill(0);
+                for &(first, count) in chunks {
+                    let sl = std::slice::from_raw_parts(arena_base.add(first as usize), count as usize);
+                    for slot in sl {
+                        let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
+                        let lu = ((u >> 11) << 4) | (u & 15);
+                        counts[lu] += 1;
+                    }
+                }
+
+                let mut pos = base_ref[b];
+                for lc in 0..max_local_chunk {
+                    let chunk_u0 = (lc << 11) | (b << 4);
+                    let chunk_n = (user_cap - chunk_u0).min(16);
+                    let lu_base = lc << 4;
+                    for lo in 0..chunk_n {
+                        let c = counts[lu_base + lo];
+                        if c != 0 {
+                            let u = chunk_u0 + lo;
+                            (*off_base.add(u)).store(pos, Relaxed);
+                            (*end_base.add(u)).store(pos + c, Relaxed);
+                            counts[lu_base + lo] = pos;
+                            pos += c;
+                        }
+                    }
+                }
+
+                for &(first, count) in chunks {
+                    let sl = std::slice::from_raw_parts(arena_base.add(first as usize), count as usize);
+                    for slot in sl {
+                        let u = ((slot.user_or_cid >> 40) & 0x7F_FFFF) as usize;
+                        let lu = ((u >> 11) << 4) | (u & 15);
+                        let dst = counts[lu] as usize;
+                        counts[lu] = (dst + 1) as u32;
+                        *csr_base.add(dst) = ClickSlot {
+                            key_and_alias: slot.key_and_alias,
+                            user_or_cid: slot.user_or_cid & MASK40,
+                        };
+                    }
+                }
+
+                for lc in 0..max_local_chunk {
+                    let chunk_u0 = (lc << 11) | (b << 4);
+                    let chunk_n = (user_cap - chunk_u0).min(16);
+                    let lu_base = lc << 4;
+                    for lo in 0..chunk_n {
+                        let end = counts[lu_base + lo] as usize;
+                        if end == 0 {
+                            continue;
+                        }
+                        let start = (*off_base.add(chunk_u0 + lo)).load(Relaxed) as usize;
+                        let len = end - start;
+                        if len > 2048 {
+                            local_whales.push((start, end));
+                        } else if len > 1 {
+                            let slice = std::slice::from_raw_parts_mut(csr_base.add(start), len);
+                            sort_click_slice(slice);
+                        }
+                    }
+                }
+            }
+            if !local_whales.is_empty() {
+                *worker_whales[tid].lock().unwrap() = local_whales;
+            }
+        });
+
+        let mut all_whales: Vec<(usize, usize)> = Vec::new();
+        for w in worker_whales {
+            all_whales.extend(w.into_inner().unwrap());
+        }
+        if !all_whales.is_empty() {
+            let next_w = AtomicUsize::new(0);
+            let whales_ref = &all_whales;
+            crate::sys::par(threads, |_| {
+                let csr_base = csr_ptr as *mut ClickSlot;
+                loop {
+                    let wi = next_w.fetch_add(1, Relaxed);
+                    let Some(&(s, e)) = whales_ref.get(wi) else {
+                        break;
+                    };
+                    let slice = std::slice::from_raw_parts_mut(csr_base.add(s), e - s);
+                    sort_click_slice(slice);
+                }
+            });
+        }
+
+        Self {
+            csr: Vec::new(),
+            data_ptr: out_base,
+            data_len: total_clicks,
+            csr_off,
+            csr_end,
+            user_cap,
+        }
     }
 }
 
@@ -1184,11 +1417,7 @@ pub fn sort_click_slice(slice: &mut [ClickSlot]) {
         5..=8 => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") {
-                    sort_clicks_le8_avx512(slice);
-                } else {
-                    sort_clicks_le8_avx2(slice);
-                }
+                sort_clicks_le8_avx2(slice);
             }
             #[cfg(not(target_arch = "x86_64"))]
             slice.sort_unstable_by_key(|s| s.sort_key60());
@@ -1198,11 +1427,7 @@ pub fn sort_click_slice(slice: &mut [ClickSlot]) {
         9..=16 => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") {
-                    sort_clicks_le16_avx512(slice);
-                } else {
-                    sort_clicks_le16_avx2(slice);
-                }
+                sort_clicks_le16_avx2(slice);
             }
             #[cfg(not(target_arch = "x86_64"))]
             slice.sort_unstable_by_key(|s| s.sort_key60());
@@ -1678,5 +1903,49 @@ mod tests {
             };
             assert_eq!(tok_to_vec(actual_winner_tok), expected_winner_cid);
         }
+
+        // Test 128 cyclic bucketed arena counting-sort CSR builder across whales and 'K...' ties
+        let ck_user_cap = 20_000usize;
+        let num_ck_buckets = 128usize;
+        let ck_arena = crate::scatter::Arena::<ClickSlot>::new(16_384, 512);
+        let mut sc0 = crate::scatter::Scatter::<ClickSlot, 4>::new();
+        let mut sc1 = crate::scatter::Scatter::<ClickSlot, 4>::new();
+        sc0.reset(num_ck_buckets);
+        sc1.reset(num_ck_buckets);
+        unsafe {
+            // Whale user 0 with 2500 clicks (> 2048 threshold) + 'K...' tie
+            for i in 0..2500usize {
+                let cid = scramble40(i as u64 + 10, ckey);
+                let slot = ClickSlot::new_parsed_cased(
+                    (2500 - i) as u32 * 10,
+                    (i % 7) as u32,
+                    (i % 4) as u8,
+                    0,
+                    cid,
+                    i == 77,
+                );
+                if i % 2 == 0 {
+                    sc0.push(&ck_arena, 0, slot);
+                } else {
+                    sc1.push(&ck_arena, 0, slot);
+                }
+            }
+            // User 17,000 in cyclic bucket (17_000 & 127) with tied ts between 'k' and 'K'
+            let s_low = ClickSlot::new_parsed_cased(500, 1, 0, 17_000, k_low, false);
+            let s_up = ClickSlot::new_parsed_cased(500, 2, 0, 17_000, k_up, true);
+            sc0.push(&ck_arena, (17_000 >> 4) & 127, s_low);
+            sc1.push(&ck_arena, (17_000 >> 4) & 127, s_up);
+            sc0.finish(&ck_arena);
+            sc1.finish(&ck_arena);
+        }
+        let ck_chunks = crate::scatter::by_partition(&[&sc0.log, &sc1.log], num_ck_buckets);
+        let b_csr = unsafe {
+            ClickCsr::from_bucketed_arena_par(ck_arena.base, &ck_chunks, ck_user_cap, 2)
+        };
+        assert_eq!(b_csr.csr_slice(0).len(), 2500);
+        assert!(b_csr.csr_slice(0).windows(2).all(|w| w[0].ts() <= w[1].ts()));
+        assert_eq!(b_csr.csr_slice(1).len(), 0);
+        assert_eq!(b_csr.csr_slice(17_000).len(), 2);
+        assert!(b_csr.csr_slice(17_000).last().unwrap().is_upper_k());
     }
 }

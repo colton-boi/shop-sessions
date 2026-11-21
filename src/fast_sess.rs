@@ -9,8 +9,8 @@ use crate::fast_links::min_token_for_mask;
 use crate::group::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Each event block covers `32,768` consecutive `event_index` values (`512 KiB` of 16-byte slots).
-pub const BLOCK_SHIFT: usize = 15;
+/// Each event block covers `16,384` consecutive `event_index` values (`256 KiB` of 16-byte slots).
+pub const BLOCK_SHIFT: usize = 14;
 pub const BLOCK_EVENTS: usize = 1 << BLOCK_SHIFT;
 pub const BLOCK_MASK: usize = BLOCK_EVENTS - 1;
 
@@ -29,12 +29,13 @@ pub const DAY_MAGIC_SHIFT: u32 = 39;
 pub const INVALID_W0: u64 = u64::MAX;
 /// Bit 63 in `FastEvRec::w1` marks a valid canonical-`eid` event whose `user_id` is odd/complex
 /// (chain user `alias >= 14`, kiosk `>= KIOSK_BASE`, or uppercase case variant).
-/// Bits `37..63` of `w1` then store the 26-bit `odd_handle` (`(tid << 20) | seq`).
+/// Bits `37..62` of `w1` store the 25-bit `user_idx` or `odd_handle` (`(tid << 20) | seq`);
+/// bit `62` + bits `14..16` can carry a 3-bit `sub_block` (`0..8`) during super-block scatter.
 pub const ODD_USER_BIT: u64 = 1u64 << 63;
 
-/// 16-byte packed event record for 32K-block direct-index dedup and sessionization:
+/// 16-byte packed event record for 16K-block direct-index dedup and sessionization:
 /// - `w0`: `(rel_ts_ms << 33) | (price_cents << 9) | (cat << 4) | alias` (or `u64::MAX` if invalid)
-/// - `w1`: `[bit 63: ODD_USER_BIT] | ((user_idx_or_handle & 0x3FF_FFFF) << 37) | (ingest_rel_sec << 16) | slot_with_gen`
+/// - `w1`: `[bit 63: ODD_USER_BIT] | [bit 62: sub_hi] | ((user_idx_or_handle & 0x1FF_FFFF) << 37) | (ingest_rel_sec << 16) | [bits 14..16: sub_lo] | slot_or_tag`
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct FastEvRec {
@@ -61,9 +62,9 @@ impl FastEvRec {
             | (((price_cents as u64) & 0xFF_FFFF) << 9)
             | (((cat as u64) & 0x1F) << 4)
             | ((alias as u64) & 0xF);
-        let w1 = (((user_idx as u64) & 0x3FF_FFFF) << 37)
+        let w1 = (((user_idx as u64) & 0x1FF_FFFF) << 37)
             | ((ing as u64) << 16)
-            | ((slot as u64) & 0x7FFF);
+            | ((slot as u64) & 0x3FFF);
         Self { w0, w1 }
     }
 
@@ -81,19 +82,35 @@ impl FastEvRec {
             | (((price_cents as u64) & 0xFF_FFFF) << 9)
             | (((cat as u64) & 0x1F) << 4);
         let w1 = ODD_USER_BIT
-            | (((odd_handle as u64) & 0x3FF_FFFF) << 37)
+            | (((odd_handle as u64) & 0x1FF_FFFF) << 37)
             | ((ing as u64) << 16)
-            | ((slot as u64) & 0x7FFF);
+            | ((slot as u64) & 0x3FFF);
         Self { w0, w1 }
     }
 
     #[inline(always)]
     pub const fn new_invalid(user_idx: u32, ingest_rel_sec: u32, slot: u16) -> Self {
         let ing = if ingest_rel_sec > 0x1F_FFFF { 0x1F_FFFF } else { ingest_rel_sec };
-        let w1 = (((user_idx as u64) & 0x3FF_FFFF) << 37)
+        let w1 = (((user_idx as u64) & 0x1FF_FFFF) << 37)
             | ((ing as u64) << 16)
-            | ((slot as u64) & 0x7FFF);
+            | ((slot as u64) & 0x3FFF);
         Self { w0: INVALID_W0, w1 }
+    }
+
+    /// Attaches a 3-bit sub-block index (`0..8`) in bits `14..16` and bit `62` of `w1`
+    /// for 2-level coarse-to-fine super-block scatter (`8` x 16K sub-blocks = `131,072` events).
+    #[inline(always)]
+    pub const fn with_sub_block(mut self, sub: u8) -> Self {
+        let s = (sub as u64) & 0x7;
+        self.w1 = (self.w1 & !((0x3u64 << 14) | (1u64 << 62)))
+            | ((s & 0x3) << 14)
+            | ((s >> 2) << 62);
+        self
+    }
+
+    #[inline(always)]
+    pub const fn sub_block(&self) -> usize {
+        (((self.w1 >> 14) & 0x3) | (((self.w1 >> 62) & 0x1) << 2)) as usize
     }
 
     #[inline(always)]
@@ -108,7 +125,7 @@ impl FastEvRec {
 
     #[inline(always)]
     pub const fn odd_handle(&self) -> u32 {
-        ((self.w1 >> 37) & 0x3FF_FFFF) as u32
+        ((self.w1 >> 37) & 0x1FF_FFFF) as u32
     }
 
     #[inline(always)]
@@ -133,7 +150,7 @@ impl FastEvRec {
 
     #[inline(always)]
     pub const fn user_idx(&self) -> u32 {
-        ((self.w1 >> 37) & 0x3FF_FFFF) as u32
+        ((self.w1 >> 37) & 0x1FF_FFFF) as u32
     }
 
     #[inline(always)]
@@ -143,7 +160,7 @@ impl FastEvRec {
 
     #[inline(always)]
     pub const fn slot(&self) -> usize {
-        (self.w1 & 0x7FFF) as usize
+        (self.w1 & 0x3FFF) as usize
     }
 }
 
@@ -489,7 +506,7 @@ impl FastSessWorker {
         if ((*slot).w1 as u16) != tag || rec.ingest_rel_sec() < (*slot).ingest_rel_sec() {
             *slot = FastEvRec {
                 w0: rec.w0,
-                w1: (rec.w1 & !0xFFFFu64) | (tag as u64),
+                w1: (rec.w1 & !(0xFFFFu64 | (1u64 << 62))) | (tag as u64),
             };
         }
     }
@@ -631,8 +648,9 @@ impl FastSessWorker {
         });
     }
 
-    /// Fuses compaction of occupied valid slots from `self.slots[0..32768]` into `q_w0` + `pkm`
+    /// Fuses compaction of occupied valid slots from `self.slots[0..BLOCK_EVENTS]` into `q_w0` + `pkm`
     /// with L1-tiled run/session boundary detection (`sts`, `s_ev_start`, `runs`).
+    /// Uses 256-bit AVX2 (avoiding 512-bit `zmm` frequency downclocking).
     #[inline(always)]
     fn compact_and_identify(&mut self, gen: u16) -> usize {
         self.sts.clear();
@@ -640,13 +658,6 @@ impl FastSessWorker {
         self.runs.clear();
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            if is_x86_feature_detected!("avx512f")
-                && is_x86_feature_detected!("avx512bw")
-                && is_x86_feature_detected!("avx512vl")
-                && is_x86_feature_detected!("avx512dq")
-            {
-                return self.compact_and_identify_avx512(gen);
-            }
             if is_x86_feature_detected!("avx2") {
                 return self.compact_and_identify_avx2(gen);
             }
@@ -1056,251 +1067,6 @@ impl FastSessWorker {
 
         if t > 0 {
             Self::flush_tile_avx2(
-                tile,
-                &mut self.sts,
-                &mut self.s_ev_start,
-                &mut self.runs,
-                total_k,
-                t,
-                &mut cur_run,
-                &mut has_started,
-            );
-            total_k += t;
-        }
-        if has_started {
-            cur_run.ev_end = total_k as u16;
-            cur_run.sess_end = self.sts.len() as u32;
-            self.runs.push(cur_run);
-            self.s_ev_start.push(total_k as u16);
-        }
-        total_k
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-    unsafe fn flush_tile_avx512(
-        tile: &mut RunTileBuf,
-        sts: &mut Vec<u32>,
-        s_ev_start: &mut Vec<u16>,
-        runs: &mut Vec<UserRun>,
-        total_k: usize,
-        t: usize,
-        cur_run: &mut UserRun,
-        has_started: &mut bool,
-    ) {
-        use std::arch::x86_64::*;
-        let end = 1 + t;
-        let mut i = if !*has_started {
-            *cur_run = UserRun {
-                user_idx: *tile.user.get_unchecked(1),
-                ev_start: total_k as u16,
-                ev_end: 0,
-                sess_start: sts.len() as u32,
-                sess_end: 0,
-                alias_mask: 1u16 << (*tile.alias.get_unchecked(1)),
-                unsorted: false,
-            };
-            sts.push(*tile.ts.get_unchecked(1));
-            s_ev_start.push(total_k as u16);
-            *has_started = true;
-            2usize
-        } else {
-            1usize
-        };
-
-        let v_gap = _mm512_set1_epi32(SESSION_GAP_MS as i32);
-        let u_ptr = tile.user.as_ptr();
-        let ts_ptr = tile.ts.as_ptr();
-        let alias_ptr = tile.alias.as_ptr();
-
-        while i + 16 <= end {
-            let u_cur = _mm512_loadu_si512(u_ptr.add(i) as *const __m512i);
-            let u_prev = _mm512_loadu_si512(u_ptr.add(i - 1) as *const __m512i);
-            let u_start_mask = _mm512_cmpneq_epi32_mask(u_cur, u_prev) as u32;
-
-            let ts_cur = _mm512_loadu_si512(ts_ptr.add(i) as *const __m512i);
-            let ts_prev = _mm512_loadu_si512(ts_ptr.add(i - 1) as *const __m512i);
-
-            let lt_mask = _mm512_cmplt_epu32_mask(ts_cur, ts_prev) as u32;
-            let unsorted_mask = lt_mask & !u_start_mask;
-
-            let diff = _mm512_sub_epi32(ts_cur, ts_prev);
-            let gt_gap_mask = (_mm512_cmpgt_epu32_mask(diff, v_gap) as u32) & !lt_mask;
-
-            let any_boundary = u_start_mask | gt_gap_mask | unsorted_mask;
-            if any_boundary == 0 {
-                let ap = alias_ptr.add(i);
-                let a0 = *ap;
-                let rep = (a0 as u64).wrapping_mul(0x0101_0101_0101_0101);
-                if (ap as *const u64).read_unaligned() == rep
-                    && (ap.add(8) as *const u64).read_unaligned() == rep
-                {
-                    cur_run.alias_mask |= 1u16 << a0;
-                } else {
-                    let mut m = cur_run.alias_mask;
-                    for lane in 0..16 {
-                        m |= 1u16 << (*alias_ptr.add(i + lane));
-                    }
-                    cur_run.alias_mask = m;
-                }
-            } else {
-                for lane in 0..16 {
-                    let idx = i + lane;
-                    let g_idx = (total_k + idx - 1) as u16;
-                    let bit = 1u32 << lane;
-                    let alias = *alias_ptr.add(idx);
-                    if (u_start_mask & bit) != 0 {
-                        cur_run.ev_end = g_idx;
-                        cur_run.sess_end = sts.len() as u32;
-                        runs.push(*cur_run);
-
-                        let u = *u_ptr.add(idx);
-                        let ts = *ts_ptr.add(idx);
-                        *cur_run = UserRun {
-                            user_idx: u,
-                            ev_start: g_idx,
-                            ev_end: 0,
-                            sess_start: sts.len() as u32,
-                            sess_end: 0,
-                            alias_mask: 1u16 << alias,
-                            unsorted: false,
-                        };
-                        sts.push(ts);
-                        s_ev_start.push(g_idx);
-                    } else {
-                        cur_run.alias_mask |= 1u16 << alias;
-                        if (unsorted_mask & bit) != 0 {
-                            cur_run.unsorted = true;
-                        } else if (gt_gap_mask & bit) != 0 {
-                            sts.push(*ts_ptr.add(idx));
-                            s_ev_start.push(g_idx);
-                        }
-                    }
-                }
-            }
-            i += 16;
-        }
-
-        while i < end {
-            let g_idx = (total_k + i - 1) as u16;
-            let u = *u_ptr.add(i);
-            let ts = *ts_ptr.add(i);
-            let prev_ts = *ts_ptr.add(i - 1);
-            let alias = *alias_ptr.add(i);
-            if u != cur_run.user_idx {
-                cur_run.ev_end = g_idx;
-                cur_run.sess_end = sts.len() as u32;
-                runs.push(*cur_run);
-
-                *cur_run = UserRun {
-                    user_idx: u,
-                    ev_start: g_idx,
-                    ev_end: 0,
-                    sess_start: sts.len() as u32,
-                    sess_end: 0,
-                    alias_mask: 1u16 << alias,
-                    unsorted: false,
-                };
-                sts.push(ts);
-                s_ev_start.push(g_idx);
-            } else {
-                cur_run.alias_mask |= 1u16 << alias;
-                if ts < prev_ts {
-                    cur_run.unsorted = true;
-                } else if ts - prev_ts > SESSION_GAP_MS {
-                    sts.push(ts);
-                    s_ev_start.push(g_idx);
-                }
-            }
-            i += 1;
-        }
-
-        tile.user[0] = *u_ptr.add(t);
-        tile.ts[0] = *ts_ptr.add(t);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-    unsafe fn compact_and_identify_avx512(&mut self, gen: u16) -> usize {
-        use std::arch::x86_64::*;
-        self.pkm.fill(0);
-        let mut total_k = 0usize;
-        let mut t = 0usize;
-        let mut cur_run = UserRun::default();
-        let mut has_started = false;
-
-        let tags = _mm512_setr_epi64(
-            0u16.wrapping_add(gen) as i64,
-            1u16.wrapping_add(gen) as i64,
-            2u16.wrapping_add(gen) as i64,
-            3u16.wrapping_add(gen) as i64,
-            4u16.wrapping_add(gen) as i64,
-            5u16.wrapping_add(gen) as i64,
-            6u16.wrapping_add(gen) as i64,
-            7u16.wrapping_add(gen) as i64,
-        );
-        let mask16 = _mm512_set1_epi64(0xFFFF);
-        let inv_w0 = _mm512_set1_epi64(-1);
-        let idx_even = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
-        let idx_odd = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-        let mut w0_buf = [0u64; 8];
-        let mut w1_buf = [0u64; 8];
-
-        let slots_ptr = self.slots.as_ptr() as *const __m512i;
-        let tile = &mut *self.tile;
-        for chunk in 0..(BLOCK_EVENTS / 8) {
-            let v0 = _mm512_loadu_si512(slots_ptr.add(chunk * 2));
-            let v1 = _mm512_loadu_si512(slots_ptr.add(chunk * 2 + 1));
-            let w0 = _mm512_permutex2var_epi64(v0, idx_even, v1);
-            let w1 = _mm512_permutex2var_epi64(v0, idx_odd, v1);
-
-            let slot_tags = _mm512_and_si512(w1, mask16);
-            let occupied = _mm512_cmpeq_epi64_mask(slot_tags, tags);
-            let valid = _mm512_cmpneq_epi64_mask(w0, inv_w0);
-            let live = occupied & valid;
-            if live == 0 {
-                continue;
-            }
-            let cnt = live.count_ones() as usize;
-            _mm512_mask_compressstoreu_epi64(w0_buf.as_mut_ptr() as *mut i64, live, w0);
-            _mm512_mask_compressstoreu_epi64(w1_buf.as_mut_ptr() as *mut i64, live, w1);
-
-            for i in 0..cnt {
-                let cw0 = w0_buf[i];
-                let cw1 = w1_buf[i];
-                if (cw1 & ODD_USER_BIT) != 0 {
-                    let handle = ((cw1 >> 37) & 0x3FF_FFFF) as u32;
-                    self.kept_odd_events.push((handle, cw0));
-                    continue;
-                }
-                let k = total_k + t;
-                let tp = 1 + t;
-                *self.q_w0.get_unchecked_mut(k) = cw0;
-                *tile.user.get_unchecked_mut(tp) = ((cw1 >> 37) & 0x3FF_FFFF) as u32;
-                *tile.ts.get_unchecked_mut(tp) = (cw0 >> 33) as u32;
-                *tile.alias.get_unchecked_mut(tp) = (cw0 & 0xF) as u8;
-                let is_purch = ((cw0 >> 9) & 0xFF_FFFF) != 0;
-                *self.pkm.get_unchecked_mut(k >> 6) |= (is_purch as u64) << (k & 63);
-                t += 1;
-            }
-            if t >= TILE_FLUSH {
-                Self::flush_tile_avx512(
-                    tile,
-                    &mut self.sts,
-                    &mut self.s_ev_start,
-                    &mut self.runs,
-                    total_k,
-                    t,
-                    &mut cur_run,
-                    &mut has_started,
-                );
-                total_k += t;
-                t = 0;
-            }
-        }
-
-        if t > 0 {
-            Self::flush_tile_avx512(
                 tile,
                 &mut self.sts,
                 &mut self.s_ev_start,
@@ -1964,15 +1730,12 @@ impl FastSessWorker {
 
 /// Computes the 16-bit mask of clicks `k in 0..nck` (`nck <= 16`) that satisfy
 /// `0 <= sess_ts - ck_ts[k] <= WEEK_MS` (i.e. `sess_ts.wrapping_sub(ck_ts[k]) <= WEEK_MS`).
-/// Dispatches to AVX-512 on Cascade Lake and AVX2 on Zen 3.
+/// Uses 256-bit AVX2 on x86_64 (avoiding 512-bit `zmm` frequency downclocking).
 #[inline(always)]
 pub fn compute_click_window_mask_16(sess_ts: u32, nck: usize, ck_ts: &[u32; 16]) -> u16 {
     let valid_lanes = ((1u32 << nck) - 1) as u16;
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if is_x86_feature_detected!("avx512f") {
-            return compute_click_window_mask_16_avx512(sess_ts, ck_ts) & valid_lanes;
-        }
         if is_x86_feature_detected!("avx2") {
             return compute_click_window_mask_16_avx2(sess_ts, ck_ts) & valid_lanes;
         }
@@ -1984,17 +1747,6 @@ pub fn compute_click_window_mask_16(sess_ts: u32, nck: usize, ck_ts: &[u32; 16])
         }
     }
     m
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-unsafe fn compute_click_window_mask_16_avx512(sess_ts: u32, ck_ts: &[u32; 16]) -> u16 {
-    use std::arch::x86_64::*;
-    let v_sess = _mm512_set1_epi32(sess_ts as i32);
-    let v_ck = _mm512_loadu_si512(ck_ts.as_ptr() as *const __m512i);
-    let diff = _mm512_sub_epi32(v_sess, v_ck);
-    let v_week = _mm512_set1_epi32(WEEK_MS as i32);
-    _mm512_cmple_epu32_mask(diff, v_week)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2244,8 +1996,8 @@ mod tests {
         // Block 0: user 0 (head) and user 1 (tail: 2 events at t0 and t0 + 10_000)
         let block0 = vec![
             FastEvRec::new_valid(t0, 0, 0, 0, 0, 100, 0),
-            FastEvRec::new_valid(t0, 150, 3, 0, 1, 100, 32766),
-            FastEvRec::new_valid(t0 + 10_000, 0, 0, 1, 1, 100, 32767),
+            FastEvRec::new_valid(t0, 150, 3, 0, 1, 100, (BLOCK_EVENTS - 2) as u16),
+            FastEvRec::new_valid(t0 + 10_000, 0, 0, 1, 1, 100, (BLOCK_EVENTS - 1) as u16),
         ];
         // Block 1: user 1 continues at head (1 event at t0 + 20_000, within 30 min of block 0's tail!) and user 2 (tail)
         let block1 = vec![
@@ -2280,7 +2032,7 @@ mod tests {
     fn test_gt16_clicks_and_full_pipeline_benchmark() {
         let ukey = 0x9999_AAAA_BBBBu64 & MASK40;
         let ckey = 0xCCCC_DDDD_EEEEu64 & MASK40;
-        let num_users = 2048usize;
+        let num_users = 1024usize;
         let mut tab = UserAliasTable::new(num_users, ukey);
         let mut intra = Vec::with_capacity(num_users * 2);
         for u in 0..num_users as u32 {
@@ -2308,7 +2060,7 @@ mod tests {
         assert!(csr.finalize_and_sort(ckey));
         let csr_us = t1.elapsed().as_secs_f64() * 1e6;
 
-        // Build one full 32,768-event block across users 0..2048 (16 events per user)
+        // Build one full 16,384-event block across users 0..1024 (16 events per user)
         let mut block_evs = Vec::with_capacity(BLOCK_EVENTS);
         for u in 0..num_users as u32 {
             for e in 0..16u32 {
@@ -2348,12 +2100,27 @@ mod tests {
         let total_sessions: u32 = cells.iter().map(|c| c.sessions).sum();
         assert_eq!(total_sessions, (num_users * 2) as u32);
         eprintln!(
-            "[fast-core bench] 2048 users: link_resolve={link_us:.1} us, click_csr_sort({total_clicks} clicks)={csr_us:.1} us, 32K_block_dedup_and_sessionize={sess_us:.1} us"
+            "[fast-core bench] {num_users} users: link_resolve={link_us:.1} us, click_csr_sort({total_clicks} clicks)={csr_us:.1} us, 16K_block_dedup_and_sessionize={sess_us:.1} us"
         );
     }
 
     #[test]
     fn test_compact_and_identify_avx2_and_push_person_name_exact() {
+        // Verify FastEvRec::with_sub_block / sub_block / slot / user_idx / odd_handle
+        for sub in 0..8u8 {
+            let r = FastEvRec::new_valid(123_456, 999, 7, 3, 2_300_000, 500, 16_383).with_sub_block(sub);
+            assert_eq!(r.sub_block(), sub as usize);
+            assert_eq!(r.slot(), 16_383);
+            assert_eq!(r.user_idx(), 2_300_000);
+            assert!(!r.is_odd_user());
+
+            let ro = FastEvRec::new_odd_user(123_456, 999, 7, (31 << 20) | 999_999, 500, 12_345).with_sub_block(sub);
+            assert_eq!(ro.sub_block(), sub as usize);
+            assert_eq!(ro.slot(), 12_345);
+            assert_eq!(ro.odd_handle(), (31 << 20) | 999_999);
+            assert!(ro.is_odd_user());
+        }
+
         let mut w_scalar = FastSessWorker::new(4, 14);
         let mut w_avx2 = FastSessWorker::new(4, 14);
         let gen = 8u16;
@@ -2364,10 +2131,10 @@ mod tests {
         // - slots 0..1200: dense normal valid events (hits `live_perm == 0xF && odd_perm == 0` fast path,
         //   multiple users, session gaps, unsorted timestamps, and purchase bits across u64 pkm boundaries)
         // - slots 1200..1500: sparse pattern (holes, INVALID_W0, odd-user events, stale-gen tags)
-        // - slots 32760..32768: tail dense 4-slot groups
+        // - slots (BLOCK_EVENTS - 8)..BLOCK_EVENTS: tail dense 4-slot groups
         for idx in 0..BLOCK_EVENTS {
             let tag = ((idx as u16) & 7).wrapping_add(gen);
-            let rec = if idx < 1200 || idx >= 32760 {
+            let rec = if idx < 1200 || idx >= BLOCK_EVENTS - 8 {
                 let price = if idx % 5 == 0 { 199 + idx as u32 } else { 0 };
                 let u = (idx / 5) as u32;
                 let ts_off = if idx % 17 == 13 { 0 } else { (idx as u32) * 400_000 };

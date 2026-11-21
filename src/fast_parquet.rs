@@ -911,14 +911,12 @@ unsafe fn encode_top_category_defs_avx2(
 }
 
 /// Checks whether a slice of `i32` has identical min and max (and returns `(min, max)`).
+/// Uses 256-bit AVX2 on x86_64 (avoiding 512-bit `zmm` frequency downclocking).
 #[inline(always)]
 pub fn min_max_i32(slice: &[i32]) -> (i32, i32) {
     debug_assert!(!slice.is_empty());
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") {
-            return unsafe { min_max_i32_avx512(slice) };
-        }
         return unsafe { min_max_i32_avx2(slice) };
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -935,35 +933,6 @@ pub fn min_max_i32(slice: &[i32]) -> (i32, i32) {
         }
         (lo, hi)
     }
-}
-
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-unsafe fn min_max_i32_avx512(slice: &[i32]) -> (i32, i32) {
-    let n = slice.len();
-    let ptr = slice.as_ptr();
-    let mut i = 0usize;
-    let first = *ptr;
-    let mut vmin = _mm512_set1_epi32(first);
-    let mut vmax = vmin;
-    while i + 16 <= n {
-        let v = _mm512_loadu_si512(ptr.add(i) as *const _);
-        vmin = _mm512_min_epi32(vmin, v);
-        vmax = _mm512_max_epi32(vmax, v);
-        i += 16;
-    }
-    let mut lo = _mm512_reduce_min_epi32(vmin);
-    let mut hi = _mm512_reduce_max_epi32(vmax);
-    while i < n {
-        let v = *ptr.add(i);
-        if v < lo {
-            lo = v;
-        }
-        if v > hi {
-            hi = v;
-        }
-        i += 1;
-    }
-    (lo, hi)
 }
 
 #[target_feature(enable = "avx2,bmi2,lzcnt")]
@@ -1005,19 +974,6 @@ unsafe fn min_max_i32_avx2(slice: &[i32]) -> (i32, i32) {
         i += 1;
     }
     (lo, hi)
-}
-
-/// Computes a 16-bit mask of rows in `0..len` (`len <= 16`) that have `rev == 0 && cat == 0xFF`.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-unsafe fn zero_rev_mask16_avx512(rev: *const i32, cat: *const u8, len: usize) -> u16 {
-    let k: __mmask16 = ((1u32 << len) - 1) as u16;
-    let r = _mm512_maskz_loadu_epi32(k, rev as *const _);
-    let r_zero = _mm512_mask_cmpeq_epi32_mask(k, r, _mm512_setzero_si512());
-    let mut c_buf = [0u8; 16];
-    std::ptr::copy_nonoverlapping(cat, c_buf.as_mut_ptr(), len);
-    let c = _mm_loadu_si128(c_buf.as_ptr() as *const __m128i);
-    let c_null = _mm_cmpeq_epi8_mask(c, _mm_set1_epi8(-1));
-    r_zero & c_null & k
 }
 
 /// Computes an 8-bit mask of rows in `0..len` (`len <= 8`) that have `rev == 0 && cat == 0xFF`.
@@ -1078,21 +1034,14 @@ fn compact_person_dict(
 /// 1. `zero_rev`: rows where `revenue_cents == 0 && top_category == 0xFF`
 /// 2. `non_zero`: rows where `revenue_cents != 0 || top_category != 0xFF`
 ///
-/// Uses AVX-512 on Cascade Lake / Ice Lake and AVX2 on Zen 3 / x86-64-v3.
+/// Uses 256-bit AVX2 (avoiding 512-bit `zmm` frequency downclocking).
 pub fn split_zero_revenue_chunks<'a>(
     cols: &UserDailyCols<'a>,
     scratch: &'a mut SplitScratch,
 ) -> (UserDailyCols<'a>, UserDailyCols<'a>) {
     let n = cols.len();
     scratch.prepare(n);
-    if is_x86_feature_detected!("avx512f")
-        && is_x86_feature_detected!("avx512bw")
-        && is_x86_feature_detected!("avx512vl")
-    {
-        unsafe { split_zero_revenue_avx512(cols, scratch) };
-    } else {
-        unsafe { split_zero_revenue_avx2(cols, scratch) };
-    }
+    unsafe { split_zero_revenue_avx2(cols, scratch) };
     compact_person_dict(
         cols.names_data,
         cols.names_offsets,
@@ -1132,98 +1081,6 @@ pub fn split_zero_revenue_chunks<'a>(
         cat_dict_offsets: cols.cat_dict_offsets,
     };
     (zero, nonz)
-}
-
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-unsafe fn split_zero_revenue_avx512(cols: &UserDailyCols<'_>, scratch: &mut SplitScratch) {
-    let n = cols.len();
-    let mut i = 0usize;
-    let mut z_len = 0usize;
-    let mut nz_len = 0usize;
-
-    let zp = scratch.zero_person.as_mut_ptr();
-    let zd = scratch.zero_day.as_mut_ptr();
-    let zs = scratch.zero_sessions.as_mut_ptr();
-    let ze = scratch.zero_events.as_mut_ptr();
-
-    let nzp = scratch.nonz_person.as_mut_ptr();
-    let nzd = scratch.nonz_day.as_mut_ptr();
-    let nzs = scratch.nonz_sessions.as_mut_ptr();
-    let nze = scratch.nonz_events.as_mut_ptr();
-    let nzr = scratch.nonz_revenue.as_mut_ptr();
-    let nzc = scratch.nonz_category.as_mut_ptr();
-
-    while i + 16 <= n {
-        let zmask = zero_rev_mask16_avx512(cols.revenue_cents.as_ptr().add(i), cols.top_category.as_ptr().add(i), 16);
-        let nzmask = !zmask;
-        let z_cnt = zmask.count_ones() as usize;
-        let nz_cnt = 16 - z_cnt;
-
-        let vp = _mm512_loadu_si512(cols.person_keys.as_ptr().add(i) as *const _);
-        let vd = _mm512_loadu_si512(cols.day.as_ptr().add(i) as *const _);
-        let vs = _mm512_loadu_si512(cols.sessions.as_ptr().add(i) as *const _);
-        let ve = _mm512_loadu_si512(cols.events.as_ptr().add(i) as *const _);
-
-        _mm512_mask_compressstoreu_epi32(zp.add(z_len) as *mut _, zmask, vp);
-        _mm512_mask_compressstoreu_epi32(zd.add(z_len) as *mut _, zmask, vd);
-        _mm512_mask_compressstoreu_epi32(zs.add(z_len) as *mut _, zmask, vs);
-        _mm512_mask_compressstoreu_epi32(ze.add(z_len) as *mut _, zmask, ve);
-        z_len += z_cnt;
-
-        if nz_cnt > 0 {
-            let vr = _mm512_loadu_si512(cols.revenue_cents.as_ptr().add(i) as *const _);
-            _mm512_mask_compressstoreu_epi32(nzp.add(nz_len) as *mut _, nzmask, vp);
-            _mm512_mask_compressstoreu_epi32(nzd.add(nz_len) as *mut _, nzmask, vd);
-            _mm512_mask_compressstoreu_epi32(nzs.add(nz_len) as *mut _, nzmask, vs);
-            _mm512_mask_compressstoreu_epi32(nze.add(nz_len) as *mut _, nzmask, ve);
-            _mm512_mask_compressstoreu_epi32(nzr.add(nz_len) as *mut _, nzmask, vr);
-            let mut m = nzmask;
-            let mut dst_c = nzc.add(nz_len);
-            while m != 0 {
-                let bit = m.trailing_zeros() as usize;
-                *dst_c = *cols.top_category.get_unchecked(i + bit);
-                dst_c = dst_c.add(1);
-                m &= m - 1;
-            }
-            nz_len += nz_cnt;
-        }
-        i += 16;
-    }
-
-    while i < n {
-        let rev = *cols.revenue_cents.get_unchecked(i);
-        let cat = *cols.top_category.get_unchecked(i);
-        if rev == 0 && cat == NULL_CAT {
-            *zp.add(z_len) = *cols.person_keys.get_unchecked(i);
-            *zd.add(z_len) = *cols.day.get_unchecked(i);
-            *zs.add(z_len) = *cols.sessions.get_unchecked(i);
-            *ze.add(z_len) = *cols.events.get_unchecked(i);
-            z_len += 1;
-        } else {
-            *nzp.add(nz_len) = *cols.person_keys.get_unchecked(i);
-            *nzd.add(nz_len) = *cols.day.get_unchecked(i);
-            *nzs.add(nz_len) = *cols.sessions.get_unchecked(i);
-            *nze.add(nz_len) = *cols.events.get_unchecked(i);
-            *nzr.add(nz_len) = rev;
-            *nzc.add(nz_len) = cat;
-            nz_len += 1;
-        }
-        i += 1;
-    }
-
-    scratch.zero_person.set_len(z_len);
-    scratch.zero_day.set_len(z_len);
-    scratch.zero_sessions.set_len(z_len);
-    scratch.zero_events.set_len(z_len);
-    scratch.zero_revenue.resize(z_len, 0);
-    scratch.zero_category.resize(z_len, NULL_CAT);
-
-    scratch.nonz_person.set_len(nz_len);
-    scratch.nonz_day.set_len(nz_len);
-    scratch.nonz_sessions.set_len(nz_len);
-    scratch.nonz_events.set_len(nz_len);
-    scratch.nonz_revenue.set_len(nz_len);
-    scratch.nonz_category.set_len(nz_len);
 }
 
 #[target_feature(enable = "avx2,bmi2,lzcnt")]

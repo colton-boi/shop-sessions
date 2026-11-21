@@ -113,15 +113,10 @@ pub fn unscramble40_x8_scalar(y: [u64; 8], key: u64) -> [u64; 8] {
     ]
 }
 
-/// 8-way parallel `unscramble40` with runtime AVX-512DQ dispatch.
+/// 8-way parallel `unscramble40` using the 2-phase ILP scalar implementation
+/// (avoids 512-bit AVX-512 turbo downclocking on Cascade Lake).
 #[inline(always)]
 pub fn unscramble40_x8(y: [u64; 8], key: u64) -> [u64; 8] {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
-            return unsafe { unscramble40_x8_avx512(y, key) };
-        }
-    }
     unscramble40_x8_scalar(y, key)
 }
 
@@ -348,22 +343,14 @@ pub unsafe fn decode_b36_x4(
     out
 }
 
-/// AVX-512 8-way base36 decoder for 8 IDs, with runtime fallback to two AVX2 4-way calls.
+/// 8-way base36 decoder for 8 IDs via two AVX2 4-way calls
+/// (avoids 512-bit AVX-512 turbo downclocking).
 #[inline(always)]
 pub unsafe fn decode_b36_x8(
     ptrs: [*const u8; 8],
     lens: [usize; 8],
     prefixes: [u8; 8],
 ) -> [Option<u64>; 8] {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vl")
-        {
-            return decode_b36_x8_avx512(ptrs, lens, prefixes);
-        }
-    }
     let lo = decode_b36_x4(
         [ptrs[0], ptrs[1], ptrs[2], ptrs[3]],
         [lens[0], lens[1], lens[2], lens[3]],
