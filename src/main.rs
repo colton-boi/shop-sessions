@@ -747,5 +747,5 @@ fn main() {
     let rows = [&d_chunks, &p_chunks, &c_chunks].map(|c| c.iter().map(size_of).sum::<u64>());
     diag::summary(t0.elapsed().as_secs_f64(), &stages, ru.0, ru.1, rows);
     sys::prof::finish();
-    std::process::exit(0);
+    sys::exit_now();
 }
