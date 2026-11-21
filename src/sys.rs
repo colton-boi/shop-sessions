@@ -4,6 +4,7 @@ use std::os::raw::{c_int, c_void};
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
     fn syscall(number: i64, ...) -> i64;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn getrusage(who: c_int, usage: *mut [i64; 18]) -> c_int;
@@ -128,6 +129,9 @@ fn probe_host(data_dir: &std::path::Path) -> HostProfile {
     let o9 = order9_free();
     let thp = if std::env::var_os("SS_NOHUGE").is_some() {
         ThpPolicy::NoHuge
+    } else if std::env::var_os("SS_THP").is_some_and(|v| v == "advise") {
+        // Models the scorer's thp=madvise on a host whose THP mode is `always`.
+        ThpPolicy::AdviseHuge
     } else if bracketed(&en, "always") {
         // Without MADV_HUGEPAGE the kernel allocates huge pages opportunistically and never stalls to compact.
         ThpPolicy::DefaultHuge
@@ -164,38 +168,50 @@ pub fn host_profile() -> &'static HostProfile {
     HOST_PROFILE.get_or_init(|| probe_host(std::path::Path::new("/data")))
 }
 
-/// A whole file mapped copy-on-write, with a zero page of slack on both sides
-/// and a newline written after the last byte when the file lacks one.
-pub fn map_file(file: &std::fs::File, size: usize) -> (*const u8, usize) {
+const PAGE: usize = 4096;
+
+/// A whole file mapped read-only, with a zero page before it (`ts::digits` loads up to 15 bytes
+/// backward) and at least one after it. Files of 2 MiB or more start on a 2 MiB boundary so a page
+/// cache of huge folios can be mapped with PMDs. Nothing is read here: see `end_line`.
+pub fn map_file(file: &std::fs::File, size: usize) -> *const u8 {
     use std::os::unix::io::AsRawFd;
-    const PAGE: usize = 4096;
     if size == 0 {
-        return (std::ptr::null(), 0);
+        return std::ptr::null();
     }
-    let span = (size + PAGE - 1) / PAGE * PAGE + 2 * PAGE;
+    let align = if size >= HUGE { HUGE } else { PAGE };
+    let span = PAGE + size.div_ceil(PAGE) * PAGE + PAGE + align;
     unsafe {
-        let base = mmap(std::ptr::null_mut(), span, 3, 0x02 | 0x20 | 0x4000, -1, 0) as *mut u8;
+        // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+        let base = mmap(std::ptr::null_mut(), span, 1, 0x02 | 0x20 | 0x4000, -1, 0) as usize;
         assert!(base as isize != -1, "mmap reserve failed");
-        let data = base.add(PAGE);
+        let data = (base + PAGE + align - 1) & !(align - 1);
         // MAP_PRIVATE | MAP_FIXED over the reserved span.
-        let p = mmap(data as *mut c_void, size, 3, 0x02 | 0x10, file.as_raw_fd(), 0);
-        assert!(p as *mut u8 == data, "mmap of input failed");
-        if *data.add(size - 1) != b'\n' {
-            *data.add(size) = b'\n';
-            return (data, size + 1);
-        }
-        (data, size)
+        let p = mmap(data as *mut c_void, size, 1, 0x02 | 0x10, file.as_raw_fd(), 0);
+        assert!(p as usize == data, "mmap of input failed");
+        data as *const u8
     }
 }
 
-/// Drops the page tables of a `map_file` mapping of a file of `size` bytes.
+/// The length of a `map_file` mapping once it ends with a newline: when the file lacks one, a
+/// newline is written after its last byte (into a private copy of that page).
+pub unsafe fn end_line(data: *const u8, size: usize) -> usize {
+    if size == 0 || *data.add(size - 1) == b'\n' {
+        return size;
+    }
+    let at = data.add(size) as usize;
+    // PROT_READ | PROT_WRITE
+    assert!(mprotect((at & !(PAGE - 1)) as *mut c_void, PAGE, 3) == 0, "mprotect failed");
+    *(at as *mut u8) = b'\n';
+    size + 1
+}
+
+/// Drops the page tables of the first `size` bytes of a `map_file` mapping.
 /// MADV_DONTNEED needs only the read side of the mmap lock, where munmap would
 /// stall every other thread's page faults; the empty mapping then costs
 /// nothing at exit.
 pub fn unmap_file(data: *const u8, size: usize) {
-    const PAGE: usize = 4096;
     if size != 0 {
-        unsafe { madvise(data.sub(PAGE) as *mut c_void, (size + PAGE - 1) / PAGE * PAGE + 2 * PAGE, 4) };
+        unsafe { madvise(data as *mut c_void, size.div_ceil(PAGE) * PAGE, 4) };
     }
 }
 
