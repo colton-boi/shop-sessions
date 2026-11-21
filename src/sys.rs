@@ -118,9 +118,117 @@ pub fn map_zeroed(bytes: usize) -> *mut u8 {
     p as *mut u8
 }
 
+/// Persistent workers for `par`: spawning threads for every stage costs 0.1 to 0.2 ms each time plus wake-up
+/// latency, so the workers start once, spin briefly between stages and then sleep on a futex.
+mod pool {
+    use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering::*};
+    use std::sync::OnceLock;
+
+    type Job<'a> = &'a (dyn Fn(usize) + Sync);
+
+    pub struct Pool {
+        workers: usize,
+        job: AtomicPtr<Job<'static>>,
+        /// Generation << 10 | thread count of the current job, in one word so a worker never pairs a count
+        /// with the wrong generation.
+        epoch: AtomicU32,
+        pending: AtomicU32,
+    }
+
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    const SPIN: u32 = 1 << 14;
+
+    fn futex_wait(word: &AtomicU32, value: u32) {
+        unsafe { super::syscall(202, word as *const AtomicU32, 128, value, std::ptr::null::<u8>()) };
+    }
+
+    fn futex_wake(word: &AtomicU32) {
+        unsafe { super::syscall(202, word as *const AtomicU32, 129, i32::MAX) };
+    }
+
+    /// Waits until `word` differs from `value`.
+    fn wait_change(word: &AtomicU32, value: u32) {
+        for _ in 0..SPIN {
+            if word.load(Acquire) != value {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        while word.load(Acquire) == value {
+            futex_wait(word, value);
+        }
+    }
+
+    /// Starts `workers` threads, once; later calls keep the first pool.
+    pub fn start(workers: usize) -> &'static Pool {
+        POOL.get_or_init(|| {
+            let pool = Pool {
+                workers,
+                job: AtomicPtr::new(std::ptr::null_mut()),
+                epoch: AtomicU32::new(0),
+                pending: AtomicU32::new(0),
+            };
+            for t in 1..=workers {
+                std::thread::Builder::new()
+                    .stack_size(2 << 20)
+                    .spawn(move || {
+                        let pool = POOL.wait();
+                        let mut seen = 0;
+                        loop {
+                            wait_change(&pool.epoch, seen);
+                            seen = pool.epoch.load(Acquire);
+                            if (t as u32) < seen & 1023 {
+                                let job = unsafe { *pool.job.load(Acquire) };
+                                job(t);
+                                if pool.pending.fetch_sub(1, AcqRel) == 1 {
+                                    futex_wake(&pool.pending);
+                                }
+                            }
+                        }
+                    })
+                    .unwrap();
+            }
+            pool
+        })
+    }
+
+    /// Runs `f(0..n)` with `f(0)` on the caller; false when the pool is too small.
+    pub fn run(n: usize, f: Job) -> bool {
+        let Some(pool) = POOL.get() else { return false };
+        if n - 1 > pool.workers || n > 1023 {
+            return false;
+        }
+        let job: *const Job = &f;
+        pool.job.store(job as *mut Job<'static>, Release);
+        pool.pending.store(n as u32 - 1, Release);
+        let epoch = pool.epoch.load(Relaxed);
+        pool.epoch.store(((epoch >> 10).wrapping_add(1) << 10) | n as u32, Release);
+        futex_wake(&pool.epoch);
+        f(0);
+        loop {
+            let left = pool.pending.load(Acquire);
+            if left == 0 {
+                break;
+            }
+            wait_change(&pool.pending, left);
+        }
+        true
+    }
+}
+
+/// Starts the persistent workers that `par` uses for up to `threads` threads.
+pub fn start_pool(threads: usize) {
+    if threads > 1 && std::env::var_os("SS_NOPOOL").is_none() {
+        pool::start(threads - 1);
+    }
+}
+
 pub fn par<F: Fn(usize) + Sync>(n: usize, f: F) {
     if n == 1 {
         f(0);
+        return;
+    }
+    if pool::run(n, &f) {
         return;
     }
     std::thread::scope(|s| {

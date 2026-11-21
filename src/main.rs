@@ -438,6 +438,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .clamp(1, 256);
+    sys::start_pool(threads);
     diag::host(threads);
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
