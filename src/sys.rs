@@ -5,6 +5,7 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
     fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+    fn mallopt(param: c_int, value: c_int) -> c_int;
     fn syscall(number: i64, ...) -> i64;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn getrusage(who: c_int, usage: *mut [i64; 18]) -> c_int;
@@ -411,6 +412,19 @@ pub fn mix(x: u64) -> u64 {
     let x = (x ^ (x >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let x = (x ^ (x >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x ^ (x >> 32)
+}
+
+/// Large buffers come from the heap and stay there when freed, instead of a fresh mmap (faults,
+/// zeroing) and a munmap (TLB shootdown) each time a growing Vec moves.
+pub fn tune_malloc() {
+    if std::env::var_os("SS_MALLOC_DEFAULT").is_some() {
+        return;
+    }
+    unsafe {
+        mallopt(-3, 32 << 20); // M_MMAP_THRESHOLD, at its maximum
+        mallopt(-1, -1); // M_TRIM_THRESHOLD: never trim
+        mallopt(-2, 16 << 20); // M_TOP_PAD
+    }
 }
 
 /// Ends the process at once: every output file is written and closed by now, and nothing else

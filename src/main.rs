@@ -392,6 +392,7 @@ fn log_stage(marks: &[Mark]) {
 fn main() {
     let t0 = Instant::now();
     sys::prof::start();
+    sys::tune_malloc();
     let args: Vec<String> = std::env::args().collect();
     let dir = |var: &str, back: usize, default: &str| -> PathBuf {
         if args.len() >= 3 {
