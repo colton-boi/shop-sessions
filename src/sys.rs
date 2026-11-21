@@ -98,6 +98,11 @@ pub fn populate(p: *mut u8, bytes: usize) {
     }
 }
 
+/// Frees the pages of a dead `map_zeroed` region of `bytes` bytes now, so exit has nothing left to tear down.
+pub fn release(p: *mut u8, bytes: usize) {
+    unsafe { madvise(p as *mut c_void, bytes, 4) };
+}
+
 /// Zero-filled anonymous memory that is only committed where touched.
 pub fn map_zeroed(bytes: usize) -> *mut u8 {
     let len = (bytes.max(1) + HUGE - 1) & !(HUGE - 1);
@@ -137,9 +142,6 @@ impl<T> PerThread<T> {
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get(&self, i: usize) -> &mut T {
         &mut *self.0[i].get()
-    }
-    pub fn into_vec(self) -> Vec<T> {
-        self.0.into_iter().map(|c| c.into_inner()).collect()
     }
 }
 

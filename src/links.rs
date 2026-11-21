@@ -1,5 +1,5 @@
 use crate::ids::tok_less;
-use crate::sys::{map_zeroed, mix};
+use crate::sys::{map_zeroed, mix, release};
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -23,6 +23,11 @@ impl LinkTable {
     pub fn new(pairs: usize) -> Self {
         let cap = (pairs * 3).next_power_of_two().max(4);
         LinkTable { slots: map_zeroed(cap * 16) as *const Slot, mask: cap - 1 }
+    }
+
+    /// Frees the table's pages in `[from, to)` slot ranges once no lookup can happen.
+    pub fn release(&self, from: usize, to: usize) {
+        release(self.slots.wrapping_add(from) as *mut u8, (to - from) * 16);
     }
 
     pub fn slots(&self) -> usize {

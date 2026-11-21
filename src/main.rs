@@ -545,6 +545,9 @@ fn main() {
     let (d_parts, p_parts) = (parts(16_384), parts(16_384));
     let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
     let dims = dims_loader.join().expect("loading products and campaigns");
+    let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
+    let p_recs = event_input.bytes as usize / 40 + (threads * p_parts + 2) * P_CHUNK;
+    let c_recs = click_input.bytes as usize / 20 + (threads * p_parts + 2) * C_CHUNK;
     let sh = Shared {
         window_start,
         window_end,
@@ -558,9 +561,9 @@ fn main() {
         campaign_ids: dims.campaign_ids,
         campaigns: dims.campaigns,
         links,
-        d_arena: Arena::new(event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK, D_CHUNK),
-        p_arena: Arena::new(event_input.bytes as usize / 40 + (threads * p_parts + 2) * P_CHUNK, P_CHUNK),
-        c_arena: Arena::new(click_input.bytes as usize / 20 + (threads * p_parts + 2) * C_CHUNK, C_CHUNK),
+        d_arena: Arena::new(d_recs, D_CHUNK),
+        p_arena: Arena::new(p_recs, P_CHUNK),
+        c_arena: Arena::new(c_recs, C_CHUNK),
         d_parts,
         p_parts,
     };
@@ -661,8 +664,33 @@ fn main() {
     marks.push(mark("sessions"));
     log_stage(&marks);
 
-    let cells: Vec<Vec<Cell>> = groupers.into_vec().into_iter().map(|g| g.cells).collect();
-    write_campaigns(&sh, &output.join("campaign_daily").join("part-000.parquet"), &cells);
+    // Tearing memory down at exit is serial and on the clock, so the other threads free the dead arenas
+    // and links table while thread 0 writes the campaign table.
+    const PIECE: usize = 32 << 20;
+    let regions = [
+        (sh.d_arena.base as usize, d_recs * std::mem::size_of::<DRec>()),
+        (sh.p_arena.base as usize, p_recs * std::mem::size_of::<PRec>()),
+        (sh.c_arena.base as usize, c_recs * std::mem::size_of::<CRec>()),
+    ];
+    let pieces: Vec<(usize, usize)> =
+        regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect();
+    let release = std::env::var_os("SS_NORELEASE").is_none();
+    let next = AtomicUsize::new(0);
+    phase(7, &|t| {
+        if t == 0 {
+            let cells: Vec<Vec<Cell>> = (0..threads).map(|t| std::mem::take(unsafe { &mut groupers.get(t).cells })).collect();
+            write_campaigns(&sh, &output.join("campaign_daily").join("part-000.parquet"), &cells);
+        }
+        while release {
+            let i = next.fetch_add(1, Relaxed);
+            if i < sweeps {
+                sh.links.release(i * SWEEP, ((i + 1) * SWEEP).min(sh.links.slots()));
+                continue;
+            }
+            let Some(&(at, n)) = pieces.get(i - sweeps) else { break };
+            sys::release(at as *mut u8, n);
+        }
+    });
     marks.push(mark("campaigns"));
     log_stage(&marks);
 
