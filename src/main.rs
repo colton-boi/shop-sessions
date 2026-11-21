@@ -195,7 +195,11 @@ unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
         reader.scan::<2>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
             let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
             if la != 0 && lb != 0 {
-                pairs.push((tok(buf.add(s[0] as usize), la), tok(buf.add(s[1] as usize), lb)));
+                let a = tok(buf.add(s[0] as usize), la);
+                let b = tok(buf.add(s[1] as usize), lb);
+                if a != b {
+                    pairs.push((a, b));
+                }
             }
         });
         sh_files.done(x);
@@ -485,7 +489,7 @@ fn main() {
         let list = pair_lists[t];
         unsafe { links.link_all(&list[from..(from + LINK_BLOCK).min(list.len())]) };
     });
-    const SWEEP: usize = 1 << 16;
+    const SWEEP: usize = 1 << 14;
     let sweeps = links.slots().div_ceil(SWEEP);
     let sweep = |f: &(dyn Fn(usize, usize) + Sync)| {
         let next = AtomicUsize::new(0);
@@ -497,8 +501,7 @@ fn main() {
             f(i * SWEEP, ((i + 1) * SWEEP).min(links.slots()));
         });
     };
-    sweep(&|from, to| unsafe { links.compress(from, to) });
-    sweep(&|from, to| unsafe { links.resolve(from, to) });
+    sweep(&|from, to| unsafe { links.compress_and_resolve(from, to) });
     marks.push(mark("links join"));
     log_stage(&marks);
 
@@ -637,6 +640,8 @@ fn main() {
     let pieces: Vec<(usize, usize)> =
         regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect();
     let release = std::env::var_os("SS_NORELEASE").is_none();
+    const REL_SWEEP: usize = 1 << 16;
+    let rel_sweeps = sh.links.slots().div_ceil(REL_SWEEP);
     let next = AtomicUsize::new(0);
     phase(7, &|t| {
         if t == 0 {
@@ -645,11 +650,11 @@ fn main() {
         }
         while release {
             let i = next.fetch_add(1, Relaxed);
-            if i < sweeps {
-                sh.links.release(i * SWEEP, ((i + 1) * SWEEP).min(sh.links.slots()));
+            if i < rel_sweeps {
+                sh.links.release(i * REL_SWEEP, ((i + 1) * REL_SWEEP).min(sh.links.slots()));
                 continue;
             }
-            let Some(&(at, n)) = pieces.get(i - sweeps) else { break };
+            let Some(&(at, n)) = pieces.get(i - rel_sweeps) else { break };
             sys::release(at as *mut u8, n);
         }
     });
