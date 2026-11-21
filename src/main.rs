@@ -1,4 +1,5 @@
 mod csv;
+mod diag;
 mod dims;
 mod group;
 mod ids;
@@ -411,6 +412,14 @@ fn write_campaigns(sh: &Shared, path: &Path, per_thread: &[Vec<Cell>]) {
     w.finish();
 }
 
+type Mark<'a> = (&'a str, f64, (f64, f64, u64), [u64; 4]);
+
+fn log_stage(marks: &[Mark]) {
+    let (name, at, ru, _) = marks[marks.len() - 1];
+    let (prev_at, prev_ru) = if marks.len() > 1 { (marks[marks.len() - 2].1, marks[marks.len() - 2].2) } else { (0.0, (0.0, 0.0, 0)) };
+    diag::stage(name, at - prev_at, ru.0 - prev_ru.0, ru.1 - prev_ru.1);
+}
+
 fn main() {
     let t0 = Instant::now();
     sys::prof::start();
@@ -429,6 +438,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .clamp(1, 256);
+    diag::host(threads);
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let window_start = manifest_time(&manifest, "\"window_start\"");
@@ -467,7 +477,8 @@ fn main() {
     let counters = verbose.then(sys::Counters::open);
     let count = || counters.as_ref().map_or([0; 4], |c| c.read());
     let mark = |name| (name, t0.elapsed().as_secs_f64(), sys::rusage(), count());
-    let mut marks: Vec<(&str, f64, (f64, f64, u64), [u64; 4])> = vec![mark("setup")];
+    let mut marks: Vec<Mark> = vec![mark("setup")];
+    log_stage(&marks);
     let phase = |stage: usize, f: &(dyn Fn(usize) + Sync)| {
         let begun = Instant::now();
         par(threads, |t| {
@@ -492,6 +503,7 @@ fn main() {
     let next = AtomicUsize::new(0);
     phase(0, &|t| unsafe { parse_links(&link_input, &next, workers.get(t)) });
     marks.push(mark("links parse"));
+    log_stage(&marks);
 
     let pair_lists: Vec<&[(u64, u64)]> = (0..threads).map(|t| unsafe { workers.get(t).pairs.as_slice() }).collect();
     let pairs: usize = pair_lists.iter().map(|p| p.len()).sum();
@@ -526,6 +538,7 @@ fn main() {
     sweep(&|from, to| unsafe { links.compress(from, to) });
     sweep(&|from, to| unsafe { links.resolve(from, to) });
     marks.push(mark("links join"));
+    log_stage(&marks);
 
     let rows_guess = (event_input.bytes / 78) as usize;
     let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
@@ -572,6 +585,7 @@ fn main() {
             sys::populate(at as *mut u8, n);
         });
         marks.push(mark("populate"));
+    log_stage(&marks);
     }
     // Largest work first, so the tail of the phase is made of small pieces.
     let mut work: Vec<(bool, usize)> = (0..event_input.extents.len())
@@ -607,6 +621,7 @@ fn main() {
         w.c.finish(&sh.c_arena);
     });
     marks.push(mark("parse"));
+    log_stage(&marks);
 
     let logs = |f: &dyn Fn(&Worker) -> &Vec<(u32, u32, u32)>| -> Vec<&Vec<(u32, u32, u32)>> {
         (0..threads).map(|t| f(unsafe { workers.get(t) })).collect()
@@ -625,6 +640,7 @@ fn main() {
         }
     });
     marks.push(mark("dedup"));
+    log_stage(&marks);
 
     let size_of = |chunks: &Vec<(u32, u32)>| chunks.iter().map(|c| c.1 as u64).sum::<u64>();
     let mut order: Vec<usize> = (0..sh.p_parts).collect();
@@ -643,10 +659,12 @@ fn main() {
         std::mem::replace(&mut g.out, group::UserOut::new(PathBuf::new())).finish(t == 0);
     });
     marks.push(mark("sessions"));
+    log_stage(&marks);
 
     let cells: Vec<Vec<Cell>> = groupers.into_vec().into_iter().map(|g| g.cells).collect();
     write_campaigns(&sh, &output.join("campaign_daily").join("part-000.parquet"), &cells);
     marks.push(mark("campaigns"));
+    log_stage(&marks);
 
     if verbose {
         let (mut prev, mut prev_ru, mut prev_n) = (0.0, (0.0, 0.0, 0), marks[0].3);
@@ -685,6 +703,10 @@ fn main() {
         let ru = sys::rusage();
         eprintln!("total wall {:.1} ms  user {:.1} ms  sys {:.1} ms", t0.elapsed().as_secs_f64() * 1e3, ru.0 * 1e3, ru.1 * 1e3);
     }
+    let stages: Vec<(&str, f64)> = marks.iter().scan(0.0, |prev, m| { let d = m.1 - *prev; *prev = m.1; Some((m.0, d)) }).collect();
+    let ru = sys::rusage();
+    let rows = [&d_chunks, &p_chunks, &c_chunks].map(|c| c.iter().map(size_of).sum::<u64>());
+    diag::summary(t0.elapsed().as_secs_f64(), &stages, ru.0, ru.1, rows);
     sys::prof::finish();
     std::process::exit(0);
 }
