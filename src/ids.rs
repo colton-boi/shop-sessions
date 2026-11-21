@@ -32,16 +32,18 @@ fn intern(bytes: &[u8]) -> u64 {
 /// Branch-free: ID lengths 7 to 9 are mixed at random, so any branch on `len` mispredicts.
 #[inline(always)]
 unsafe fn pack(p: *const u8, len: usize) -> u64 {
-    let bits = (len.min(8) * 8) as u32;
-    let keep = _bzhi_u64(u64::MAX, bits);
-    let x = (p as *const u64).read_unaligned() & keep;
-    let ninth = if len == 9 { *p.add(8) as u64 } else { 0 };
-    // Bytes past `len` read as 1 here, so the zero test sees only real bytes; a
-    // ninth byte that is absent reads as 1 too.
+    // Both loads are unconditional so the len == 9 choices compile to cmov, not a mispredicting branch.
+    let raw = (p as *const u64).read_unaligned();
+    let raw9 = *p.add(8) as u64;
+    // BZHI saturates for an index of 64 or more, so len 8 and 9 keep all eight bytes.
+    let keep = _bzhi_u64(u64::MAX, (len as u32) << 3);
+    let x = raw & keep;
+    let is9 = len == 9;
+    let ninth = if is9 { raw9 } else { 0 };
+    // Bytes past `len` read as 1 here, so the zero test sees only real bytes.
     let filled = x | (!keep & 0x0101_0101_0101_0101);
-    let n9 = if len == 9 { ninth } else { 1 };
-    let has_zero = filled.wrapping_sub(0x0101_0101_0101_0101) & !filled & 0x8080_8080_8080_8080;
-    let bad = has_zero | (x & 0x8080_8080_8080_8080) | (n9.wrapping_sub(1) & 0x80) | (n9 & 0x80);
+    let n9_bad = if is9 { raw9.wrapping_sub(1) | raw9 } else { 0 };
+    let bad = ((filled.wrapping_sub(0x0101_0101_0101_0101) | filled) & 0x8080_8080_8080_8080) | (n9_bad & 0x80);
     if bad != 0 {
         return 0;
     }
