@@ -45,7 +45,7 @@ impl Reader {
     }
 
     #[inline(always)]
-    unsafe fn index_step(
+    unsafe fn index_step<const FULL: bool>(
         &mut self,
         buf: *const u8,
         p: *const u8,
@@ -59,7 +59,7 @@ impl Reader {
         pfs: &mut u64,
         carry: &mut u64,
     ) {
-        if left < 64 {
+        if !FULL {
             d = _bzhi_u64(d, left as u32);
             q = _bzhi_u64(q, left as u32);
         }
@@ -149,13 +149,23 @@ impl Reader {
         let (mut pd, mut pq, mut pfs) = (0u64, 0u64, 0u64);
         let mut carry = 1u64;
         let mut p = buf;
+        let full_end = buf.add(n & !63);
         let end = buf.add(n);
-        while p < end {
+        while p < full_end {
+            let v = _mm512_loadu_si512(p as *const __m512i);
+            let d = _mm512_cmpeq_epi8_mask(v, comma) | _mm512_cmpeq_epi8_mask(v, newline);
+            let q = _mm512_cmpeq_epi8_mask(v, quote);
+            self.index_step::<true>(
+                buf, p, 64, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,
+            );
+            p = p.add(64);
+        }
+        if p < end {
             let v = _mm512_loadu_si512(p as *const __m512i);
             let d = _mm512_cmpeq_epi8_mask(v, comma) | _mm512_cmpeq_epi8_mask(v, newline);
             let q = _mm512_cmpeq_epi8_mask(v, quote);
             let left = end.offset_from(p) as usize;
-            self.index_step(
+            self.index_step::<false>(
                 buf, p, left, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,
             );
             p = p.add(64);
@@ -185,8 +195,22 @@ impl Reader {
         let (mut pd, mut pq, mut pfs) = (0u64, 0u64, 0u64);
         let mut carry = 1u64;
         let mut p = buf;
+        let full_end = buf.add(n & !63);
         let end = buf.add(n);
-        while p < end {
+        while p < full_end {
+            let a = _mm256_loadu_si256(p as *const __m256i);
+            let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+            let da = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, newline));
+            let db = _mm256_or_si256(_mm256_cmpeq_epi8(b, comma), _mm256_cmpeq_epi8(b, newline));
+            let d = (_mm256_movemask_epi8(da) as u32 as u64) | (_mm256_movemask_epi8(db) as u32 as u64) << 32;
+            let q = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)) as u32 as u64)
+                | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)) as u32 as u64) << 32;
+            self.index_step::<true>(
+                buf, p, 64, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,
+            );
+            p = p.add(64);
+        }
+        if p < end {
             let a = _mm256_loadu_si256(p as *const __m256i);
             let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
             let da = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, newline));
@@ -195,7 +219,7 @@ impl Reader {
             let q = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)) as u32 as u64)
                 | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)) as u32 as u64) << 32;
             let left = end.offset_from(p) as usize;
-            self.index_step(
+            self.index_step::<false>(
                 buf, p, left, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,
             );
             p = p.add(64);
@@ -351,6 +375,7 @@ impl Reader {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub unsafe fn bench_index_only(&mut self, data: *const u8, size: usize) -> usize {
         let mut start = 0usize;
         let mut total_delims = 0usize;

@@ -183,6 +183,7 @@ const PAGE: usize = 4096;
 /// A whole file mapped read-only, with a zero page before it (`ts::digits` loads up to 15 bytes
 /// backward) and at least one after it. Files of 2 MiB or more start on a 2 MiB boundary so a page
 /// cache of huge folios can be mapped with PMDs. Nothing is read here: see `end_line`.
+#[allow(dead_code)]
 pub fn map_file(file: &std::fs::File, size: usize) -> *const u8 {
     use std::os::unix::io::AsRawFd;
     if size == 0 {
@@ -203,9 +204,9 @@ pub fn map_file(file: &std::fs::File, size: usize) -> *const u8 {
 }
 
 /// Contiguous 2 MiB-aligned virtual region covering multiple input CSV files.
-#[allow(dead_code)]
 pub struct ContiguousMappedFile {
     pub ptr: *const u8,
+    #[allow(dead_code)]
     pub rel_offset: u64,
     pub size: usize,
 }
@@ -226,7 +227,6 @@ unsafe impl Sync for ContiguousInputRegion {}
 /// Reserves one anonymous virtual range covering all `files` padded to 2 MiB boundaries
 /// (with a leading 2 MiB zero guard) and maps each non-empty file into its 2 MiB-aligned slot
 /// using `MAP_PRIVATE | MAP_FIXED`.
-#[allow(dead_code)]
 pub fn map_files_contiguous(files: &[std::path::PathBuf]) -> ContiguousInputRegion {
     use std::os::unix::io::AsRawFd;
     if files.is_empty() {
@@ -371,6 +371,15 @@ pub fn release(p: *mut u8, bytes: usize) {
     unsafe { madvise(p as *mut c_void, bytes, 4) };
 }
 
+#[inline]
+fn apply_thp_advice(ptr: *mut u8, len: usize) {
+    match host_profile().thp {
+        ThpPolicy::AdviseHuge => unsafe { madvise(ptr as *mut c_void, len, 14) },
+        ThpPolicy::NoHuge => unsafe { madvise(ptr as *mut c_void, len, 15) },
+        ThpPolicy::DefaultHuge => 0,
+    };
+}
+
 /// Zero-filled anonymous memory that is only committed where touched.
 pub fn map_zeroed(bytes: usize) -> *mut u8 {
     let len = (bytes.max(1) + HUGE - 1) & !(HUGE - 1);
@@ -380,18 +389,12 @@ pub fn map_zeroed(bytes: usize) -> *mut u8 {
         panic!("mmap of {len} bytes failed");
     }
     if bytes >= HUGE {
-        // MADV_HUGEPAGE / MADV_NOHUGEPAGE per the host's THP policy (SS_NOHUGE=1 models a host without THP).
-        match host_profile().thp {
-            ThpPolicy::AdviseHuge => unsafe { madvise(p, len, 14) },
-            ThpPolicy::NoHuge => unsafe { madvise(p, len, 15) },
-            ThpPolicy::DefaultHuge => 0,
-        };
+        apply_thp_advice(p as *mut u8, len);
     }
     p as *mut u8
 }
 
 /// Zero-filled 2 MiB-aligned anonymous hugepage arena (`MADV_HUGEPAGE` when supported).
-#[allow(dead_code)]
 pub fn map_zeroed_huge(bytes: usize) -> *mut u8 {
     let len = (bytes.max(1) + HUGE - 1) & !(HUGE - 1);
     // PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE
@@ -405,13 +408,18 @@ pub fn map_zeroed_huge(bytes: usize) -> *mut u8 {
         unsafe { munmap(p, len) };
         let raw = unsafe { mmap(std::ptr::null_mut(), len + HUGE, 3, 0x02 | 0x20 | 0x4000, -1, 0) };
         assert!(raw as isize != -1, "mmap of {} bytes failed", len + HUGE);
-        ((raw as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8
+        let aligned_addr = (raw as usize + HUGE - 1) & !(HUGE - 1);
+        let head_slack = aligned_addr - raw as usize;
+        if head_slack > 0 {
+            unsafe { munmap(raw, head_slack) };
+        }
+        let tail_slack = (raw as usize + len + HUGE) - (aligned_addr + len);
+        if tail_slack > 0 {
+            unsafe { munmap((aligned_addr + len) as *mut c_void, tail_slack) };
+        }
+        aligned_addr as *mut u8
     };
-    match host_profile().thp {
-        ThpPolicy::AdviseHuge => unsafe { madvise(aligned as *mut c_void, len, 14) },
-        ThpPolicy::NoHuge => unsafe { madvise(aligned as *mut c_void, len, 15) },
-        ThpPolicy::DefaultHuge => 0,
-    };
+    apply_thp_advice(aligned, len);
     aligned
 }
 
@@ -688,7 +696,6 @@ impl<T> SyncCell<T> {
 }
 
 /// Runs two heterogeneous setup closures in parallel on the thread pool (must not nest `par`).
-#[allow(dead_code)]
 pub fn join2<A, B, RA, RB>(threads: usize, a: A, b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,

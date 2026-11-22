@@ -1,5 +1,5 @@
 use crate::fast_parquet::{FastUserDailyWriter, UserDailyCols, NULL_CAT};
-use crate::ids::{tok_bytes, tok_less};
+use crate::ids::{append_tok_bytes, click_less, event_canon_key, event_eq};
 use crate::parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
 use crate::ts::DAY_MS;
 use crate::sys::mix;
@@ -82,9 +82,9 @@ impl UserOut {
     }
 
     #[inline(always)]
-    fn add(&mut self, user: &[u8], day: i32, sessions: u32, events: u32, revenue: u64, category_idx: Option<u8>) {
+    fn add(&mut self, person_tok: u64, day: i32, sessions: u32, events: u32, revenue: u64, category_idx: Option<u8>) {
         if !self.cur_person_started {
-            self.names_data.extend_from_slice(user);
+            append_tok_bytes(person_tok, &mut self.names_data);
             self.names_offsets.push(self.names_data.len() as u32);
             self.cur_person_started = true;
         }
@@ -174,6 +174,7 @@ impl UserOut {
 
     /// Writes both `extra` (from the fast-path sessionizer) and `self` (from complex users)
     /// into a single `user_daily/part-*.parquet` file.
+    #[allow(dead_code)]
     pub fn finish_with_extra(self, extra: &UserDailyCols<'_>, even_if_empty: bool) {
         let rows = self.day.len();
         if rows == 0 && extra.is_empty() && !even_if_empty {
@@ -344,7 +345,6 @@ pub struct Grouper {
     generation: u32,
     cat_sum: [u64; 256],
     cats: Vec<u8>,
-    name: Vec<u8>,
     pub out: UserOut,
     cells: Vec<Cell>,
     /// Kept apart from `cells` so the per-click updates touch a smaller table.
@@ -372,7 +372,6 @@ impl Grouper {
             generation: 0,
             cat_sum: [0; 256],
             cats: Vec::new(),
-            name: Vec::new(),
             out: UserOut::with_categories(path, categories),
             cells: vec![Cell::default(); cells],
             assisted: vec![0; cells],
@@ -512,7 +511,7 @@ impl Grouper {
         std::mem::take(&mut self.cells)
     }
 
-    fn flush_day(&mut self, sh: &Shared, day: u32, sessions: u32, events: u32, revenue: u64) {
+    fn flush_day(&mut self, sh: &Shared, person: u64, day: u32, sessions: u32, events: u32, revenue: u64) {
         let mut best: Option<u8> = None;
         for &c in &self.cats {
             let sum = self.cat_sum[c as usize];
@@ -522,7 +521,7 @@ impl Grouper {
                 _ => Some(c),
             };
         }
-        self.out.add(&self.name, (sh.first_day + day as i64) as i32, sessions, events, revenue, best);
+        self.out.add(person, (sh.first_day + day as i64) as i32, sessions, events, revenue, best);
         for &c in &self.cats {
             self.cat_sum[c as usize] = 0;
         }
@@ -530,7 +529,6 @@ impl Grouper {
     }
 
     unsafe fn person(&mut self, sh: &Shared, person: u64, events: &[u64], purchases: &[(u64, u32)], clicks: &[Click]) {
-        tok_bytes_fast(person, &mut self.name);
         self.out.begin_person();
         let nck = clicks.len();
         let mut next_purchase = 0;
@@ -549,7 +547,7 @@ impl Grouper {
             let start_day = ((sh.base_ms + start as i64).div_euclid(DAY_MS) - sh.first_day) as u32;
             if start_day != day {
                 if day != u32::MAX {
-                    self.flush_day(sh, day, day_sessions, day_events, day_revenue);
+                    self.flush_day(sh, person, day, day_sessions, day_events, day_revenue);
                     self.day_rows.push(DayRow { day, first: day_first, end: session_index });
                 }
                 day = start_day;
@@ -602,7 +600,7 @@ impl Grouper {
                 self.sess_row.push(self.day_rows.len() as u32);
             }
         }
-        self.flush_day(sh, day, day_sessions, day_events, day_revenue);
+        self.flush_day(sh, person, day, day_sessions, day_events, day_revenue);
         if nck == 0 {
             return;
         }
@@ -745,16 +743,11 @@ unsafe fn credit(sh: &Shared, clicks: &[Click]) -> usize {
     let id = |c: &Click| (*sh.c_arena.base.add(c.at as usize)).click;
     while k > 0 && clicks[k - 1].ts() == ts {
         k -= 1;
-        if tok_less(id(&clicks[k]), id(&clicks[best])) {
+        if click_less(sh.c_side_arena.base, id(&clicks[k]), id(&clicks[best])) {
             best = k;
         }
     }
     clicks[best].campaign as usize
-}
-
-#[inline(always)]
-fn tok_bytes_fast(t: u64, out: &mut Vec<u8>) {
-    tok_bytes(t, out)
 }
 
 /// One thread's working memory for event_id dedup.
@@ -787,7 +780,7 @@ impl Dedup {
         let mut k = 0;
         for &(first, count) in chunks {
             for at in first..first + count {
-                let b = mix((*base.add(at as usize)).event) as usize & mask;
+                let b = mix(event_canon_key((*base.add(at as usize)).event)) as usize & mask;
                 *buckets.add(k) = b as u32;
                 k += 1;
                 let (w, bit) = (b / 64, 1u64 << (b % 64));
@@ -827,7 +820,7 @@ impl Dedup {
             }
             let at = *cands.get_unchecked(i);
             let r = &*base.add(at as usize);
-            let h = mix(r.event).rotate_left(32);
+            let h = mix(event_canon_key(r.event)).rotate_left(32);
             let tag = ((h >> 20) as u32 | 1) as u64;
             let mut slot = h as usize & mask;
             loop {
@@ -838,7 +831,7 @@ impl Dedup {
                 }
                 if entry >> 32 == tag {
                     let other = &*base.add(entry as u32 as usize);
-                    if other.event == r.event {
+                    if event_eq(sh.e_side_arena.base, other.event, r.event) {
                         if r.ingest < other.ingest {
                             kill(other);
                             *table.add(slot) = tag << 32 | at as u64;

@@ -13,11 +13,10 @@ mod ts;
 use csv::Reader;
 use dims::KeyMap;
 use group::{Cell, Grouper};
-use ids::tok_pair;
+use ids::{event_canon_key, init_hex_user_table, tok, tok_click_user_pair, tok_pair, try_pack_event_user, Hex128, SideWriter};
 use links::LinkTable;
 use parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
 use scatter::{by_partition, part_of_key, Arena, Scatter};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
@@ -85,6 +84,8 @@ pub struct Shared {
     pub(crate) d_arena: Arena<DRec>,
     pub p_arena: Arena<PRec>,
     pub c_arena: Arena<CRec>,
+    pub(crate) e_side_arena: Arena<Hex128>,
+    pub(crate) c_side_arena: Arena<Hex128>,
     pub(crate) d_parts: usize,
     pub(crate) p_parts: usize,
 }
@@ -140,6 +141,8 @@ struct Worker {
     d: Scatter<DRec, 4>,
     p: Scatter<PRec, 4>,
     c: Scatter<CRec, 8>,
+    e_side: SideWriter,
+    c_side: SideWriter,
     /// Per stage: on-CPU, runqueue-wait and idle seconds.
     busy: [[f64; 3]; 8],
 }
@@ -183,7 +186,7 @@ impl Input {
     }
 }
 
-fn list_csv(dir: &Path, extent: u64) -> Input {
+fn list_csv_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
@@ -193,11 +196,18 @@ fn list_csv(dir: &Path, extent: u64) -> Input {
         Err(_) => Vec::new(),
     };
     paths.sort();
-    let mut input = Input { files: Vec::new(), remaining: Vec::new(), extents: Vec::new(), bytes: 0 };
-    for p in paths {
-        let file = File::open(&p).expect("open input");
-        let size = file.metadata().unwrap().len();
-        let index = input.files.len();
+    paths
+}
+
+fn build_input(mapped: &[sys::ContiguousMappedFile], extent: u64) -> Input {
+    let mut input = Input {
+        files: Vec::with_capacity(mapped.len()),
+        remaining: Vec::with_capacity(mapped.len()),
+        extents: Vec::new(),
+        bytes: 0,
+    };
+    for (index, f) in mapped.iter().enumerate() {
+        let size = f.size as u64;
         let mut from = 0;
         let first = input.extents.len();
         while from < size {
@@ -207,9 +217,29 @@ fn list_csv(dir: &Path, extent: u64) -> Input {
         }
         input.remaining.push(AtomicUsize::new(input.extents.len() - first));
         input.bytes += size;
-        input.files.push(Mapped(sys::map_file(&file, size as usize), size as usize));
+        input.files.push(Mapped(f.ptr, f.size));
     }
     input
+}
+
+fn load_all_inputs(data: &Path, link_extent: u64, extent: u64) -> (Input, Input, Input) {
+    let links_paths = list_csv_paths(&data.join("links"));
+    let events_paths = list_csv_paths(&data.join("events"));
+    let clicks_paths = list_csv_paths(&data.join("clicks"));
+    let n_links = links_paths.len();
+    let n_events = events_paths.len();
+    let mut all_paths = Vec::with_capacity(n_links + n_events + clicks_paths.len());
+    all_paths.extend(links_paths);
+    all_paths.extend(events_paths);
+    all_paths.extend(clicks_paths);
+    let region = sys::map_files_contiguous(&all_paths);
+    let (links_m, rest) = region.files.split_at(n_links);
+    let (events_m, clicks_m) = rest.split_at(n_events);
+    (
+        build_input(links_m, link_extent),
+        build_input(events_m, extent),
+        build_input(clicks_m, extent),
+    )
 }
 
 fn manifest_time(text: &str, key: &str) -> i64 {
@@ -250,7 +280,7 @@ unsafe fn flush_events(sh: &Shared, d: &mut Scatter<DRec, 4>, p: &mut Scatter<PR
         } else {
             NONE
         };
-        d.push(&sh.d_arena, part_of_key(e.event, sh.d_parts), DRec { event: e.event, ingest: e.ingest, payload });
+        d.push(&sh.d_arena, part_of_key(event_canon_key(e.event), sh.d_parts), DRec { event: e.event, ingest: e.ingest, payload });
     }
 }
 
@@ -267,7 +297,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
-    let Worker { reader, dates, d, p, .. } = w;
+    let Worker { reader, dates, d, p, e_side, .. } = w;
     let mut batch = [PendingEvent { event: 0, user: 0, user_hash: 0, ingest: 0, ts: 0, payload: 0, valid: false }; BATCH];
     let mut pending = 0;
     let base_s = sh.base_ms.div_euclid(1000);
@@ -278,7 +308,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
         if len(0) == 0 {
             return;
         }
-        let (event, user) = tok_pair(at(0), len(0), at(1), len(1));
+        let (event, user) = try_pack_event_user(at(0), len(0), at(1), len(1), e_side, &sh.e_side_arena);
         let mut out = PendingEvent { event, user: 0, user_hash: 0, ingest: i32::MAX, ts: 0, payload: 0, valid: false };
         'valid: {
             let ts_u32 = if REL {
@@ -329,7 +359,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
                 }
                 _ => break 'valid,
             }
-            out.user = user;
+            out.user = if user != 0 { user } else { tok(at(1), len(1)) };
             out.user_hash = mix(out.user);
             sh.links.prefetch_hashed(out.user_hash);
             out.ts = ts_u32;
@@ -364,7 +394,7 @@ unsafe fn parse_clicks(sh: &Shared, file: Mapped, x: &Extent, w: &mut Worker) {
 
 #[inline(never)]
 unsafe fn parse_clicks_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
-    let Worker { reader, dates, c, .. } = w;
+    let Worker { reader, dates, c, c_side, .. } = w;
     let mut batch = [PendingClick { click: 0, user: 0, user_hash: 0, ts: 0, campaign: 0 }; BATCH];
     let mut pending = 0;
     let click_win_ms = (sh.window_end - sh.base_ms) as u64;
@@ -388,7 +418,7 @@ unsafe fn parse_clicks_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
             (t - sh.base_ms) as u32
         };
         let Some(campaign) = sh.campaign_id(at(2), len(2)) else { return };
-        let (click, user) = tok_pair(at(0), len(0), at(1), len(1));
+        let (click, user) = tok_click_user_pair(at(0), len(0), at(1), len(1), c_side, &sh.c_side_arena);
         let user_hash = mix(user);
         sh.links.prefetch_hashed(user_hash);
         *batch.get_unchecked_mut(pending) =
@@ -497,17 +527,15 @@ fn main() {
     let days = ((window_end - 1).div_euclid(DAY_MS) - first_day + 1) as usize;
 
     if verbose { eprintln!("  manifest {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
-    // Products and campaigns are first needed by the event parse; load them beside the links.
-    let dims_loader = {
-        let data = data.clone();
-        std::thread::spawn(move || dims::load(&data))
-    };
     let knob = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
     let extent = knob("SS_EXTENT", EXTENT);
     let read_buf = knob("SS_READ_BUF", READ_BUF as u64) as usize;
-    let mut link_input = list_csv(&data.join("links"), extent.min(256 << 10));
-    let mut event_input = list_csv(&data.join("events"), extent);
-    let mut click_input = list_csv(&data.join("clicks"), extent);
+    let (dims, (mut link_input, mut event_input, mut click_input)) = sys::join2(
+        threads,
+        || dims::load(&data),
+        || load_all_inputs(&data, extent.min(128 << 10), extent),
+    );
+    init_hex_user_table((link_input.bytes + event_input.bytes + click_input.bytes) as usize);
     std::fs::create_dir_all(output.join("user_daily")).expect("create output");
     std::fs::create_dir_all(output.join("campaign_daily")).expect("create output");
 
@@ -524,6 +552,8 @@ fn main() {
         d: Scatter::new(),
         p: Scatter::new(),
         c: Scatter::new(),
+        e_side: SideWriter::default(),
+        c_side: SideWriter::default(),
         busy: [[0.0; 3]; 8],
     });
     let count = || counters.as_ref().map_or([0; 4], |c| c.read());
@@ -617,12 +647,12 @@ fn main() {
     let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
     let (d_parts, p_parts) = (parts(16_384), parts(16_384));
     let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
-    let dims = dims_loader
-        .join()
-        .expect("loading products and campaigns");
     let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
     let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
     let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
+    const SIDE_CHUNK: usize = 4096;
+    let e_side_recs = (event_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
+    let c_side_recs = (click_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
     let use_rel = base_ms % 1000 == 0;
     let date_lut = DateLut::new(window_start, window_end, base_ms.div_euclid(1000));
     let sh = Shared {
@@ -645,13 +675,24 @@ fn main() {
         d_arena: Arena::new(d_recs, D_CHUNK),
         p_arena: Arena::new(p_recs, P_CHUNK),
         c_arena: Arena::new(c_recs, C_CHUNK),
+        e_side_arena: Arena::new(e_side_recs, SIDE_CHUNK),
+        c_side_arena: Arena::new(c_side_recs, SIDE_CHUNK),
         d_parts,
         p_parts,
     };
 
     // Committing the expected arena in 4 MB blocks costs about a third of the kernel
     // time that eight threads faulting it in page by page take during the parse.
-    let populated = [rows_guess * 17, rows_guess * 17, click_input.bytes as usize / 46 * 25];
+    let ev_pop_rows = (event_input.bytes / 80) as usize;
+    let ck_pop_rows = (click_input.bytes / 52) as usize;
+    let populated = [
+        ((ev_pop_rows + (threads * d_parts / 2) * D_CHUNK) * std::mem::size_of::<DRec>())
+            .min(sh.d_arena.cap_bytes()),
+        ((ev_pop_rows + (threads * p_parts / 2) * P_CHUNK) * std::mem::size_of::<PRec>())
+            .min(sh.p_arena.cap_bytes()),
+        ((ck_pop_rows + (threads * p_parts / 2) * C_CHUNK) * std::mem::size_of::<CRec>())
+            .min(sh.c_arena.cap_bytes()),
+    ];
     {
         const PIECE: usize = 4 << 20;
         let regions = [
@@ -730,23 +771,32 @@ fn main() {
     let size_of = |chunks: &Vec<(u32, u32)>| chunks.iter().map(|c| c.1 as u64).sum::<u64>();
     let mut order: Vec<usize> = (0..sh.p_parts).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(size_of(&p_chunks[i]) + size_of(&c_chunks[i])));
-    // Tearing memory down at exit is serial and on the clock, so it is freed in parallel: what is dead
-    // by now (links table, dedup arena) by threads that run out of sessions work, the rest while
-    // thread 0 writes the campaign table. Only pages ever touched are walked.
-    const PIECE: usize = 32 << 20;
-    let touched = |base: usize, used: usize, populated: usize, cap: usize| (base, used.max(populated).min(cap));
-    let split = |regions: &[(usize, usize)]| -> Vec<(usize, usize)> {
-        regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect()
-    };
-    let dead_pieces = split(&[touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes())]);
-    let live_pieces = split(&[
-        touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes()),
-        touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes()),
-    ]);
-    let release = std::env::var_os("SS_NORELEASE").is_none();
-    let (dead_next, live_next) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    // Tearing memory down at exit is serial and on the clock when THP is off, so free in parallel
+    // only under NoHuge; with hugepages active, exit_now() tears down 2 MiB PMDs immediately.
+    let release = std::env::var_os("SS_NORELEASE").is_none() && sys::host_profile().thp == sys::ThpPolicy::NoHuge;
     const REL_SWEEP: usize = 1 << 16;
-    let rel_sweeps = sh.links.slots().div_ceil(REL_SWEEP);
+    let (dead_pieces, live_pieces, rel_sweeps) = if release {
+        const PIECE: usize = 32 << 20;
+        let touched = |base: usize, used: usize, populated: usize, cap: usize| (base, used.max(populated).min(cap));
+        let split = |regions: &[(usize, usize)]| -> Vec<(usize, usize)> {
+            regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect()
+        };
+        (
+            split(&[
+                touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes()),
+                (sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes()),
+            ]),
+            split(&[
+                touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes()),
+                touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes()),
+                (sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes()),
+            ]),
+            sh.links.slots().div_ceil(REL_SWEEP),
+        )
+    } else {
+        (Vec::new(), Vec::new(), 0)
+    };
+    let (dead_next, live_next) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let drain_dead = || {
         while release {
             let i = dead_next.fetch_add(1, Relaxed);

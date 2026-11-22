@@ -1,5 +1,5 @@
 use crate::ids::tok_less;
-use crate::sys::{map_zeroed, mix, release};
+use crate::sys::{map_zeroed_huge, mix, release};
 use std::arch::x86_64::{
     __m256i, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_load_si256, _mm256_movemask_pd,
     _mm256_set1_epi64x, _mm256_setzero_si256, _mm_prefetch, _MM_HINT_T0,
@@ -36,7 +36,7 @@ impl LinkTable {
 
     fn with_buckets(num_buckets: usize) -> Self {
         debug_assert!(num_buckets.is_power_of_two() && num_buckets >= 1);
-        let buckets = map_zeroed(num_buckets * std::mem::size_of::<Bucket>()) as *const Bucket;
+        let buckets = map_zeroed_huge(num_buckets * std::mem::size_of::<Bucket>()) as *const Bucket;
         debug_assert_eq!(buckets as usize & 63, 0);
         LinkTable { buckets, bucket_mask: num_buckets - 1 }
     }

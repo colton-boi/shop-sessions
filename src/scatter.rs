@@ -1,4 +1,4 @@
-use crate::sys::map_zeroed;
+use crate::sys::map_zeroed_huge;
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -15,7 +15,7 @@ impl<T> Arena<T> {
     pub fn new(records: usize, chunk: usize) -> Self {
         let cap = records.div_ceil(chunk) * chunk;
         assert!(cap < u32::MAX as usize, "input too large for 32-bit record indexes");
-        Arena { base: map_zeroed(cap * std::mem::size_of::<T>()) as *mut T, cap, next: AtomicUsize::new(0), chunk }
+        Arena { base: map_zeroed_huge(cap * std::mem::size_of::<T>()) as *mut T, cap, next: AtomicUsize::new(0), chunk }
     }
 
     pub fn cap_bytes(&self) -> usize {
@@ -26,10 +26,14 @@ impl<T> Arena<T> {
         self.next.load(Relaxed).min(self.cap) * std::mem::size_of::<T>()
     }
 
-    fn take(&self) -> usize {
+    pub fn take(&self) -> usize {
         let at = self.next.fetch_add(self.chunk, Relaxed);
         assert!(at + self.chunk <= self.cap, "record arena overflow");
         at
+    }
+
+    pub fn chunk(&self) -> usize {
+        self.chunk
     }
 }
 
