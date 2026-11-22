@@ -13,7 +13,10 @@ mod ts;
 use csv::Reader;
 use dims::KeyMap;
 use group::{Cell, Grouper};
-use ids::{event_canon_key, init_hex_user_table, tok, tok_click_user_pair, tok_pair, try_pack_event_user, Hex128, SideWriter};
+use ids::{
+    event_canon_key, init_hex_user_table, tok_click_user_pair_tid, tok_pair_tid, tok_tid,
+    try_pack_event_user, Hex128, SideWriter,
+};
 use links::LinkTable;
 use parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
 use scatter::{by_partition, part_of_key, Arena, Scatter};
@@ -56,7 +59,7 @@ const NONE: u32 = u32::MAX;
 pub const DEAD: u64 = u64::MAX;
 pub(crate) const WEEK_MS: i64 = 7 * DAY_MS;
 
-const READ_BUF: usize = 64 << 10;
+const READ_BUF: usize = 16 << 10;
 const EXTENT: u64 = 2 << 20;
 const D_CHUNK: usize = 512;
 pub(crate) const P_CHUNK: usize = 512;
@@ -263,7 +266,7 @@ fn manifest_time(text: &str, key: &str) -> i64 {
     ms
 }
 
-unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
+unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker, tid: usize) {
     let Worker { reader, pairs, .. } = w;
     loop {
         let i = next.fetch_add(1, Relaxed);
@@ -272,7 +275,7 @@ unsafe fn parse_links(sh_files: &Input, next: &AtomicUsize, w: &mut Worker) {
         reader.scan::<2>(data, size, x.from as usize, x.to as usize, |buf, s, e| {
             let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
             if la != 0 && lb != 0 {
-                let (a, b) = tok_pair(buf.add(s[0] as usize), la, buf.add(s[1] as usize), lb);
+                let (a, b) = tok_pair_tid(buf.add(s[0] as usize), la, buf.add(s[1] as usize), lb, tid);
                 if a != b {
                     pairs.push((a, b));
                 }
@@ -295,16 +298,22 @@ unsafe fn flush_events(sh: &Shared, d: &mut Scatter<DRec, 4>, p: &mut Scatter<PR
     }
 }
 
-unsafe fn parse_events(sh: &Shared, file: Mapped, x: &Extent, w: &mut Worker) {
+unsafe fn parse_events(sh: &Shared, file: Mapped, x: &Extent, w: &mut Worker, tid: usize) {
     if sh.use_rel {
-        parse_events_impl::<true>(sh, file, x, w);
+        parse_events_impl::<true>(sh, file, x, w, tid);
     } else {
-        parse_events_impl::<false>(sh, file, x, w);
+        parse_events_impl::<false>(sh, file, x, w, tid);
     }
 }
 
 #[inline(never)]
-unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
+unsafe fn parse_events_impl<const REL: bool>(
+    sh: &Shared,
+    Mapped(data, size): Mapped,
+    x: &Extent,
+    w: &mut Worker,
+    tid: usize,
+) {
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -353,7 +362,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
             match len(4) {
                 4 => {
                     let ty = (at(4) as *const u32).read_unaligned();
-                    if ty != VIEW && ty != CART {
+                    if (ty != VIEW) & (ty != CART) {
                         break 'valid;
                     }
                 }
@@ -370,7 +379,7 @@ unsafe fn parse_events_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
                 }
                 _ => break 'valid,
             }
-            out.user = if user != 0 { user } else { tok(at(1), len(1)) };
+            out.user = if user != 0 { user } else { tok_tid(at(1), len(1), tid) };
             out.user_hash = mix(out.user);
             sh.links.prefetch_hashed(out.user_hash);
             out.ts = ts_u32;
@@ -395,16 +404,22 @@ unsafe fn flush_clicks(sh: &Shared, c: &mut Scatter<CRec, 8>, batch: &[PendingCl
     }
 }
 
-unsafe fn parse_clicks(sh: &Shared, file: Mapped, x: &Extent, w: &mut Worker) {
+unsafe fn parse_clicks(sh: &Shared, file: Mapped, x: &Extent, w: &mut Worker, tid: usize) {
     if sh.use_rel {
-        parse_clicks_impl::<true>(sh, file, x, w);
+        parse_clicks_impl::<true>(sh, file, x, w, tid);
     } else {
-        parse_clicks_impl::<false>(sh, file, x, w);
+        parse_clicks_impl::<false>(sh, file, x, w, tid);
     }
 }
 
 #[inline(never)]
-unsafe fn parse_clicks_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Mapped, x: &Extent, w: &mut Worker) {
+unsafe fn parse_clicks_impl<const REL: bool>(
+    sh: &Shared,
+    Mapped(data, size): Mapped,
+    x: &Extent,
+    w: &mut Worker,
+    tid: usize,
+) {
     let Worker { reader, dates, c, c_side, .. } = w;
     let mut batch = [PendingClick { click: 0, user: 0, user_hash: 0, ts: 0, campaign: 0 }; BATCH];
     let mut pending = 0;
@@ -429,7 +444,7 @@ unsafe fn parse_clicks_impl<const REL: bool>(sh: &Shared, Mapped(data, size): Ma
             (t - sh.base_ms) as u32
         };
         let Some(campaign) = sh.campaign_id(at(2), len(2)) else { return };
-        let (click, user) = tok_click_user_pair(at(0), len(0), at(1), len(1), c_side, &sh.c_side_arena);
+        let (click, user) = tok_click_user_pair_tid(at(0), len(0), at(1), len(1), c_side, &sh.c_side_arena, tid);
         let user_hash = mix(user);
         sh.links.prefetch_hashed(user_hash);
         *batch.get_unchecked_mut(pending) =
@@ -612,7 +627,7 @@ fn main() {
             };
             unended[i].store(lacks, Relaxed);
         }
-        parse_links(&link_input, &next, workers.get(t))
+        parse_links(&link_input, &next, workers.get(t), t)
     });
     // Rare, and done before the populate so no mapping change contends with it for the mmap lock.
     for (i, u) in unended.iter().enumerate() {
@@ -754,11 +769,11 @@ fn main() {
             let Some(&(is_event, i)) = work.get(i) else { break };
             if is_event {
                 let x = &event_input.extents[i];
-                parse_events(&sh, event_input.files[x.file], x, w);
+                parse_events(&sh, event_input.files[x.file], x, w, t);
                 event_input.done(x);
             } else {
                 let x = &click_input.extents[i];
-                parse_clicks(&sh, click_input.files[x.file], x, w);
+                parse_clicks(&sh, click_input.files[x.file], x, w, t);
                 click_input.done(x);
             }
         }

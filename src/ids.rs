@@ -163,8 +163,9 @@ struct HexSegment {
     mask: usize,
     base_idx: usize,
     max_load: usize,
-    count: AlignedUsize,
-    in_flight: AlignedUsize,
+    seal_mask: usize,
+    count: [AlignedUsize; 64],
+    in_flight: [AlignedUsize; 64],
     sealed: AlignedBool,
     next: AtomicPtr<HexSegment>,
 }
@@ -182,8 +183,9 @@ impl HexSegment {
             mask: cap - 1,
             base_idx,
             max_load: cap * 3 / 4,
-            count: AlignedUsize(AtomicUsize::new(0)),
-            in_flight: AlignedUsize(AtomicUsize::new(0)),
+            seal_mask: if cap >= 16384 { 63 } else { 0 },
+            count: std::array::from_fn(|_| AlignedUsize(AtomicUsize::new(0))),
+            in_flight: std::array::from_fn(|_| AlignedUsize(AtomicUsize::new(0))),
             sealed: AlignedBool(AtomicBool::new(false)),
             next: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -208,8 +210,14 @@ impl HexUserTable {
         Self::with_cap(cap)
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     pub unsafe fn intern(&self, prefix: u8, hi: u64, lo: u64) -> u32 {
+        self.intern_tid(prefix, hi, lo, 0)
+    }
+
+    #[inline(always)]
+    pub unsafe fn intern_tid(&self, prefix: u8, hi: u64, lo: u64, tid: usize) -> u32 {
         let h = hash_hex(prefix, hi, lo);
         let ready_tag = (h & !0x3FF) | ((prefix as u64) << 2) | 2;
         let mut seg = &self.head;
@@ -230,7 +238,7 @@ impl HexUserTable {
                 }
                 idx = (idx + 1) & seg.mask;
             }
-            if let Some(found) = Self::insert_in_segment(seg, hi, lo, ready_tag, idx) {
+            if let Some(found) = Self::insert_in_segment(seg, hi, lo, ready_tag, idx, tid) {
                 return found;
             }
             seg = Self::next_segment(seg);
@@ -239,8 +247,16 @@ impl HexUserTable {
 
     #[cold]
     #[inline(never)]
-    unsafe fn insert_in_segment(seg: &HexSegment, hi: u64, lo: u64, ready_tag: u64, mut idx: usize) -> Option<u32> {
-        seg.in_flight.0.fetch_add(1, SeqCst);
+    unsafe fn insert_in_segment(
+        seg: &HexSegment,
+        hi: u64,
+        lo: u64,
+        ready_tag: u64,
+        mut idx: usize,
+        tid: usize,
+    ) -> Option<u32> {
+        let shard = tid & 63;
+        seg.in_flight[shard].0.fetch_add(1, SeqCst);
         if !seg.sealed.0.load(Acquire) {
             loop {
                 let slot = &*seg.slots.add(idx);
@@ -255,27 +271,32 @@ impl HexUserTable {
                             *slot.hi.get() = hi;
                             *slot.lo.get() = lo;
                             slot.state.store(ready_tag, Release);
-                            let c = seg.count.0.fetch_add(1, Relaxed) + 1;
-                            if c >= seg.max_load {
-                                seg.sealed.0.store(true, Release);
+                            let c = seg.count[shard].0.fetch_add(1, Relaxed) + 1;
+                            if (c & seg.seal_mask) == 0 {
+                                let total: usize = seg.count.iter().map(|s| s.0.load(Relaxed)).sum();
+                                if total >= seg.max_load {
+                                    seg.sealed.0.store(true, SeqCst);
+                                }
                             }
-                            seg.in_flight.0.fetch_sub(1, Release);
+                            seg.in_flight[shard].0.fetch_sub(1, Release);
                             return Some((seg.base_idx + idx) as u32);
                         }
                         Err(_) => continue,
                     }
                 }
                 if st == ready_tag && *slot.hi.get() == hi && *slot.lo.get() == lo {
-                    seg.in_flight.0.fetch_sub(1, Release);
+                    seg.in_flight[shard].0.fetch_sub(1, Release);
                     return Some((seg.base_idx + idx) as u32);
                 }
                 idx = (idx + 1) & seg.mask;
             }
         }
-        seg.in_flight.0.fetch_sub(1, Release);
+        seg.in_flight[shard].0.fetch_sub(1, Release);
         fence(SeqCst);
-        while seg.in_flight.0.load(Acquire) != 0 {
-            std::hint::spin_loop();
+        for inf in &seg.in_flight {
+            while inf.0.load(Acquire) != 0 {
+                std::hint::spin_loop();
+            }
         }
         // Zero writers can now touch `seg`; final read-only probe from `idx`.
         loop {
@@ -609,15 +630,23 @@ unsafe fn try_pack_pair(p0: *const u8, l0: usize, p1: *const u8, l1: usize) -> O
 }
 
 /// Tokenizes a `user_id` (`p` must be readable for 9 bytes; `len >= 1`).
+#[allow(dead_code)]
 #[inline(always)]
 pub unsafe fn tok(p: *const u8, len: usize) -> u64 {
+    tok_tid(p, len, 0)
+}
+
+/// Tokenizes a `user_id` using worker `tid` for sharded `HexUserTable` accounting.
+/// (`p` must be readable for 9 bytes; `len >= 1`).
+#[inline(always)]
+pub unsafe fn tok_tid(p: *const u8, len: usize, tid: usize) -> u64 {
     if len <= 9 {
         let t = pack(p, len);
         if t != 0 {
             return t;
         }
     } else if let Some((prefix, hi, lo)) = parse_hex33(p, len) {
-        let idx = hex_users().intern(prefix, hi, lo);
+        let idx = hex_users().intern_tid(prefix, hi, lo, tid);
         return make_order_hex_tok(prefix, hi, idx);
     }
     fallback_intern(p, len)
@@ -625,17 +654,25 @@ pub unsafe fn tok(p: *const u8, len: usize) -> u64 {
 
 /// `(tok(p0, l0), tok(p1, l1))`, except that an empty ID gives 0 instead of an interned token.
 /// `p0` and `p1` must be readable for 16 bytes.
+#[allow(dead_code)]
 #[inline(always)]
 pub unsafe fn tok_pair(p0: *const u8, l0: usize, p1: *const u8, l1: usize) -> (u64, u64) {
+    tok_pair_tid(p0, l0, p1, l1, 0)
+}
+
+/// `(tok_tid(p0, l0, tid), tok_tid(p1, l1, tid))`, except that an empty ID gives 0 instead of an interned token.
+/// `p0` and `p1` must be readable for 16 bytes.
+#[inline(always)]
+pub unsafe fn tok_pair_tid(p0: *const u8, l0: usize, p1: *const u8, l1: usize, tid: usize) -> (u64, u64) {
     if let Some(pair) = try_pack_pair(p0, l0, p1, l1) {
         return pair;
     }
-    tok_pair_long(p0, l0, p1, l1)
+    tok_pair_long_tid(p0, l0, p1, l1, tid)
 }
 
 #[inline(never)]
-unsafe fn tok_pair_long(p0: *const u8, l0: usize, p1: *const u8, l1: usize) -> (u64, u64) {
-    (if l0 == 0 { 0 } else { tok(p0, l0) }, if l1 == 0 { 0 } else { tok(p1, l1) })
+unsafe fn tok_pair_long_tid(p0: *const u8, l0: usize, p1: *const u8, l1: usize, tid: usize) -> (u64, u64) {
+    (if l0 == 0 { 0 } else { tok_tid(p0, l0, tid) }, if l1 == 0 { 0 } else { tok_tid(p1, l1, tid) })
 }
 
 /// Tokenizes an `event_id` without any hash table or mutex: 33B hex IDs push `(hi, lo)`
@@ -715,6 +752,7 @@ pub unsafe fn tok_click(p: *const u8, len: usize, side: &mut SideWriter, arena: 
 }
 
 /// Tokenizes `(click_id, user_id)` in one AVX2 pass when both are `<= 9B` ASCII.
+#[allow(dead_code)]
 #[inline(always)]
 pub unsafe fn tok_click_user_pair(
     p0: *const u8,
@@ -724,24 +762,40 @@ pub unsafe fn tok_click_user_pair(
     c_side: &mut SideWriter,
     c_arena: &Arena<Hex128>,
 ) -> (u64, u64) {
-    if let Some(pair) = try_pack_pair(p0, l0, p1, l1) {
-        return pair;
-    }
-    tok_click_user_long(p0, l0, p1, l1, c_side, c_arena)
+    tok_click_user_pair_tid(p0, l0, p1, l1, c_side, c_arena, 0)
 }
 
-#[inline(never)]
-unsafe fn tok_click_user_long(
+/// Tokenizes `(click_id, user_id)` in one AVX2 pass when both are `<= 9B` ASCII,
+/// using worker `tid` for sharded `HexUserTable` accounting.
+#[inline(always)]
+pub unsafe fn tok_click_user_pair_tid(
     p0: *const u8,
     l0: usize,
     p1: *const u8,
     l1: usize,
     c_side: &mut SideWriter,
     c_arena: &Arena<Hex128>,
+    tid: usize,
+) -> (u64, u64) {
+    if let Some(pair) = try_pack_pair(p0, l0, p1, l1) {
+        return pair;
+    }
+    tok_click_user_long_tid(p0, l0, p1, l1, c_side, c_arena, tid)
+}
+
+#[inline(never)]
+unsafe fn tok_click_user_long_tid(
+    p0: *const u8,
+    l0: usize,
+    p1: *const u8,
+    l1: usize,
+    c_side: &mut SideWriter,
+    c_arena: &Arena<Hex128>,
+    tid: usize,
 ) -> (u64, u64) {
     (
         if l0 == 0 { 0 } else { tok_click(p0, l0, c_side, c_arena) },
-        if l1 == 0 { 0 } else { tok(p1, l1) },
+        if l1 == 0 { 0 } else { tok_tid(p1, l1, tid) },
     )
 }
 
@@ -763,12 +817,16 @@ fn unpack_9_buf(t: u64, buf: &mut [u8; 33]) -> usize {
 pub fn append_tok_bytes(t: u64, out: &mut Vec<u8>) {
     let tag = t >> 62;
     if tag < 2 {
-        for i in 0..9 {
-            let c = ((t >> (7 * (8 - i))) & 0x7F) as u8;
-            if c == 0 {
-                break;
-            }
-            out.push(c);
+        unsafe {
+            let b0_7 = _pdep_u64(t >> 7, 0x7F7F_7F7F_7F7F_7F7F).swap_bytes();
+            let b8 = (t & 0x7F) as u8;
+            let len = if b8 != 0 { 9 } else { 8 - (b0_7.leading_zeros() >> 3) as usize };
+            let old = out.len();
+            out.reserve(9);
+            let dst = out.as_mut_ptr().add(old);
+            (dst as *mut u64).write_unaligned(b0_7);
+            *dst.add(8) = b8;
+            out.set_len(old + len);
         }
         return;
     }
@@ -1148,6 +1206,87 @@ mod tests {
                 assert_eq!(results[t][k].1, id0);
             }
             assert_eq!(unsafe { tbl.get(id0) }, items[k].as_slice());
+        }
+    }
+
+    #[test]
+    fn test_hex_user_table_sharded_tid() {
+        let tbl_sized = HexUserTable::for_bytes(3usize << 30);
+        assert_eq!(tbl_sized.head.cap, 1 << 21);
+        let tbl = HexUserTable::with_cap(1 << 16);
+        let items: Vec<(u8, u64, u64)> = (0..2000u64)
+            .map(|i| (if i % 2 == 0 { b'u' } else { b'U' }, i.wrapping_mul(0x9E37_79B9_7F4A_7C15), i + 1))
+            .collect();
+        let mut results = vec![Vec::new(); 8];
+        std::thread::scope(|sc| {
+            for (tid, out) in results.iter_mut().enumerate() {
+                let tbl_ref = &tbl;
+                let items_ref = &items;
+                sc.spawn(move || {
+                    for k in 0..items_ref.len() {
+                        let idx = (k + tid * 37) % items_ref.len();
+                        let (p, hi, lo) = items_ref[idx];
+                        let id = unsafe { tbl_ref.intern_tid(p, hi, lo, tid * 9) };
+                        out.push((idx, id));
+                    }
+                });
+            }
+        });
+        for r in &mut results {
+            r.sort_by_key(|x| x.0);
+        }
+        for k in 0..items.len() {
+            let id0 = results[0][k].1;
+            for t in 1..8 {
+                assert_eq!(results[t][k].1, id0);
+            }
+            assert_eq!(unsafe { tbl.get(id0) }, items[k]);
+        }
+    }
+
+    #[test]
+    fn test_append_tok_bytes_matches_unpack_9_buf() {
+        let mut x = 0x1234_5678_9ABC_DEF0u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut out = Vec::new();
+        let mut buf = [0u8; 33];
+        for len in 1..=9 {
+            // Test boundary characters (0x01, 0x7F, '0', 'z') and random 7-bit non-zero ASCII.
+            for case in 0..2000 {
+                let mut src = [0u8; 16];
+                for i in 0..len {
+                    src[i] = match case {
+                        0 => 0x01,
+                        1 => 0x7F,
+                        2 => b'u',
+                        3 => if i == len - 1 { 0x01 } else { 0x7F },
+                        4 => if i == len - 1 { 0x7F } else { 0x01 },
+                        _ => (rnd() % 127 + 1) as u8,
+                    };
+                }
+                let t = unsafe { pack(src.as_ptr(), len) };
+                assert_ne!(t, 0);
+                assert!(t >> 62 < 2);
+                let expected_len = unpack_9_buf(t, &mut buf);
+                assert_eq!(expected_len, len);
+
+                // Verify empty out and non-empty out (prefix preservation).
+                out.clear();
+                append_tok_bytes(t, &mut out);
+                assert_eq!(out.as_slice(), &buf[..expected_len], "len={len} case={case}");
+
+                let prefix = b"pfx:";
+                out.clear();
+                out.extend_from_slice(prefix);
+                append_tok_bytes(t, &mut out);
+                assert_eq!(&out[..prefix.len()], prefix);
+                assert_eq!(&out[prefix.len()..], &buf[..expected_len], "prefix len={len} case={case}");
+            }
         }
     }
 }

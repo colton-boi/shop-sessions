@@ -1485,12 +1485,13 @@ struct RowGroupMeta {
 /// High-speed columnar Parquet v1 writer for `user_daily` using `RLE_DICTIONARY`
 /// and optional zero-revenue row-group splitting.
 ///
-/// Accumulates the Parquet file in a single `Vec<u8>` buffer (tightly pre-reserved via `rows * 6`)
-/// and flushes it in one `write_all` syscall in `finish()`.
+/// Streams each row group directly to `file` while tracking `file_offset` so memory stays bounded.
 pub struct FastUserDailyWriter {
     file: File,
+    file_offset: u64,
     buf: Vec<u8>,
     total_rows: u64,
+    revenue_i64: bool,
     groups: Vec<RowGroupMeta>,
     page_buf: Vec<u8>,
     dict_buf: Vec<u8>,
@@ -1499,7 +1500,12 @@ pub struct FastUserDailyWriter {
     split_scratch: SplitScratch,
 }
 
-fn emit_dict_page_into(buf: &mut Vec<u8>, num_values: usize, payload: &[u8]) -> (u64, u64) {
+fn emit_dict_page_into(
+    base_offset: u64,
+    buf: &mut Vec<u8>,
+    num_values: usize,
+    payload: &[u8],
+) -> (u64, u64) {
     let off = buf.len() as u64;
     {
         let mut t = ThriftWriter::new(buf);
@@ -1514,10 +1520,11 @@ fn emit_dict_page_into(buf: &mut Vec<u8>, num_values: usize, payload: &[u8]) -> 
     }
     buf.extend_from_slice(payload);
     let written = buf.len() as u64 - off;
-    (off, written)
+    (base_offset + off, written)
 }
 
 fn emit_data_page_into(
+    base_offset: u64,
     buf: &mut Vec<u8>,
     num_values: usize,
     encoding: i32,
@@ -1539,7 +1546,7 @@ fn emit_data_page_into(
     }
     buf.extend_from_slice(payload);
     let written = buf.len() as u64 - off;
-    (off, written)
+    (base_offset + off, written)
 }
 
 impl FastUserDailyWriter {
@@ -1549,8 +1556,10 @@ impl FastUserDailyWriter {
         buf.extend_from_slice(b"PAR1");
         FastUserDailyWriter {
             file,
+            file_offset: 0,
             buf,
             total_rows: 0,
+            revenue_i64: false,
             groups: Vec::new(),
             page_buf: Vec::with_capacity(64 << 10),
             dict_buf: Vec::with_capacity(64 << 10),
@@ -1560,6 +1569,159 @@ impl FastUserDailyWriter {
         }
     }
 
+    #[inline(always)]
+    pub fn is_revenue_i64(&self) -> bool {
+        self.revenue_i64
+    }
+
+    #[inline(always)]
+    pub fn set_revenue_i64(&mut self, v: bool) {
+        assert!(self.total_rows == 0 || self.revenue_i64 == v);
+        self.revenue_i64 = v;
+    }
+
+    #[inline(always)]
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    #[inline(always)]
+    fn flush_buf(&mut self) {
+        if !self.buf.is_empty() {
+            self.file.write_all(&self.buf).expect("write Parquet row group");
+            self.file_offset += self.buf.len() as u64;
+            self.buf.clear();
+        }
+    }
+
+    /// Streams a pre-split zero-revenue (`revenue_cents == 0`, `top_category == NULL`) chunk
+    /// directly as one Parquet row group using pre-encoded `PLAIN` user_id dictionary bytes.
+    pub fn write_zero_rev_direct(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+    ) {
+        let n = day.len();
+        if n == 0 {
+            return;
+        }
+        debug_assert_eq!(person_keys.len(), n);
+        debug_assert_eq!(sessions.len(), n);
+        debug_assert_eq!(events.len(), n);
+        self.buf.reserve(n.saturating_mul(4));
+
+        let c0 = self.write_user_id_plain_dict_col(names_plain, names_count, person_keys);
+        let c1 = self.write_day_col(day);
+        let c2 = self.write_sessions_col(sessions);
+        let c3 = self.write_events_col(events);
+        let c4 = if self.revenue_i64 {
+            self.write_const_i64_col(n, 0)
+        } else {
+            self.write_const_i32_col(n, 0)
+        };
+        let c5 = self.write_all_null_category_col(n);
+
+        self.total_rows += n as u64;
+        self.groups.push(RowGroupMeta {
+            num_rows: n as u64,
+            cols: [c0, c1, c2, c3, c4, c5],
+        });
+        self.flush_buf();
+    }
+
+    /// Streams a pre-split non-zero chunk directly as one Parquet row group using pre-encoded
+    /// `PLAIN` user_id dictionary bytes (`i32` revenue).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_nonz_direct(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+        revenue_cents: &[i32],
+        top_category: &[u8],
+        cat_dict_data: &[u8],
+        cat_dict_offsets: &[u32],
+    ) {
+        let n = day.len();
+        if n == 0 {
+            return;
+        }
+        debug_assert_eq!(person_keys.len(), n);
+        debug_assert_eq!(sessions.len(), n);
+        debug_assert_eq!(events.len(), n);
+        debug_assert_eq!(revenue_cents.len(), n);
+        debug_assert_eq!(top_category.len(), n);
+        self.buf.reserve(n.saturating_mul(6));
+
+        let c0 = self.write_user_id_plain_dict_col(names_plain, names_count, person_keys);
+        let c1 = self.write_day_col(day);
+        let c2 = self.write_sessions_col(sessions);
+        let c3 = self.write_events_col(events);
+        let c4 = if self.revenue_i64 {
+            self.write_i32_as_i64_const_or_plain(revenue_cents)
+        } else {
+            self.write_int32_const_or_plain(revenue_cents)
+        };
+        let c5 = self.write_top_category_slice(top_category, cat_dict_data, cat_dict_offsets);
+
+        self.total_rows += n as u64;
+        self.groups.push(RowGroupMeta {
+            num_rows: n as u64,
+            cols: [c0, c1, c2, c3, c4, c5],
+        });
+        self.flush_buf();
+    }
+
+    /// Streams a pre-split non-zero chunk directly as one Parquet row group with `INT64` revenue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_nonz_i64_direct(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+        revenue_i64: &[u64],
+        top_category: &[u8],
+        cat_dict_data: &[u8],
+        cat_dict_offsets: &[u32],
+    ) {
+        let n = day.len();
+        if n == 0 {
+            return;
+        }
+        assert!(self.revenue_i64 || self.total_rows == 0);
+        self.revenue_i64 = true;
+        debug_assert_eq!(person_keys.len(), n);
+        debug_assert_eq!(sessions.len(), n);
+        debug_assert_eq!(events.len(), n);
+        debug_assert_eq!(revenue_i64.len(), n);
+        debug_assert_eq!(top_category.len(), n);
+        self.buf.reserve(n.saturating_mul(6));
+
+        let c0 = self.write_user_id_plain_dict_col(names_plain, names_count, person_keys);
+        let c1 = self.write_day_col(day);
+        let c2 = self.write_sessions_col(sessions);
+        let c3 = self.write_events_col(events);
+        let c4 = self.write_u64_const_or_plain(revenue_i64);
+        let c5 = self.write_top_category_slice(top_category, cat_dict_data, cat_dict_offsets);
+
+        self.total_rows += n as u64;
+        self.groups.push(RowGroupMeta {
+            num_rows: n as u64,
+            cols: [c0, c1, c2, c3, c4, c5],
+        });
+        self.flush_buf();
+    }
+
     /// Writes `cols` in chunks of `chunk_rows` (e.g. 4096), splitting each chunk into a
     /// zero-revenue row group (`rev == 0 && cat == 0xFF`) and a non-zero row group.
     pub fn write_batches_split(&mut self, cols: &UserDailyCols<'_>, chunk_rows: usize) {
@@ -1567,8 +1729,8 @@ impl FastUserDailyWriter {
         if rows == 0 {
             return;
         }
-        self.buf.reserve(rows.saturating_mul(6));
         let step = chunk_rows.max(1);
+        self.buf.reserve(step.min(rows).saturating_mul(6));
         let mut from = 0usize;
         while from < rows {
             let to = (from + step).min(rows);
@@ -1592,7 +1754,11 @@ impl FastUserDailyWriter {
         let c1 = self.write_day_col(cols.day);
         let c2 = self.write_sessions_col(cols.sessions);
         let c3 = self.write_events_col(cols.events);
-        let c4 = self.write_const_i32_col(n, 0);
+        let c4 = if self.revenue_i64 {
+            self.write_const_i64_col(n, 0)
+        } else {
+            self.write_const_i32_col(n, 0)
+        };
         let c5 = self.write_all_null_category_col(n);
 
         self.total_rows += n as u64;
@@ -1600,6 +1766,7 @@ impl FastUserDailyWriter {
             num_rows: n as u64,
             cols: [c0, c1, c2, c3, c4, c5],
         });
+        self.flush_buf();
     }
 
     /// Writes `cols` directly as a single Parquet row group without splitting.
@@ -1613,7 +1780,11 @@ impl FastUserDailyWriter {
         let c1 = self.write_day_col(cols.day);
         let c2 = self.write_sessions_col(cols.sessions);
         let c3 = self.write_events_col(cols.events);
-        let c4 = self.write_int32_const_or_plain(cols.revenue_cents);
+        let c4 = if self.revenue_i64 {
+            self.write_i32_as_i64_const_or_plain(cols.revenue_cents)
+        } else {
+            self.write_int32_const_or_plain(cols.revenue_cents)
+        };
         let c5 = self.write_top_category_col(cols);
 
         self.total_rows += n as u64;
@@ -1621,9 +1792,58 @@ impl FastUserDailyWriter {
             num_rows: n as u64,
             cols: [c0, c1, c2, c3, c4, c5],
         });
+        self.flush_buf();
     }
 
-    /// 1. `user_id` (`BYTE_ARRAY`, `REQUIRED`):
+    /// 1a. `user_id` (`BYTE_ARRAY`, `REQUIRED`) directly from pre-encoded `PLAIN` dictionary bytes.
+    fn write_user_id_plain_dict_col(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+    ) -> ColChunkMeta {
+        debug_assert!(names_count > 0);
+        debug_assert!(!person_keys.is_empty());
+
+        let dict_off = self.file_offset + self.buf.len() as u64;
+        let hdr_start = self.buf.len();
+        {
+            let mut t = ThriftWriter::new(&mut self.buf);
+            t.i32(1, P_DICT);
+            t.i32(2, names_plain.len() as i32);
+            t.i32(3, names_plain.len() as i32);
+            t.begin_field(7); // DictionaryPageHeader
+            t.i32(1, names_count as i32);
+            t.i32(2, E_PLAIN);
+            t.end_struct();
+            self.buf.push(0);
+        }
+        let hdr_len = (self.buf.len() - hdr_start) as u64;
+        let dict_sz = hdr_len + names_plain.len() as u64;
+        if names_plain.len() >= (64 << 10) {
+            self.flush_buf();
+            self.file.write_all(names_plain).expect("write user_id dict");
+            self.file_offset += names_plain.len() as u64;
+        } else {
+            self.buf.extend_from_slice(names_plain);
+        }
+
+        let w = bit_width((names_count - 1) as u32);
+        self.page_buf.clear();
+        encode_rle_or_bitpack_keys(person_keys, 0, w, &mut self.page_buf);
+        let (data_off, data_sz) =
+            emit_data_page_into(self.file_offset, &mut self.buf, person_keys.len(), E_RLE_DICT, &self.page_buf);
+
+        ColChunkMeta {
+            file_offset: dict_off,
+            total_size: dict_sz + data_sz,
+            data_page_offset: data_off,
+            dict_page_offset: Some(dict_off),
+            uses_dict: true,
+        }
+    }
+
+    /// 1b. `user_id` (`BYTE_ARRAY`, `REQUIRED`):
     /// Dictionary page of `lo_person..=hi_person` + RLE/Bit-Packed `RLE_DICTIONARY` data page.
     fn write_user_id_col(&mut self, cols: &UserDailyCols<'_>) -> ColChunkMeta {
         let keys = cols.person_keys;
@@ -1648,13 +1868,13 @@ impl FastUserDailyWriter {
             self.dict_buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
             self.dict_buf.extend_from_slice(name);
         }
-        let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, dict_count, &self.dict_buf);
+        let (dict_off, dict_sz) = emit_dict_page_into(self.file_offset, &mut self.buf, dict_count, &self.dict_buf);
 
         let w = bit_width(hi - lo);
         self.page_buf.clear();
         encode_rle_or_bitpack_keys(keys, lo, w, &mut self.page_buf);
         let (data_off, data_sz) =
-            emit_data_page_into(&mut self.buf, keys.len(), E_RLE_DICT, &self.page_buf);
+            emit_data_page_into(self.file_offset, &mut self.buf, keys.len(), E_RLE_DICT, &self.page_buf);
 
         ColChunkMeta {
             file_offset: dict_off,
@@ -1682,7 +1902,7 @@ impl FastUserDailyWriter {
         for v in min_v..=max_v {
             self.dict_buf.extend_from_slice(&v.to_le_bytes());
         }
-        let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, dict_count, &self.dict_buf);
+        let (dict_off, dict_sz) = emit_dict_page_into(self.file_offset, &mut self.buf, dict_count, &self.dict_buf);
 
         let w = bit_width(span).max(min_bit_width);
         self.page_buf.clear();
@@ -1694,7 +1914,7 @@ impl FastUserDailyWriter {
             encode_sub_min_bitpacked_u8(values, min_v, w, &mut self.page_buf);
         }
         let (data_off, data_sz) =
-            emit_data_page_into(&mut self.buf, values.len(), E_RLE_DICT, &self.page_buf);
+            emit_data_page_into(self.file_offset, &mut self.buf, values.len(), E_RLE_DICT, &self.page_buf);
 
         ColChunkMeta {
             file_offset: dict_off,
@@ -1752,14 +1972,34 @@ impl FastUserDailyWriter {
 
     fn write_const_i32_col(&mut self, n: usize, val: i32) -> ColChunkMeta {
         let dict_bytes = val.to_le_bytes();
-        let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, 1, &dict_bytes);
+        let (dict_off, dict_sz) = emit_dict_page_into(self.file_offset, &mut self.buf, 1, &dict_bytes);
 
         self.page_buf.clear();
         self.page_buf.push(1); // bit-width = 1
         push_varint(&mut self.page_buf, (n as u64) << 1);
         self.page_buf.push(0); // dictionary index 0
         let (data_off, data_sz) =
-            emit_data_page_into(&mut self.buf, n, E_RLE_DICT, &self.page_buf);
+            emit_data_page_into(self.file_offset, &mut self.buf, n, E_RLE_DICT, &self.page_buf);
+
+        ColChunkMeta {
+            file_offset: dict_off,
+            total_size: dict_sz + data_sz,
+            data_page_offset: data_off,
+            dict_page_offset: Some(dict_off),
+            uses_dict: true,
+        }
+    }
+
+    fn write_const_i64_col(&mut self, n: usize, val: u64) -> ColChunkMeta {
+        let dict_bytes = val.to_le_bytes();
+        let (dict_off, dict_sz) = emit_dict_page_into(self.file_offset, &mut self.buf, 1, &dict_bytes);
+
+        self.page_buf.clear();
+        self.page_buf.push(1); // bit-width = 1
+        push_varint(&mut self.page_buf, (n as u64) << 1);
+        self.page_buf.push(0); // dictionary index 0
+        let (data_off, data_sz) =
+            emit_data_page_into(self.file_offset, &mut self.buf, n, E_RLE_DICT, &self.page_buf);
 
         ColChunkMeta {
             file_offset: dict_off,
@@ -1782,12 +2022,54 @@ impl FastUserDailyWriter {
         }
     }
 
+    fn write_i32_as_i64_const_or_plain(&mut self, values: &[i32]) -> ColChunkMeta {
+        let (min_v, max_v) = min_max_i32(values);
+        if min_v == max_v {
+            self.write_const_i64_col(values.len(), min_v as i64 as u64)
+        } else {
+            self.page_buf.clear();
+            self.page_buf.reserve(values.len() * 8);
+            for &v in values {
+                self.page_buf.extend_from_slice(&(v as i64).to_le_bytes());
+            }
+            let (data_off, data_sz) =
+                emit_data_page_into(self.file_offset, &mut self.buf, values.len(), E_PLAIN, &self.page_buf);
+            ColChunkMeta {
+                file_offset: data_off,
+                total_size: data_sz,
+                data_page_offset: data_off,
+                dict_page_offset: None,
+                uses_dict: false,
+            }
+        }
+    }
+
+    fn write_u64_const_or_plain(&mut self, values: &[u64]) -> ColChunkMeta {
+        let first = values[0];
+        if values[1..].iter().all(|&v| v == first) {
+            self.write_const_i64_col(values.len(), first)
+        } else {
+            let raw_bytes = unsafe {
+                std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 8)
+            };
+            let (data_off, data_sz) =
+                emit_data_page_into(self.file_offset, &mut self.buf, values.len(), E_PLAIN, raw_bytes);
+            ColChunkMeta {
+                file_offset: data_off,
+                total_size: data_sz,
+                data_page_offset: data_off,
+                dict_page_offset: None,
+                uses_dict: false,
+            }
+        }
+    }
+
     fn write_plain_i32(&mut self, values: &[i32]) -> ColChunkMeta {
         let raw_bytes = unsafe {
             std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
         };
         let (data_off, data_sz) =
-            emit_data_page_into(&mut self.buf, values.len(), E_PLAIN, raw_bytes);
+            emit_data_page_into(self.file_offset, &mut self.buf, values.len(), E_PLAIN, raw_bytes);
         ColChunkMeta {
             file_offset: data_off,
             total_size: data_sz,
@@ -1805,7 +2087,7 @@ impl FastUserDailyWriter {
         push_varint(&mut self.page_buf, hdr);
         self.page_buf.push(0); // def level 0 (NULL) repeated n times
         let (data_off, data_sz) =
-            emit_data_page_into(&mut self.buf, n, E_PLAIN, &self.page_buf);
+            emit_data_page_into(self.file_offset, &mut self.buf, n, E_PLAIN, &self.page_buf);
 
         ColChunkMeta {
             file_offset: data_off,
@@ -1822,30 +2104,38 @@ impl FastUserDailyWriter {
     /// - Otherwise: Dictionary Page of category strings + `E_RLE_DICT` Data Page encoded via
     ///   `encode_top_category_chunk`.
     fn write_top_category_col(&mut self, cols: &UserDailyCols<'_>) -> ColChunkMeta {
-        let cats = cols.top_category;
+        self.write_top_category_slice(cols.top_category, cols.cat_dict_data, cols.cat_dict_offsets)
+    }
+
+    fn write_top_category_slice(
+        &mut self,
+        cats: &[u8],
+        cat_dict_data: &[u8],
+        cat_dict_offsets: &[u32],
+    ) -> ColChunkMeta {
         let n = cats.len();
 
         if !has_non_null_u8(cats) {
             self.write_all_null_category_col(n)
         } else {
-            let num_cats = cols.cat_dict_offsets.len().saturating_sub(1);
+            let num_cats = cat_dict_offsets.len().saturating_sub(1);
             self.dict_buf.clear();
             self.dict_buf
-                .reserve(num_cats * 4 + cols.cat_dict_data.len());
+                .reserve(num_cats * 4 + cat_dict_data.len());
             for c in 0..num_cats {
-                let s = cols.cat_dict_offsets[c] as usize;
-                let e = cols.cat_dict_offsets[c + 1] as usize;
-                let bytes = &cols.cat_dict_data[s..e];
+                let s = cat_dict_offsets[c] as usize;
+                let e = cat_dict_offsets[c + 1] as usize;
+                let bytes = &cat_dict_data[s..e];
                 self.dict_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 self.dict_buf.extend_from_slice(bytes);
             }
-            let (dict_off, dict_sz) = emit_dict_page_into(&mut self.buf, num_cats, &self.dict_buf);
+            let (dict_off, dict_sz) = emit_dict_page_into(self.file_offset, &mut self.buf, num_cats, &self.dict_buf);
 
             self.page_buf.clear();
             encode_top_category_chunk(cats, num_cats, &mut self.cat_u8_buf, &mut self.page_buf);
 
             let (data_off, data_sz) =
-                emit_data_page_into(&mut self.buf, n, E_RLE_DICT, &self.page_buf);
+                emit_data_page_into(self.file_offset, &mut self.buf, n, E_RLE_DICT, &self.page_buf);
 
             ColChunkMeta {
                 file_offset: dict_off,
@@ -1867,12 +2157,13 @@ impl FastUserDailyWriter {
             logical_tag: Option<i16>,
         }
 
-        const SPECS: [ColSpec; 6] = [
+        let rev_ty = if self.revenue_i64 { TYPE_INT64 } else { TYPE_INT32 };
+        let specs: [ColSpec; 6] = [
             ColSpec { name: b"user_id", ty: TYPE_BYTE_ARRAY, rep: REP_REQUIRED, converted: Some(0), logical_tag: Some(1) },
             ColSpec { name: b"day", ty: TYPE_INT32, rep: REP_REQUIRED, converted: Some(6), logical_tag: Some(6) },
             ColSpec { name: b"sessions", ty: TYPE_INT32, rep: REP_REQUIRED, converted: None, logical_tag: None },
             ColSpec { name: b"events", ty: TYPE_INT32, rep: REP_REQUIRED, converted: None, logical_tag: None },
-            ColSpec { name: b"revenue_cents", ty: TYPE_INT32, rep: REP_REQUIRED, converted: None, logical_tag: None },
+            ColSpec { name: b"revenue_cents", ty: rev_ty, rep: REP_REQUIRED, converted: None, logical_tag: None },
             ColSpec { name: b"top_category", ty: TYPE_BYTE_ARRAY, rep: REP_OPTIONAL, converted: Some(0), logical_tag: Some(1) },
         ];
 
@@ -1880,15 +2171,15 @@ impl FastUserDailyWriter {
         {
             let mut t = ThriftWriter::new(&mut self.buf);
             t.i32(1, 1); // version = 1
-            t.list(2, T_STRUCT, SPECS.len() + 1);
+            t.list(2, T_STRUCT, specs.len() + 1);
 
             // Root schema element
             t.begin_struct();
             t.binary(4, b"schema");
-            t.i32(5, SPECS.len() as i32);
+            t.i32(5, specs.len() as i32);
             t.end_struct();
 
-            for spec in &SPECS {
+            for spec in &specs {
                 t.begin_struct();
                 t.i32(1, spec.ty);
                 t.i32(3, spec.rep);
@@ -1910,9 +2201,9 @@ impl FastUserDailyWriter {
 
             for g in &self.groups {
                 t.begin_struct();
-                t.list(1, T_STRUCT, SPECS.len());
+                t.list(1, T_STRUCT, specs.len());
                 let mut rg_bytes = 0u64;
-                for (spec, chunk) in SPECS.iter().zip(&g.cols) {
+                for (spec, chunk) in specs.iter().zip(&g.cols) {
                     rg_bytes += chunk.total_size;
                     t.begin_struct();
                     t.i64(2, chunk.file_offset as i64);
@@ -2834,5 +3125,171 @@ print(f"OK rows={duck_rows[0]} sess={duck_rows[1]} purch={duck_rows[2]} rev={duc
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    fn encode_plain_names(names: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for name in names {
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn test_fast_parquet_direct_streaming_and_i64_overflow() {
+        let tmp_dir = std::env::temp_dir();
+        let stream_path = tmp_dir.join("fast_pq_test_direct_stream.parquet");
+        let i64_path = tmp_dir.join("fast_pq_test_direct_i64.parquet");
+
+        let categories = ["apparel", "books", "electronics"];
+        let mut cat_data = Vec::new();
+        let mut cat_off = vec![0u32];
+        for c in &categories {
+            cat_data.extend_from_slice(c.as_bytes());
+            cat_off.push(cat_data.len() as u32);
+        }
+
+        // 1. Stream >65,536 zero-rev rows + >65,536 nonz rows across multiple direct row groups.
+        let mut exp_rows = 0usize;
+        let mut exp_nulls = 0usize;
+        let mut exp_rev = 0i64;
+        let mut exp_sess = 0i64;
+        let mut exp_ev = 0i64;
+        {
+            let mut w = FastUserDailyWriter::create(&stream_path);
+            for chunk in 0..2 {
+                let n = 66_000usize;
+                let names: Vec<String> = (0..n / 2).map(|i| format!("uz_{chunk}_{i:06}")).collect();
+                let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+                let names_plain = encode_plain_names(&name_refs);
+                let mut pk = Vec::with_capacity(n);
+                let mut day = Vec::with_capacity(n);
+                let mut sess = Vec::with_capacity(n);
+                let mut ev = Vec::with_capacity(n);
+                for i in 0..n {
+                    pk.push((i / 2) as u32);
+                    day.push(20727 + (i % 15) as i32);
+                    sess.push(1 + (i % 3) as i32);
+                    ev.push(1 + (i % 10) as i32);
+                }
+                exp_rows += n;
+                exp_nulls += n;
+                exp_sess += sess.iter().map(|&v| v as i64).sum::<i64>();
+                exp_ev += ev.iter().map(|&v| v as i64).sum::<i64>();
+                w.write_zero_rev_direct(&names_plain, name_refs.len(), &pk, &day, &sess, &ev);
+            }
+
+            let nz_n = 70_000usize;
+            let nz_names: Vec<String> = (0..nz_n).map(|i| format!("unz_{i:06}")).collect();
+            let nz_refs: Vec<&str> = nz_names.iter().map(|s| s.as_str()).collect();
+            let nz_plain = encode_plain_names(&nz_refs);
+            let mut pk = Vec::with_capacity(nz_n);
+            let mut day = Vec::with_capacity(nz_n);
+            let mut sess = Vec::with_capacity(nz_n);
+            let mut ev = Vec::with_capacity(nz_n);
+            let mut rev = Vec::with_capacity(nz_n);
+            let mut cat = Vec::with_capacity(nz_n);
+            for i in 0..nz_n {
+                pk.push(i as u32);
+                day.push(20727 + (i % 10) as i32);
+                sess.push(1 + (i % 5) as i32);
+                ev.push(2 + (i % 7) as i32);
+                if i % 4 == 0 {
+                    rev.push(0);
+                    cat.push((i % categories.len()) as u8);
+                } else {
+                    rev.push(100 + (i % 5000) as i32);
+                    cat.push(if i % 3 == 0 { NULL_CAT } else { (i % categories.len()) as u8 });
+                }
+            }
+            exp_rows += nz_n;
+            exp_nulls += cat.iter().filter(|&&c| c == NULL_CAT).count();
+            exp_rev += rev.iter().map(|&v| v as i64).sum::<i64>();
+            exp_sess += sess.iter().map(|&v| v as i64).sum::<i64>();
+            exp_ev += ev.iter().map(|&v| v as i64).sum::<i64>();
+            w.write_nonz_direct(
+                &nz_plain,
+                nz_refs.len(),
+                &pk,
+                &day,
+                &sess,
+                &ev,
+                &rev,
+                &cat,
+                &cat_data,
+                &cat_off,
+            );
+            w.finish();
+        }
+
+        // 2. Test INT64 revenue overflow via write_nonz_i64_direct + write_zero_rev_direct
+        let i64_revs = [100u64, (i32::MAX as u64) + 12345, 9_000_000_000u64];
+        {
+            let mut w = FastUserDailyWriter::create(&i64_path);
+            let nz_plain = encode_plain_names(&["whale_1", "whale_2", "whale_3"]);
+            w.write_nonz_i64_direct(
+                &nz_plain,
+                3,
+                &[0, 1, 2],
+                &[20727, 20728, 20729],
+                &[1, 2, 3],
+                &[10, 20, 30],
+                &i64_revs,
+                &[0, NULL_CAT, 2],
+                &cat_data,
+                &cat_off,
+            );
+            let z_plain = encode_plain_names(&["zero_1", "zero_2"]);
+            w.write_zero_rev_direct(&z_plain, 2, &[0, 1], &[20727, 20728], &[1, 1], &[2, 3]);
+            w.finish();
+        }
+
+        let venv_py = Path::new("/home/colton/Documents/Projects/Builders/#3/.venv/bin/python");
+        if venv_py.exists() {
+            let script = r#"
+import sys
+import polars as pl
+import pyarrow.parquet as pq
+import duckdb
+
+p1, p2 = sys.argv[1], sys.argv[2]
+for p in (p1, p2):
+    pq.read_table(p)
+    duckdb.sql(f"SELECT COUNT(*) FROM read_parquet('{p}')").fetchall()
+
+df1 = pl.read_parquet(p1)
+print(f"STREAM rows={df1.height} nulls={df1['top_category'].null_count()} rev={df1['revenue_cents'].sum()} sess={df1['sessions'].sum()} ev={df1['events'].sum()}")
+df2 = pl.read_parquet(p2)
+print(f"I64 rows={df2.height} nulls={df2['top_category'].null_count()} rev={df2['revenue_cents'].sum()} sess={df2['sessions'].sum()} ev={df2['events'].sum()}")
+"#;
+            let out = Command::new(venv_py)
+                .arg("-c")
+                .arg(script)
+                .arg(stream_path.to_str().unwrap())
+                .arg(i64_path.to_str().unwrap())
+                .output()
+                .expect("run python verifier");
+            assert!(
+                out.status.success(),
+                "Python verifier failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(
+                lines[0],
+                format!("STREAM rows={exp_rows} nulls={exp_nulls} rev={exp_rev} sess={exp_sess} ev={exp_ev}")
+            );
+            let exp_i64_rev: u64 = i64_revs.iter().sum();
+            assert_eq!(
+                lines[1],
+                format!("I64 rows=5 nulls=3 rev={exp_i64_rev} sess=8 ev=65")
+            );
+        }
+
+        let _ = std::fs::remove_file(&stream_path);
+        let _ = std::fs::remove_file(&i64_path);
     }
 }

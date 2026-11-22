@@ -1,6 +1,5 @@
 use crate::fast_parquet::{FastUserDailyWriter, UserDailyCols, NULL_CAT};
 use crate::ids::{append_tok_bytes, click_less, event_canon_key, event_eq};
-use crate::parquet::{Col, Kind, Writer, BYTES, INT32, INT64};
 use crate::ts::DAY_MS;
 use crate::sys::mix;
 use crate::{CRec, DRec, PRec, Shared, DEAD, NONE};
@@ -9,35 +8,54 @@ use std::path::PathBuf;
 
 const SESSION_GAP: u32 = 1_800_000;
 const WEEK: u32 = 604_800_000;
+const DAY_MS_U32: u32 = DAY_MS as u32;
 
-pub static USER_COLS: [Col; 6] = [
-    Col { name: "user_id", ty: BYTES, kind: Kind::Utf8 },
-    Col { name: "day", ty: INT32, kind: Kind::Date },
-    Col { name: "sessions", ty: INT32, kind: Kind::Plain },
-    Col { name: "events", ty: INT32, kind: Kind::Plain },
-    Col { name: "revenue_cents", ty: INT64, kind: Kind::Plain },
-    Col { name: "top_category", ty: BYTES, kind: Kind::Utf8 },
-];
+const FLUSH_ROWS: usize = 65_536;
 
-const FLUSH_ROWS: usize = 4_096;
+/// Appends `person_tok` directly as a Parquet `PLAIN` `BYTE_ARRAY` entry (`[len_le32, bytes...]`)
+/// into `names_plain`, returning its dense dictionary index and incrementing `names_count`.
+#[inline(always)]
+fn append_plain_tok(person_tok: u64, names_plain: &mut Vec<u8>, names_count: &mut u32) -> u32 {
+    let old = names_plain.len();
+    names_plain.reserve(4 + 33);
+    names_plain.extend_from_slice(&[0u8; 4]);
+    append_tok_bytes(person_tok, names_plain);
+    let tok_len = (names_plain.len() - old - 4) as u32;
+    names_plain[old..old + 4].copy_from_slice(&tok_len.to_le_bytes());
+    let key = *names_count;
+    *names_count = key + 1;
+    key
+}
 
-/// One thread's `user_daily` file, buffered in columnar vectors and written with
-/// `RLE_DICTIONARY` + zero-revenue split row groups.
+/// One thread's `user_daily` file, directly split into zero-revenue and non-zero live buffers
+/// and streamed as Parquet v1 `RLE_DICTIONARY` row groups at `FLUSH_ROWS`.
 pub struct UserOut {
     path: PathBuf,
-    names_data: Vec<u8>,
-    names_offsets: Vec<u32>,
-    person_keys: Vec<u32>,
-    day: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
-    revenue_cents: Vec<i32>,
-    revenue_i64_overflow: bool,
-    revenue_i64_raw: Vec<u64>,
-    top_category: Vec<u8>,
+    writer: Option<FastUserDailyWriter>,
+    spill_idx: u32,
+
+    z_names_plain: Vec<u8>,
+    z_names_count: u32,
+    z_person_keys: Vec<u32>,
+    z_day: Vec<i32>,
+    z_sessions: Vec<i32>,
+    z_events: Vec<i32>,
+    cur_person_z_key: u32,
+
+    nz_names_plain: Vec<u8>,
+    nz_names_count: u32,
+    nz_person_keys: Vec<u32>,
+    nz_day: Vec<i32>,
+    nz_sessions: Vec<i32>,
+    nz_events: Vec<i32>,
+    nz_revenue: Vec<i32>,
+    nz_revenue_i64: Vec<u64>,
+    nz_revenue_overflow: bool,
+    nz_top_category: Vec<u8>,
+    cur_person_nz_key: u32,
+
     cat_dict_data: Vec<u8>,
     cat_dict_offsets: Vec<u32>,
-    cur_person_started: bool,
 }
 
 pub fn build_cat_dict(categories: &[Vec<u8>]) -> (Vec<u8>, Vec<u32>) {
@@ -59,116 +77,237 @@ impl UserOut {
 
     pub fn with_categories(path: PathBuf, categories: &[Vec<u8>]) -> Self {
         let (cat_dict_data, cat_dict_offsets) = build_cat_dict(categories);
+        let z_cap = if path.as_os_str().is_empty() { 0 } else { FLUSH_ROWS + 256 };
+        let nz_cap = if path.as_os_str().is_empty() { 0 } else { 16_384 };
         UserOut {
             path,
-            names_data: Vec::with_capacity(64 << 10),
-            names_offsets: vec![0],
-            person_keys: Vec::with_capacity(FLUSH_ROWS),
-            day: Vec::with_capacity(FLUSH_ROWS),
-            sessions: Vec::with_capacity(FLUSH_ROWS),
-            events: Vec::with_capacity(FLUSH_ROWS),
-            revenue_cents: Vec::with_capacity(FLUSH_ROWS),
-            revenue_i64_overflow: false,
-            revenue_i64_raw: Vec::new(),
-            top_category: Vec::with_capacity(FLUSH_ROWS),
+            writer: None,
+            spill_idx: 0,
+
+            z_names_plain: Vec::with_capacity(if z_cap > 0 { 256 << 10 } else { 0 }),
+            z_names_count: 0,
+            z_person_keys: Vec::with_capacity(z_cap),
+            z_day: Vec::with_capacity(z_cap),
+            z_sessions: Vec::with_capacity(z_cap),
+            z_events: Vec::with_capacity(z_cap),
+            cur_person_z_key: u32::MAX,
+
+            nz_names_plain: Vec::with_capacity(if nz_cap > 0 { 64 << 10 } else { 0 }),
+            nz_names_count: 0,
+            nz_person_keys: Vec::with_capacity(nz_cap),
+            nz_day: Vec::with_capacity(nz_cap),
+            nz_sessions: Vec::with_capacity(nz_cap),
+            nz_events: Vec::with_capacity(nz_cap),
+            nz_revenue: Vec::with_capacity(nz_cap),
+            nz_revenue_i64: Vec::new(),
+            nz_revenue_overflow: false,
+            nz_top_category: Vec::with_capacity(nz_cap),
+            cur_person_nz_key: u32::MAX,
+
             cat_dict_data,
             cat_dict_offsets,
-            cur_person_started: false,
         }
     }
 
     #[inline(always)]
     pub fn begin_person(&mut self) {
-        self.cur_person_started = false;
+        self.cur_person_z_key = u32::MAX;
+        self.cur_person_nz_key = u32::MAX;
+        if self.z_day.len() >= FLUSH_ROWS {
+            self.flush_zero();
+        }
+        if self.nz_day.len() >= FLUSH_ROWS {
+            self.flush_nonz();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn promote_nz_revenue_i64(&mut self) {
+        self.nz_revenue_overflow = true;
+        self.nz_revenue_i64.reserve(self.nz_revenue.len() + 1);
+        self.nz_revenue_i64
+            .extend(self.nz_revenue.iter().map(|&r| r as u32 as u64));
+    }
+
+    fn spill_path(&self, idx: u32) -> PathBuf {
+        let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("part");
+        let name = if idx == 1 {
+            format!("{stem}.i64.parquet")
+        } else {
+            format!("{stem}.i64.{idx}.parquet")
+        };
+        match self.path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.join(name),
+            _ => PathBuf::from(name),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn flush_zero(&mut self) {
+        if self.z_day.is_empty() {
+            return;
+        }
+        let i64_mode = self.nz_revenue_overflow;
+        let w = self.writer.get_or_insert_with(|| {
+            let mut w = FastUserDailyWriter::create(&self.path);
+            if i64_mode {
+                w.set_revenue_i64(true);
+            }
+            w
+        });
+        w.write_zero_rev_direct(
+            &self.z_names_plain,
+            self.z_names_count as usize,
+            &self.z_person_keys,
+            &self.z_day,
+            &self.z_sessions,
+            &self.z_events,
+        );
+        self.z_names_plain.clear();
+        self.z_names_count = 0;
+        self.z_person_keys.clear();
+        self.z_day.clear();
+        self.z_sessions.clear();
+        self.z_events.clear();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn flush_nonz(&mut self) {
+        if self.nz_day.is_empty() {
+            return;
+        }
+        if self.nz_revenue_overflow {
+            let need_spill = matches!(
+                self.writer.as_ref(),
+                Some(w) if !w.is_revenue_i64() && w.total_rows() > 0
+            );
+            if need_spill {
+                if let Some(old_w) = self.writer.take() {
+                    old_w.finish();
+                }
+                self.spill_idx += 1;
+                let spill_path = self.spill_path(self.spill_idx);
+                let mut w = FastUserDailyWriter::create(&spill_path);
+                w.set_revenue_i64(true);
+                self.writer = Some(w);
+            } else {
+                let w = self
+                    .writer
+                    .get_or_insert_with(|| FastUserDailyWriter::create(&self.path));
+                if !w.is_revenue_i64() {
+                    w.set_revenue_i64(true);
+                }
+            }
+            let w = self.writer.as_mut().unwrap();
+            w.write_nonz_i64_direct(
+                &self.nz_names_plain,
+                self.nz_names_count as usize,
+                &self.nz_person_keys,
+                &self.nz_day,
+                &self.nz_sessions,
+                &self.nz_events,
+                &self.nz_revenue_i64,
+                &self.nz_top_category,
+                &self.cat_dict_data,
+                &self.cat_dict_offsets,
+            );
+        } else {
+            let w = self
+                .writer
+                .get_or_insert_with(|| FastUserDailyWriter::create(&self.path));
+            w.write_nonz_direct(
+                &self.nz_names_plain,
+                self.nz_names_count as usize,
+                &self.nz_person_keys,
+                &self.nz_day,
+                &self.nz_sessions,
+                &self.nz_events,
+                &self.nz_revenue,
+                &self.nz_top_category,
+                &self.cat_dict_data,
+                &self.cat_dict_offsets,
+            );
+        }
+        self.nz_names_plain.clear();
+        self.nz_names_count = 0;
+        self.nz_person_keys.clear();
+        self.nz_day.clear();
+        self.nz_sessions.clear();
+        self.nz_events.clear();
+        self.nz_revenue.clear();
+        self.nz_revenue_i64.clear();
+        self.nz_revenue_overflow = false;
+        self.nz_top_category.clear();
     }
 
     #[inline(always)]
-    fn add(&mut self, person_tok: u64, day: i32, sessions: u32, events: u32, revenue: u64, category_idx: Option<u8>) {
-        if !self.cur_person_started {
-            append_tok_bytes(person_tok, &mut self.names_data);
-            self.names_offsets.push(self.names_data.len() as u32);
-            self.cur_person_started = true;
-        }
-        let pk = (self.names_offsets.len() - 2) as u32;
-        self.person_keys.push(pk);
-        self.day.push(day);
-        self.sessions.push(sessions as i32);
-        self.events.push(events as i32);
-        if revenue > i32::MAX as u64 {
-            if !self.revenue_i64_overflow {
-                self.revenue_i64_overflow = true;
-                self.revenue_i64_raw.extend(self.revenue_cents.iter().map(|&r| r as u64));
+    pub fn add(
+        &mut self,
+        person_tok: u64,
+        day: i32,
+        sessions: u32,
+        events: u32,
+        revenue: u64,
+        category_idx: Option<u8>,
+    ) {
+        if revenue == 0 && category_idx.is_none() {
+            let pk = if self.cur_person_z_key == u32::MAX {
+                let k = append_plain_tok(person_tok, &mut self.z_names_plain, &mut self.z_names_count);
+                self.cur_person_z_key = k;
+                k
+            } else {
+                self.cur_person_z_key
+            };
+            self.z_person_keys.push(pk);
+            self.z_day.push(day);
+            self.z_sessions.push(sessions as i32);
+            self.z_events.push(events as i32);
+        } else {
+            let pk = if self.cur_person_nz_key == u32::MAX {
+                let k = append_plain_tok(person_tok, &mut self.nz_names_plain, &mut self.nz_names_count);
+                self.cur_person_nz_key = k;
+                k
+            } else {
+                self.cur_person_nz_key
+            };
+            self.nz_person_keys.push(pk);
+            self.nz_day.push(day);
+            self.nz_sessions.push(sessions as i32);
+            self.nz_events.push(events as i32);
+            if revenue > i32::MAX as u64 && !self.nz_revenue_overflow {
+                self.promote_nz_revenue_i64();
             }
+            if self.nz_revenue_overflow {
+                self.nz_revenue_i64.push(revenue);
+            }
+            self.nz_revenue.push(revenue as i32);
+            self.nz_top_category.push(category_idx.unwrap_or(NULL_CAT));
         }
-        if self.revenue_i64_overflow {
-            self.revenue_i64_raw.push(revenue);
-        }
-        self.revenue_cents.push(revenue as i32);
-        self.top_category.push(category_idx.unwrap_or(NULL_CAT));
     }
 
     /// An empty table still needs one file to carry the schema.
-    pub fn finish(self, even_if_empty: bool) {
-        let rows = self.day.len();
-        if rows == 0 && !even_if_empty {
-            return;
-        }
-        if !self.revenue_i64_overflow {
-            let mut w = FastUserDailyWriter::create(&self.path);
-            if rows > 0 {
-                let cols = UserDailyCols {
-                    names_data: &self.names_data,
-                    names_offsets: &self.names_offsets,
-                    person_keys: &self.person_keys,
-                    day: &self.day,
-                    sessions: &self.sessions,
-                    events: &self.events,
-                    revenue_cents: &self.revenue_cents,
-                    top_category: &self.top_category,
-                    cat_dict_data: &self.cat_dict_data,
-                    cat_dict_offsets: &self.cat_dict_offsets,
-                };
-                w.write_batches_split(&cols, FLUSH_ROWS);
-            }
-            w.finish();
-        } else {
-            let mut w = Writer::create(&self.path, &USER_COLS);
-            let mut u_buf = Vec::with_capacity(rows * 12);
-            let mut d_buf = Vec::with_capacity(rows * 4);
-            let mut s_buf = Vec::with_capacity(rows * 4);
-            let mut e_buf = Vec::with_capacity(rows * 4);
-            let mut r_buf = Vec::with_capacity(rows * 8);
-            let mut c_buf = Vec::new();
-            let mut pres = vec![0u8; rows.div_ceil(8)];
-            for i in 0..rows {
-                let pk = self.person_keys[i] as usize;
-                let uname = &self.names_data[self.names_offsets[pk] as usize..self.names_offsets[pk + 1] as usize];
-                u_buf.extend_from_slice(&(uname.len() as u32).to_le_bytes());
-                u_buf.extend_from_slice(uname);
-                d_buf.extend_from_slice(&self.day[i].to_le_bytes());
-                s_buf.extend_from_slice(&self.sessions[i].to_le_bytes());
-                e_buf.extend_from_slice(&self.events[i].to_le_bytes());
-                let rev = self.revenue_i64_raw.get(i).copied().unwrap_or(self.revenue_cents[i] as u64);
-                r_buf.extend_from_slice(&rev.to_le_bytes());
-                let cat = self.top_category[i];
-                if cat != NULL_CAT {
-                    let cs = &self.cat_dict_data[self.cat_dict_offsets[cat as usize] as usize..self.cat_dict_offsets[cat as usize + 1] as usize];
-                    c_buf.extend_from_slice(&(cs.len() as u32).to_le_bytes());
-                    c_buf.extend_from_slice(cs);
-                    pres[i / 8] |= 1 << (i % 8);
+    pub fn finish(mut self, even_if_empty: bool) {
+        if self.z_day.is_empty() && self.nz_day.is_empty() {
+            match self.writer.take() {
+                Some(w) => w.finish(),
+                None => {
+                    if even_if_empty {
+                        FastUserDailyWriter::create(&self.path).finish();
+                    }
                 }
             }
-            w.row_group(
-                rows,
-                &[
-                    (&u_buf, None),
-                    (&d_buf, None),
-                    (&s_buf, None),
-                    (&e_buf, None),
-                    (&r_buf, None),
-                    (&c_buf, Some(&pres)),
-                ],
-            );
+            return;
+        }
+        if !self.z_day.is_empty() {
+            self.flush_zero();
+        }
+        if !self.nz_day.is_empty() {
+            self.flush_nonz();
+        }
+        if let Some(w) = self.writer.take() {
             w.finish();
         }
     }
@@ -176,121 +315,19 @@ impl UserOut {
     /// Writes both `extra` (from the fast-path sessionizer) and `self` (from complex users)
     /// into a single `user_daily/part-*.parquet` file.
     #[allow(dead_code)]
-    pub fn finish_with_extra(self, extra: &UserDailyCols<'_>, even_if_empty: bool) {
-        let rows = self.day.len();
-        if rows == 0 && extra.is_empty() && !even_if_empty {
-            return;
-        }
-        if !self.revenue_i64_overflow {
-            let mut w = FastUserDailyWriter::create(&self.path);
-            if !extra.is_empty() {
-                w.write_batches_split(extra, FLUSH_ROWS);
-            }
-            if rows > 0 {
-                let cols = UserDailyCols {
-                    names_data: &self.names_data,
-                    names_offsets: &self.names_offsets,
-                    person_keys: &self.person_keys,
-                    day: &self.day,
-                    sessions: &self.sessions,
-                    events: &self.events,
-                    revenue_cents: &self.revenue_cents,
-                    top_category: &self.top_category,
-                    cat_dict_data: &self.cat_dict_data,
-                    cat_dict_offsets: &self.cat_dict_offsets,
-                };
-                w.write_batches_split(&cols, FLUSH_ROWS);
-            }
-            w.finish();
-        } else {
-            let mut w = Writer::create(&self.path, &USER_COLS);
-            let write_cols_plain = |w: &mut Writer,
-                                    n: usize,
-                                    names_data: &[u8],
-                                    names_offsets: &[u32],
-                                    person_keys: &[u32],
-                                    day: &[i32],
-                                    sessions: &[i32],
-                                    events: &[i32],
-                                    rev_i32: &[i32],
-                                    rev_i64: Option<&[u64]>,
-                                    top_category: &[u8],
-                                    cat_data: &[u8],
-                                    cat_off: &[u32]| {
-                if n == 0 {
-                    return;
+    pub fn finish_with_extra(mut self, extra: &UserDailyCols<'_>, even_if_empty: bool) {
+        if !extra.is_empty() {
+            let i64_mode = self.nz_revenue_overflow;
+            let w = self.writer.get_or_insert_with(|| {
+                let mut w = FastUserDailyWriter::create(&self.path);
+                if i64_mode {
+                    w.set_revenue_i64(true);
                 }
-                let mut u_buf = Vec::with_capacity(n * 12);
-                let mut d_buf = Vec::with_capacity(n * 4);
-                let mut s_buf = Vec::with_capacity(n * 4);
-                let mut e_buf = Vec::with_capacity(n * 4);
-                let mut r_buf = Vec::with_capacity(n * 8);
-                let mut c_buf = Vec::new();
-                let mut pres = vec![0u8; n.div_ceil(8)];
-                for i in 0..n {
-                    let pk = person_keys[i] as usize;
-                    let uname = &names_data[names_offsets[pk] as usize..names_offsets[pk + 1] as usize];
-                    u_buf.extend_from_slice(&(uname.len() as u32).to_le_bytes());
-                    u_buf.extend_from_slice(uname);
-                    d_buf.extend_from_slice(&day[i].to_le_bytes());
-                    s_buf.extend_from_slice(&sessions[i].to_le_bytes());
-                    e_buf.extend_from_slice(&events[i].to_le_bytes());
-                    let rev = rev_i64
-                        .and_then(|v| v.get(i).copied())
-                        .unwrap_or(rev_i32[i] as u64);
-                    r_buf.extend_from_slice(&rev.to_le_bytes());
-                    let cat = top_category[i];
-                    if cat != NULL_CAT {
-                        let cs = &cat_data[cat_off[cat as usize] as usize..cat_off[cat as usize + 1] as usize];
-                        c_buf.extend_from_slice(&(cs.len() as u32).to_le_bytes());
-                        c_buf.extend_from_slice(cs);
-                        pres[i / 8] |= 1 << (i % 8);
-                    }
-                }
-                w.row_group(
-                    n,
-                    &[
-                        (&u_buf, None),
-                        (&d_buf, None),
-                        (&s_buf, None),
-                        (&e_buf, None),
-                        (&r_buf, None),
-                        (&c_buf, Some(&pres)),
-                    ],
-                );
-            };
-            write_cols_plain(
-                &mut w,
-                extra.len(),
-                extra.names_data,
-                extra.names_offsets,
-                extra.person_keys,
-                extra.day,
-                extra.sessions,
-                extra.events,
-                extra.revenue_cents,
-                None,
-                extra.top_category,
-                extra.cat_dict_data,
-                extra.cat_dict_offsets,
-            );
-            write_cols_plain(
-                &mut w,
-                rows,
-                &self.names_data,
-                &self.names_offsets,
-                &self.person_keys,
-                &self.day,
-                &self.sessions,
-                &self.events,
-                &self.revenue_cents,
-                Some(&self.revenue_i64_raw),
-                &self.top_category,
-                &self.cat_dict_data,
-                &self.cat_dict_offsets,
-            );
-            w.finish();
+                w
+            });
+            w.write_batches_split(extra, FLUSH_ROWS);
         }
+        self.finish(even_if_empty);
     }
 }
 
@@ -521,24 +558,54 @@ impl Grouper {
         self.cells
     }
 
-    fn flush_day(&mut self, sh: &Shared, person: u64, day: u32, sessions: u32, events: u32, revenue: u64) {
-        let mut best: Option<u8> = None;
-        for &c in &self.cats {
-            let sum = self.cat_sum[c as usize];
-            // Category indexes are in byte-wise name order, so the smaller index wins a tie.
-            best = match best {
-                Some(b) if (self.cat_sum[b as usize], std::cmp::Reverse(b)) >= (sum, std::cmp::Reverse(c)) => Some(b),
-                _ => Some(c),
-            };
-        }
+    #[inline(always)]
+    fn flush_day<const HAS_PURCH: bool>(
+        &mut self,
+        sh: &Shared,
+        person: u64,
+        day: u32,
+        sessions: u32,
+        events: u32,
+        revenue: u64,
+    ) {
+        let best = if HAS_PURCH {
+            let mut best: Option<u8> = None;
+            for &c in &self.cats {
+                let sum = self.cat_sum[c as usize];
+                // Category indexes are in byte-wise name order, so the smaller index wins a tie.
+                best = match best {
+                    Some(b) if (self.cat_sum[b as usize], std::cmp::Reverse(b)) >= (sum, std::cmp::Reverse(c)) => Some(b),
+                    _ => Some(c),
+                };
+            }
+            for &c in &self.cats {
+                self.cat_sum[c as usize] = 0;
+            }
+            self.cats.clear();
+            best
+        } else {
+            None
+        };
         self.out.add(person, (sh.first_day + day as i64) as i32, sessions, events, revenue, best);
-        for &c in &self.cats {
-            self.cat_sum[c as usize] = 0;
-        }
-        self.cats.clear();
     }
 
+    #[inline(always)]
     unsafe fn person(&mut self, sh: &Shared, person: u64, events: &[u64], purchases: &[(u64, u32)], clicks: &[Click]) {
+        if purchases.is_empty() {
+            self.person_impl::<false>(sh, person, events, purchases, clicks);
+        } else {
+            self.person_impl::<true>(sh, person, events, purchases, clicks);
+        }
+    }
+
+    unsafe fn person_impl<const HAS_PURCH: bool>(
+        &mut self,
+        sh: &Shared,
+        person: u64,
+        events: &[u64],
+        purchases: &[(u64, u32)],
+        clicks: &[Click],
+    ) {
         self.out.begin_person();
         let nck = clicks.len();
         let mut next_purchase = 0;
@@ -549,15 +616,33 @@ impl Grouper {
         let organic = sh.campaigns.len();
         let n = events.len();
         let (mut i, mut next_click) = (0usize, 0usize);
+        let (mut cached_nc, mut cached_camp) = (0usize, 0usize);
+        let day_origin = (sh.first_day * DAY_MS - sh.base_ms) as u32;
+        let mut cur_day = 0u32;
+        let mut next_day_start = day_origin + DAY_MS_U32;
         let mut day = u32::MAX;
         let (mut day_sessions, mut day_events, mut day_revenue, mut day_first) = (0u32, 0u32, 0u64, 0u32);
         let mut session_index = 0u32;
         while i < n {
             let start = *events.get_unchecked(i) as u32 >> 1;
-            let start_day = ((sh.base_ms + start as i64).div_euclid(DAY_MS) - sh.first_day) as u32;
+            let start_day = if start < next_day_start {
+                cur_day
+            } else {
+                let next2 = next_day_start + DAY_MS_U32;
+                if start < next2 {
+                    cur_day += 1;
+                    next_day_start = next2;
+                    cur_day
+                } else {
+                    let d = (start - day_origin) / DAY_MS_U32;
+                    cur_day = d;
+                    next_day_start = day_origin + (d + 1) * DAY_MS_U32;
+                    d
+                }
+            };
             if start_day != day {
                 if day != u32::MAX {
-                    self.flush_day(sh, person, day, day_sessions, day_events, day_revenue);
+                    self.flush_day::<HAS_PURCH>(sh, person, day, day_sessions, day_events, day_revenue);
                     self.day_rows.push(DayRow { day, first: day_first, end: session_index });
                 }
                 day = start_day;
@@ -570,12 +655,16 @@ impl Grouper {
                 next_click += 1;
             }
             let campaign = if next_click > 0 && start - clicks.get_unchecked(next_click - 1).ts() <= WEEK {
-                credit(sh, &clicks[..next_click])
+                if next_click != cached_nc {
+                    cached_nc = next_click;
+                    cached_camp = credit(sh, &clicks[..next_click]);
+                }
+                cached_camp
             } else {
                 organic
             };
             let cell = self.cells.as_ptr().add(campaign * days + start_day as usize);
-            std::arch::x86_64::_mm_prefetch(cell as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            _mm_prefetch(cell as *const i8, _MM_HINT_T0);
             let (mut prev, mut count, mut revenue) = (start, 0u32, 0u64);
             while i < n {
                 let e = *events.get_unchecked(i);
@@ -586,7 +675,7 @@ impl Grouper {
                 prev = t;
                 count += 1;
                 i += 1;
-                if e & 1 != 0 {
+                if HAS_PURCH && (e & 1 != 0) {
                     let payload = purchases.get_unchecked(next_purchase).1;
                     next_purchase += 1;
                     let (cat, price) = ((payload >> 24) as u8, (payload & 0xFF_FFFF) as u64);
@@ -599,18 +688,20 @@ impl Grouper {
             }
             day_sessions += 1;
             day_events += count;
-            day_revenue += revenue;
             let cell = self.cells.get_unchecked_mut(campaign * days + start_day as usize);
             cell.sessions += 1;
-            cell.purchasing += (revenue > 0) as u32;
-            cell.revenue += revenue;
+            if HAS_PURCH {
+                day_revenue += revenue;
+                cell.purchasing += (revenue > 0) as u32;
+                cell.revenue += revenue;
+            }
             session_index += 1;
             if nck > 0 {
                 self.starts.push(start);
                 self.sess_row.push(self.day_rows.len() as u32);
             }
         }
-        self.flush_day(sh, person, day, day_sessions, day_events, day_revenue);
+        self.flush_day::<HAS_PURCH>(sh, person, day, day_sessions, day_events, day_revenue);
         if nck == 0 {
             return;
         }
@@ -631,6 +722,9 @@ impl Grouper {
             let ts = c.ts();
             while lo < ns && starts[lo] < ts {
                 lo += 1;
+            }
+            if lo == ns {
+                break;
             }
             let reach = ts as u64 + WEEK as u64;
             while hi < ns && starts[hi] as u64 <= reach {
@@ -747,17 +841,40 @@ fn fix_order<T: Copy>(v: &mut [T], key: impl Fn(&T) -> u64) {
 #[inline(always)]
 unsafe fn credit(sh: &Shared, clicks: &[Click]) -> usize {
     let last = clicks.len() - 1;
-    let ts = clicks[last].ts();
-    let mut best = last;
-    let mut k = last;
+    let c_last = clicks.get_unchecked(last);
+    let ts = c_last.ts();
+    if last == 0 || clicks.get_unchecked(last - 1).ts() != ts {
+        return c_last.campaign as usize;
+    }
+    credit_tie(sh, clicks, last, ts)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn credit_tie(sh: &Shared, clicks: &[Click], last: usize, ts: u32) -> usize {
+    let camp0 = clicks.get_unchecked(last).campaign;
+    let mut start = last - 1;
+    let mut all_same = clicks.get_unchecked(start).campaign == camp0;
+    while start > 0 && clicks.get_unchecked(start - 1).ts() == ts {
+        start -= 1;
+        all_same &= clicks.get_unchecked(start).campaign == camp0;
+    }
+    if all_same {
+        return camp0 as usize;
+    }
     let id = |c: &Click| (*sh.c_arena.base.add(c.at as usize)).click;
-    while k > 0 && clicks[k - 1].ts() == ts {
+    let mut best = last;
+    let mut best_id = id(clicks.get_unchecked(last));
+    let mut k = last;
+    while k > start {
         k -= 1;
-        if click_less(sh.c_side_arena.base, id(&clicks[k]), id(&clicks[best])) {
+        let ck_id = id(clicks.get_unchecked(k));
+        if click_less(sh.c_side_arena.base, ck_id, best_id) {
             best = k;
+            best_id = ck_id;
         }
     }
-    clicks[best].campaign as usize
+    clicks.get_unchecked(best).campaign as usize
 }
 
 /// One thread's working memory for event_id dedup.
@@ -895,5 +1012,165 @@ impl Dedup {
                 slot = (slot + 1) & mask;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::tok;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn make_tok(s: &str) -> u64 {
+        let mut buf = [0u8; 32];
+        let b = s.as_bytes();
+        buf[..b.len()].copy_from_slice(b);
+        unsafe { tok(buf.as_ptr(), b.len()) }
+    }
+
+    #[test]
+    fn test_user_out_empty_even_if_empty() {
+        let tmp_dir = std::env::temp_dir();
+        let skip_path = tmp_dir.join("user_out_empty_skip.parquet");
+        let keep_path = tmp_dir.join("user_out_empty_keep.parquet");
+        let _ = std::fs::remove_file(&skip_path);
+        let _ = std::fs::remove_file(&keep_path);
+
+        UserOut::new(skip_path.clone()).finish(false);
+        assert!(!skip_path.exists(), "even_if_empty=false must not create file");
+
+        UserOut::new(keep_path.clone()).finish(true);
+        assert!(keep_path.exists(), "even_if_empty=true must create schema-only file");
+
+        let venv_py = Path::new("/home/colton/Documents/Projects/Builders/#3/.venv/bin/python");
+        if venv_py.exists() {
+            let out = Command::new(venv_py)
+                .arg("-c")
+                .arg("import sys, polars as pl; df = pl.read_parquet(sys.argv[1]); assert df.height == 0 and df.columns == ['user_id', 'day', 'sessions', 'events', 'revenue_cents', 'top_category']")
+                .arg(keep_path.to_str().unwrap())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+
+        let _ = std::fs::remove_file(&keep_path);
+    }
+
+    #[test]
+    fn test_user_out_streaming_65k_and_i64_overflow() {
+        let tmp_dir = std::env::temp_dir().join("user_out_stream_test");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let cats = vec![b"books".to_vec(), b"games".to_vec(), b"music".to_vec()];
+        let stream_path = tmp_dir.join("stream.parquet");
+
+        // 1. Stream >65,536 zero rows AND >65,536 nonz rows via UserOut
+        let mut exp_rows = 0usize;
+        let mut exp_nulls = 0usize;
+        let mut exp_rev = 0u64;
+        let mut exp_sess = 0u64;
+        let mut exp_ev = 0u64;
+        {
+            let mut out = UserOut::with_categories(stream_path.clone(), &cats);
+            for p in 0..70_000u32 {
+                let pt = make_tok(&format!("u{p:06}"));
+                out.begin_person();
+                // 1 zero-rev day + 1 nonz day per person => triggers both 65,536 flushes
+                out.add(pt, 20727 + (p % 10) as i32, 1, 2, 0, None);
+                exp_rows += 1;
+                exp_nulls += 1;
+                exp_sess += 1;
+                exp_ev += 2;
+
+                let rev = 100 + (p % 500) as u64;
+                let cat = if p % 5 == 0 { None } else { Some((p % 3) as u8) };
+                out.add(pt, 20728 + (p % 10) as i32, 2, 5, rev, cat);
+                exp_rows += 1;
+                if cat.is_none() {
+                    exp_nulls += 1;
+                }
+                exp_rev += rev;
+                exp_sess += 2;
+                exp_ev += 5;
+            }
+            out.finish(true);
+        }
+
+        // 2. Overflow > i32::MAX BEFORE any flush (single file)
+        let ovf_single_dir = tmp_dir.join("ovf_single");
+        std::fs::create_dir_all(&ovf_single_dir).unwrap();
+        let ovf_single_path = ovf_single_dir.join("part-000.parquet");
+        let big_rev = (i32::MAX as u64) + 987_654_321;
+        {
+            let mut out = UserOut::with_categories(ovf_single_path.clone(), &cats);
+            let p0 = make_tok("whale0");
+            out.begin_person();
+            out.add(p0, 20727, 1, 1, 0, None);
+            out.add(p0, 20728, 1, 2, 500, Some(0));
+            out.add(p0, 20729, 3, 9, big_rev, Some(1));
+            out.finish(true);
+        }
+
+        // 3. Overflow > i32::MAX AFTER >65,536 zero-rev rows already flushed as INT32
+        let ovf_spill_dir = tmp_dir.join("ovf_spill");
+        std::fs::create_dir_all(&ovf_spill_dir).unwrap();
+        let ovf_spill_path = ovf_spill_dir.join("part-000.parquet");
+        {
+            let mut out = UserOut::with_categories(ovf_spill_path.clone(), &cats);
+            for p in 0..66_000u32 {
+                let pt = make_tok(&format!("z{p:06}"));
+                out.begin_person();
+                out.add(pt, 20727, 1, 1, 0, None);
+            }
+            let pw = make_tok("whale_late");
+            out.begin_person();
+            out.add(pw, 20730, 4, 12, big_rev, Some(2));
+            out.finish(true);
+        }
+
+        let venv_py = Path::new("/home/colton/Documents/Projects/Builders/#3/.venv/bin/python");
+        if venv_py.exists() {
+            let script = r#"
+import sys
+import polars as pl
+import duckdb
+
+p_stream, p_single, d_spill = sys.argv[1], sys.argv[2], sys.argv[3]
+df_s = pl.read_parquet(p_stream)
+print(f"STREAM rows={df_s.height} nulls={df_s['top_category'].null_count()} rev={df_s['revenue_cents'].sum()} sess={df_s['sessions'].sum()} ev={df_s['events'].sum()}")
+
+df_o1 = pl.read_parquet(p_single)
+print(f"OVF1 rows={df_o1.height} rev={df_o1['revenue_cents'].sum()}")
+
+duck_o2 = duckdb.sql(f"SELECT COUNT(*), SUM(revenue_cents) FROM read_parquet('{d_spill}/*.parquet')").fetchall()[0]
+print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
+"#;
+            let out = Command::new(venv_py)
+                .arg("-c")
+                .arg(script)
+                .arg(stream_path.to_str().unwrap())
+                .arg(ovf_single_path.to_str().unwrap())
+                .arg(ovf_spill_dir.to_str().unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "Python verifier failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(
+                lines[0],
+                format!("STREAM rows={exp_rows} nulls={exp_nulls} rev={exp_rev} sess={exp_sess} ev={exp_ev}")
+            );
+            assert_eq!(lines[1], format!("OVF1 rows=3 rev={}", 500 + big_rev));
+            assert_eq!(lines[2], format!("OVF2 rows=66001 rev={big_rev}"));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
