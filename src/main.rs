@@ -1,14 +1,17 @@
 mod csv;
 mod diag;
+mod dict;
 mod dims;
 pub mod fast_parquet;
 mod group;
 mod ids;
 mod links;
 mod parquet;
+mod scan4k;
 mod scatter;
 mod sys;
 mod ts;
+mod v6;
 
 use csv::Reader;
 use dims::KeyMap;
@@ -680,7 +683,8 @@ fn main() {
         pieces
     };
     let pop_next = AtomicUsize::new(0);
-    let overlap_pop = std::env::var("SS_OVERLAP_POP").ok().as_deref() != Some("0");
+    let try_v6 = v6::applicable(&sh, event_input.bytes);
+    let overlap_pop = !try_v6 && std::env::var("SS_OVERLAP_POP").ok().as_deref() != Some("0");
 
     if verbose { eprintln!("  listed {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
     let workers = PerThread::new(threads, |_| Worker {
@@ -808,6 +812,68 @@ fn main() {
     marks.push(mark("links join"));
     log_stage(&marks);
 
+    if try_v6 {
+        let mut push_mark = |name: &'static str| {
+            marks.push((name, t0.elapsed().as_secs_f64(), sys::rusage(), count()));
+            log_stage(&marks);
+        };
+        if let Some(m) = v6::run(
+            &sh,
+            &event_input,
+            &click_input,
+            threads,
+            read_buf,
+            &user_daily_dir,
+            &campaign_daily_dir,
+            verbose,
+            &mut push_mark,
+        ) {
+            if verbose {
+                let (mut prev, mut prev_ru, mut prev_n) = (0.0, (0.0, 0.0, 0), marks[0].3);
+                for (name, at, ru, n) in &marks {
+                    let d: Vec<f64> = (0..4).map(|k| (n[k] - prev_n[k]) as f64 / 1e6).collect();
+                    eprintln!(
+                        "{name:12} wall {:7.1} ms  user {:7.1}  sys {:6.1} ms  kfault {:6.0}  Mcyc {:7.1}  Minstr {:7.1}  Mllc {:6.2}  Mbr {:6.2}",
+                        (at - prev) * 1e3,
+                        (ru.0 - prev_ru.0) * 1e3,
+                        (ru.1 - prev_ru.1) * 1e3,
+                        (ru.2 - prev_ru.2) as f64 / 1e3,
+                        d[0],
+                        d[1],
+                        d[2],
+                        d[3]
+                    );
+                    (prev, prev_ru, prev_n) = (*at, *ru, *n);
+                }
+                let ru = sys::rusage();
+                eprintln!(
+                    "total wall {:.1} ms  user {:.1} ms  sys {:.1} ms",
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    ru.0 * 1e3,
+                    ru.1 * 1e3
+                );
+            }
+            let stages: Vec<(&str, f64)> = marks
+                .iter()
+                .scan(0.0, |prev, m| {
+                    let d = m.1 - *prev;
+                    *prev = m.1;
+                    Some((m.0, d))
+                })
+                .collect();
+            let ru = sys::rusage();
+            diag::summary(
+                t0.elapsed().as_secs_f64(),
+                &stages,
+                ru.0,
+                ru.1,
+                [m.event_lines, m.valid_events, m.clicks],
+            );
+            sys::prof::finish();
+            sys::exit_now();
+        }
+    }
+
     if pop_next.load(Relaxed) < pop_pieces.len() {
         phase(6, &|_| loop {
             let i = pop_next.fetch_add(1, Relaxed);
@@ -863,9 +929,21 @@ fn main() {
         || by_partition(&c_logs, sh.p_parts),
     );
 
+    let use_slab = std::env::var("SS_SLAB").map_or(true, |v| v != "0");
+    const DROP_LINKS: bool = true;
+    let link_slabs = if use_slab && DROP_LINKS {
+        let raw = unsafe { sh.links.as_mut_bytes() };
+        sys::SlabSlice::from_raw(raw.as_mut_ptr(), raw.len()).split_even(threads)
+    } else {
+        if DROP_LINKS {
+            sh.links.mark_dead();
+        }
+        vec![sys::SlabSlice::empty(); threads]
+    };
+
     let next = AtomicUsize::new(0);
-    phase(4, &|_| {
-        let mut work = group::Dedup::default();
+    phase(4, &|t| {
+        let mut work = group::Dedup::with_slab(link_slabs[t]);
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(chunks) = d_chunks.get(i) else { break };
@@ -878,6 +956,12 @@ fn main() {
     let size_of = |chunks: &Vec<(u32, u32)>| chunks.iter().map(|c| c.1 as u64).sum::<u64>();
     let mut order: Vec<usize> = (0..sh.p_parts).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(size_of(&p_chunks[i]) + size_of(&c_chunks[i])));
+    let d_touched = populated[0].max(sh.d_arena.used_bytes()).min(sh.d_arena.cap_bytes());
+    let g_slabs = if use_slab {
+        sys::SlabSlice::from_raw(sh.d_arena.base as *mut u8, d_touched).split_even(threads)
+    } else {
+        vec![sys::SlabSlice::empty(); threads]
+    };
     // Tearing memory down at exit is serial and on the clock when THP is off, so free in parallel
     // only under NoHuge; with hugepages active, exit_now() tears down 2 MiB PMDs immediately.
     let release = std::env::var_os("SS_NORELEASE").is_none() && sys::host_profile().thp == sys::ThpPolicy::NoHuge;
@@ -888,16 +972,27 @@ fn main() {
         let split = |regions: &[(usize, usize)]| -> Vec<(usize, usize)> {
             regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect()
         };
+        let d_piece = touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes());
+        let p_piece = touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes());
+        let c_piece = touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes());
+        let e_side_piece = touched(sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes(), populated[3], sh.e_side_arena.cap_bytes());
+        let c_side_piece = touched(sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes(), populated[4], sh.c_side_arena.cap_bytes());
+        // When slab recycling is active, Grouper uses `d_arena` throughout `sessions`, so it must
+        // stay live until `campaigns` (phase 7) rather than draining in `drain_dead` during `sessions`.
+        let (dead_regs, live_regs): (Vec<(usize, usize)>, Vec<(usize, usize)>) = if use_slab {
+            (
+                vec![e_side_piece],
+                vec![d_piece, p_piece, c_piece, c_side_piece],
+            )
+        } else {
+            (
+                vec![d_piece, e_side_piece],
+                vec![p_piece, c_piece, c_side_piece],
+            )
+        };
         (
-            split(&[
-                touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes()),
-                touched(sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes(), populated[3], sh.e_side_arena.cap_bytes()),
-            ]),
-            split(&[
-                touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes()),
-                touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes()),
-                touched(sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes(), populated[4], sh.c_side_arena.cap_bytes()),
-            ]),
+            split(&dead_regs),
+            split(&live_regs),
             sh.links.slots().div_ceil(REL_SWEEP),
         )
     } else {
@@ -918,10 +1013,11 @@ fn main() {
     let per_thread_cells = PerThread::new(threads, |_| Vec::<Cell>::new());
     let next = AtomicUsize::new(0);
     phase(5, &|t| unsafe {
-        let mut g = Grouper::new(
+        let mut g = Grouper::with_slab(
             user_daily_dir.join(format!("part-{t:03}.parquet")),
             (sh.campaigns.len() + 1) * days,
             &sh.categories,
+            g_slabs[t],
         );
         loop {
             let i = next.fetch_add(1, Relaxed);

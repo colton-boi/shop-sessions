@@ -895,6 +895,278 @@ impl<T> PerThread<T> {
     }
 }
 
+/// 64 B-aligned raw mutable slice of a dead `mmap` arena, safe to split and hand to workers.
+#[derive(Clone, Copy)]
+pub struct SlabSlice {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+unsafe impl Send for SlabSlice {}
+unsafe impl Sync for SlabSlice {}
+
+impl SlabSlice {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(),
+            len: 0,
+        }
+    }
+
+    /// Wraps `[ptr, ptr + len)` aligned inward to 64-byte boundaries.
+    pub fn from_raw(ptr: *mut u8, len: usize) -> Self {
+        if ptr.is_null() || len < 64 {
+            return Self::empty();
+        }
+        let addr = ptr as usize;
+        let aligned = (addr + 63) & !63;
+        let slack = aligned - addr;
+        if len <= slack {
+            return Self::empty();
+        }
+        let usable = (len - slack) & !63;
+        if usable == 0 {
+            Self::empty()
+        } else {
+            Self {
+                ptr: aligned as *mut u8,
+                len: usable,
+            }
+        }
+    }
+
+    /// Splits `self` into `n` disjoint 64 B-aligned slices.
+    pub fn split_even(self, n: usize) -> Vec<SlabSlice> {
+        if n == 0 || self.len == 0 {
+            return vec![Self::empty(); n];
+        }
+        let per = (self.len / n) & !63;
+        if per == 0 {
+            return vec![Self::empty(); n];
+        }
+        (0..n)
+            .map(|i| Self {
+                ptr: unsafe { self.ptr.add(i * per) },
+                len: per,
+            })
+            .collect()
+    }
+
+    /// Splits `self` into `N` disjoint 64 B-aligned slices proportional to `weights`.
+    pub fn split_weights<const N: usize>(self, weights: [usize; N]) -> [SlabSlice; N] {
+        let mut out = [Self::empty(); N];
+        if self.len == 0 {
+            return out;
+        }
+        let total_w: usize = weights.iter().sum();
+        if total_w == 0 {
+            return out;
+        }
+        let chunks = self.len / 64;
+        let mut off = 0usize;
+        for (i, &w) in weights.iter().enumerate() {
+            let bytes = ((chunks * w) / total_w) * 64;
+            if bytes > 0 {
+                out[i] = Self {
+                    ptr: unsafe { self.ptr.add(off) },
+                    len: bytes,
+                };
+                off += bytes;
+            }
+        }
+        out
+    }
+}
+
+/// Scratch buffer backed by a caller-provided dead-arena `SlabSlice` when capacity fits,
+/// falling back seamlessly to a heap `Vec<T>` if a whale partition exceeds the slab slice.
+pub struct SlabBuf<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+    slab_ptr: *mut T,
+    slab_cap: usize,
+    on_slab: bool,
+    heap: Vec<T>,
+}
+
+impl<T: Copy> Default for SlabBuf<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy> SlabBuf<T> {
+    pub fn new() -> Self {
+        Self::with_slab(SlabSlice::empty())
+    }
+
+    pub fn with_slab(slab: SlabSlice) -> Self {
+        assert!(std::mem::align_of::<T>() <= 64);
+        assert!(std::mem::size_of::<T>() > 0);
+        let slab_cap = slab.len / std::mem::size_of::<T>();
+        if slab_cap > 0 {
+            let slab_ptr = slab.ptr as *mut T;
+            Self {
+                ptr: slab_ptr,
+                len: 0,
+                cap: slab_cap,
+                slab_ptr,
+                slab_cap,
+                on_slab: true,
+                heap: Vec::new(),
+            }
+        } else {
+            let mut heap = Vec::new();
+            let ptr = heap.as_mut_ptr();
+            Self {
+                ptr,
+                len: 0,
+                cap: 0,
+                slab_ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
+                slab_cap: 0,
+                on_slab: false,
+                heap,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+
+    #[inline(always)]
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.cap);
+        self.len = new_len;
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.len = 0;
+        if self.slab_cap > 0 {
+            self.ptr = self.slab_ptr;
+            self.cap = self.slab_cap;
+            self.on_slab = true;
+        }
+    }
+
+    #[inline(always)]
+    pub fn clear_and_reserve(&mut self, need: usize) {
+        self.len = 0;
+        if need <= self.slab_cap {
+            self.ptr = self.slab_ptr;
+            self.cap = self.slab_cap;
+            self.on_slab = true;
+        } else {
+            self.reserve_heap_empty(need);
+        }
+    }
+
+    #[inline(always)]
+    pub fn clear_and_resize(&mut self, new_len: usize, val: T) {
+        self.clear_and_reserve(new_len);
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr, new_len).fill(val);
+        }
+        self.len = new_len;
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn reserve(&mut self, additional: usize) {
+        let need = self.len + additional;
+        if need > self.cap {
+            self.reserve_slow(need);
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, val: T) {
+        if self.len == self.cap {
+            self.reserve_slow(self.len + 1);
+        }
+        unsafe {
+            self.ptr.add(self.len).write(val);
+        }
+        self.len += 1;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reserve_heap_empty(&mut self, need: usize) {
+        self.on_slab = false;
+        if need > self.heap.capacity() {
+            self.heap.clear();
+            self.heap.reserve(need);
+        }
+        self.ptr = self.heap.as_mut_ptr();
+        self.cap = self.heap.capacity();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reserve_slow(&mut self, need: usize) {
+        if self.len == 0 {
+            if need <= self.slab_cap {
+                self.ptr = self.slab_ptr;
+                self.cap = self.slab_cap;
+                self.on_slab = true;
+            } else {
+                self.reserve_heap_empty(need);
+            }
+            return;
+        }
+        let new_cap = need.max(self.len.saturating_mul(2)).max(64);
+        if self.on_slab {
+            self.on_slab = false;
+            self.heap.clear();
+            self.heap.reserve(new_cap);
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.slab_ptr, self.heap.as_mut_ptr(), self.len);
+            }
+        } else {
+            unsafe { self.heap.set_len(self.len) };
+            self.heap.reserve(new_cap - self.len);
+            unsafe { self.heap.set_len(0) };
+        }
+        self.ptr = self.heap.as_mut_ptr();
+        self.cap = self.heap.capacity();
+    }
+}
+
+impl<T: Copy> std::ops::Deref for SlabBuf<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T: Copy> std::ops::DerefMut for SlabBuf<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
 #[inline(always)]
 pub fn mix(x: u64) -> u64 {
     let x = (x ^ (x >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -1092,5 +1364,55 @@ mod tests {
         assert_eq!(join3(1, || 1, || 2, || 3), (1, 2, 3));
         assert_eq!(join3(2, || 10, || 20, || 30), (10, 20, 30));
         assert_eq!(join3(4, || "a", || "b", || "c"), ("a", "b", "c"));
+    }
+
+    #[test]
+    fn test_slab_buf_recycle_and_heap_fallback() {
+        #[repr(align(64))]
+        struct Backing([u8; 512]);
+        let mut backing = Backing([0xAA; 512]);
+        let slab = SlabSlice::from_raw(backing.0.as_mut_ptr(), backing.0.len());
+        let parts = slab.split_weights([1, 3]);
+        assert_eq!(parts[0].len, 128);
+        assert_eq!(parts[1].len, 384);
+
+        let mut buf: SlabBuf<u32> = SlabBuf::with_slab(parts[0]);
+        assert_eq!(buf.cap, 32);
+        // Fits on slab without heap allocation
+        for i in 0..32u32 {
+            buf.push(i * 10);
+        }
+        assert!(buf.on_slab);
+        assert_eq!(buf.heap.capacity(), 0);
+        assert_eq!(buf[31], 310);
+
+        // Push 33rd element -> spills seamlessly to heap preserving 0..32
+        buf.push(320);
+        assert!(!buf.on_slab);
+        assert_eq!(buf.len(), 33);
+        for i in 0..33u32 {
+            assert_eq!(buf[i as usize], i * 10);
+        }
+
+        // clear_and_reserve within slab_cap moves back to slab
+        buf.clear_and_reserve(16);
+        assert!(buf.on_slab);
+        buf.clear_and_resize(8, 77);
+        assert!(buf.on_slab);
+        assert_eq!(&*buf, &[77; 8]);
+
+        // clear_and_reserve exceeding slab_cap uses heap
+        buf.clear_and_reserve(100);
+        assert!(!buf.on_slab);
+        assert!(buf.cap >= 100);
+        buf.reserve(50);
+        assert!(!buf.on_slab);
+
+        // std::mem::take + restore preserves slab
+        let taken = std::mem::take(&mut buf);
+        assert_eq!(taken.slab_cap, 32);
+        buf = taken;
+        buf.clear();
+        assert!(buf.on_slab);
     }
 }

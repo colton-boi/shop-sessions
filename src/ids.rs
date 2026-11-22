@@ -144,7 +144,7 @@ pub fn head9_of_hex(prefix: u8, hi: u64) -> u64 {
 }
 
 #[inline(always)]
-fn hash_hex(prefix: u8, hi: u64, lo: u64) -> u64 {
+pub(crate) fn hash_hex(prefix: u8, hi: u64, lo: u64) -> u64 {
     mix(hi ^ lo.rotate_left(23) ^ (prefix as u64).wrapping_mul(0x517C_C1B7_2722_0A95))
 }
 
@@ -376,6 +376,11 @@ fn hex_users() -> &'static HexUserTable {
     HEX_USERS.get_or_init(|| HexUserTable::with_cap(1 << 16))
 }
 
+#[inline(always)]
+pub(crate) unsafe fn hex_user_get(idx: u32) -> (u8, u64, u64) {
+    hex_users().get(idx)
+}
+
 #[repr(C)]
 struct FbSlot {
     state: AtomicU64, // 0 = empty, 1 = writing, (h & !3) | 2 = ready
@@ -585,7 +590,7 @@ fn fallback_bytes(idx: u32) -> &'static [u8] {
 /// `p` must be readable for 9 bytes whatever `len` is. Returns 0 when the ID does not pack.
 /// Branch-free: ID lengths 7 to 9 are mixed at random, so any branch on `len` mispredicts.
 #[inline(always)]
-unsafe fn pack(p: *const u8, len: usize) -> u64 {
+pub(crate) unsafe fn pack(p: *const u8, len: usize) -> u64 {
     // Both loads are unconditional so the len == 9 choices compile to cmov, not a mispredicting branch.
     let raw = (p as *const u64).read_unaligned();
     let raw9 = *p.add(8) as u64;

@@ -818,6 +818,68 @@ pub fn encode_rle_or_bitpack_keys(keys: &[u32], base_key: u32, width: u8, out: &
     encode_rle_or_bitpack_keys_with_runs(keys, base_key, width, runs, out);
 }
 
+/// Bit-packs `keys` (relative to `base_key`) at `width` bits per key with the Parquet RLE-hybrid
+/// bit-packed header (`(num_groups << 1) | 1`).
+fn encode_bitpacked_keys(keys: &[u32], base_key: u32, width: u8, out: &mut Vec<u8>) {
+    let num_groups = keys.len().div_ceil(8);
+    push_varint(out, ((num_groups as u64) << 1) | 1);
+    let w = width as usize;
+    let total_bytes = num_groups * w;
+    out.reserve(total_bytes + 8);
+    let start_len = out.len();
+    let mut dst = unsafe { out.as_mut_ptr().add(start_len) };
+    for g in 0..num_groups {
+        let base = g * 8;
+        let rem = keys.len() - base;
+        let mut vals = [0u64; 8];
+        if rem >= 8 {
+            for j in 0..8 {
+                vals[j] = (unsafe { *keys.get_unchecked(base + j) } - base_key) as u64;
+            }
+        } else {
+            for j in 0..rem {
+                vals[j] = (keys[base + j] - base_key) as u64;
+            }
+        }
+        if w <= 8 {
+            let mut acc = 0u64;
+            for j in 0..8 {
+                acc |= vals[j] << (j * w);
+            }
+            unsafe {
+                (dst as *mut u64).write_unaligned(acc.to_le());
+                dst = dst.add(w);
+            }
+        } else {
+            let mut bit_buf = 0u128;
+            let mut bits_in_buf = 0usize;
+            for j in 0..8 {
+                bit_buf |= (vals[j] as u128) << bits_in_buf;
+                bits_in_buf += w;
+                while bits_in_buf >= 64 {
+                    unsafe {
+                        (dst as *mut u64).write_unaligned((bit_buf as u64).to_le());
+                        dst = dst.add(8);
+                    }
+                    bit_buf >>= 64;
+                    bits_in_buf -= 64;
+                }
+            }
+            if bits_in_buf > 0 {
+                let nbytes = bits_in_buf / 8;
+                let le = (bit_buf as u64).to_le_bytes();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(le.as_ptr(), dst, nbytes);
+                    dst = dst.add(nbytes);
+                }
+            }
+        }
+    }
+    unsafe {
+        out.set_len(start_len + total_bytes);
+    }
+}
+
 /// Encodes `keys` when `runs` (the number of contiguous equal-value runs in `keys`) is already known.
 fn encode_rle_or_bitpack_keys_with_runs(
     keys: &[u32],
@@ -849,63 +911,33 @@ fn encode_rle_or_bitpack_keys_with_runs(
             i += run_len;
         }
     } else {
-        let num_groups = keys.len().div_ceil(8);
-        push_varint(out, ((num_groups as u64) << 1) | 1);
-        let w = width as usize;
-        let total_bytes = num_groups * w;
-        out.reserve(total_bytes + 8);
-        let start_len = out.len();
-        let mut dst = unsafe { out.as_mut_ptr().add(start_len) };
-        for g in 0..num_groups {
-            let base = g * 8;
-            let rem = keys.len() - base;
-            let mut vals = [0u64; 8];
-            if rem >= 8 {
-                for j in 0..8 {
-                    vals[j] = (unsafe { *keys.get_unchecked(base + j) } - base_key) as u64;
-                }
-            } else {
-                for j in 0..rem {
-                    vals[j] = (keys[base + j] - base_key) as u64;
-                }
-            }
-            if w <= 8 {
-                let mut acc = 0u64;
-                for j in 0..8 {
-                    acc |= vals[j] << (j * w);
-                }
-                unsafe {
-                    (dst as *mut u64).write_unaligned(acc.to_le());
-                    dst = dst.add(w);
-                }
-            } else {
-                let mut bit_buf = 0u128;
-                let mut bits_in_buf = 0usize;
-                for j in 0..8 {
-                    bit_buf |= (vals[j] as u128) << bits_in_buf;
-                    bits_in_buf += w;
-                    while bits_in_buf >= 64 {
-                        unsafe {
-                            (dst as *mut u64).write_unaligned((bit_buf as u64).to_le());
-                            dst = dst.add(8);
-                        }
-                        bit_buf >>= 64;
-                        bits_in_buf -= 64;
-                    }
-                }
-                if bits_in_buf > 0 {
-                    let nbytes = bits_in_buf / 8;
-                    let le = (bit_buf as u64).to_le_bytes();
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(le.as_ptr(), dst, nbytes);
-                        dst = dst.add(nbytes);
-                    }
-                }
-            }
+        encode_bitpacked_keys(keys, base_key, width, out);
+    }
+}
+
+/// Zero-scan RLE/Bit-Packing encoding of dense dictionary keys `0..run_lens.len()` using
+/// pre-tracked per-person run lengths.
+fn encode_rle_or_bitpack_keys_from_run_lens(
+    keys: &[u32],
+    run_lens: &[u32],
+    width: u8,
+    out: &mut Vec<u8>,
+) {
+    out.push(width);
+    if keys.is_empty() {
+        return;
+    }
+    let val_bytes = (width as usize).div_ceil(8);
+    let rle_est = run_lens.len() * (1 + val_bytes);
+    let bp_groups = keys.len().div_ceil(8);
+    let bp_est = 2 + bp_groups * (width as usize);
+
+    if rle_est <= bp_est {
+        for (k, &rl) in run_lens.iter().enumerate() {
+            emit_rle_run(k as u32, rl as usize, val_bytes, out);
         }
-        unsafe {
-            out.set_len(start_len + total_bytes);
-        }
+    } else {
+        encode_bitpacked_keys(keys, 0, width, out);
     }
 }
 
@@ -1782,6 +1814,43 @@ impl FastUserDailyWriter {
         sessions: &[i32],
         events: &[i32],
     ) {
+        self.write_zero_rev_direct_impl(names_plain, names_count, person_keys, None, day, sessions, events);
+    }
+
+    /// Streams a pre-split zero-revenue chunk using pre-tracked `run_lens` (zero key scan).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_zero_rev_direct_with_runs(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        run_lens: &[u32],
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+    ) {
+        self.write_zero_rev_direct_impl(
+            names_plain,
+            names_count,
+            person_keys,
+            Some(run_lens),
+            day,
+            sessions,
+            events,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_zero_rev_direct_impl(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        run_lens: Option<&[u32]>,
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+    ) {
         let n = day.len();
         if n == 0 {
             return;
@@ -1791,7 +1860,7 @@ impl FastUserDailyWriter {
         debug_assert_eq!(events.len(), n);
         self.buf.reserve(n.saturating_mul(4));
 
-        let c0 = self.write_user_id_plain_dict_col(names_plain, names_count, person_keys);
+        let c0 = self.write_user_id_plain_dict_col_impl(names_plain, names_count, person_keys, run_lens);
         let c1 = self.write_day_col(day);
         let c2 = self.write_sessions_col(sessions);
         let c3 = self.write_events_col(events);
@@ -1826,6 +1895,67 @@ impl FastUserDailyWriter {
         cat_dict_data: &[u8],
         cat_dict_offsets: &[u32],
     ) {
+        self.write_nonz_direct_impl(
+            names_plain,
+            names_count,
+            person_keys,
+            None,
+            day,
+            sessions,
+            events,
+            revenue_cents,
+            top_category,
+            cat_dict_data,
+            cat_dict_offsets,
+        );
+    }
+
+    /// Streams a pre-split non-zero chunk using pre-tracked `run_lens` (zero key scan, `i32` revenue).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_nonz_direct_with_runs(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        run_lens: &[u32],
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+        revenue_cents: &[i32],
+        top_category: &[u8],
+        cat_dict_data: &[u8],
+        cat_dict_offsets: &[u32],
+    ) {
+        self.write_nonz_direct_impl(
+            names_plain,
+            names_count,
+            person_keys,
+            Some(run_lens),
+            day,
+            sessions,
+            events,
+            revenue_cents,
+            top_category,
+            cat_dict_data,
+            cat_dict_offsets,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_nonz_direct_impl(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        run_lens: Option<&[u32]>,
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+        revenue_cents: &[i32],
+        top_category: &[u8],
+        cat_dict_data: &[u8],
+        cat_dict_offsets: &[u32],
+    ) {
         let n = day.len();
         if n == 0 {
             return;
@@ -1837,7 +1967,7 @@ impl FastUserDailyWriter {
         debug_assert_eq!(top_category.len(), n);
         self.buf.reserve(n.saturating_mul(6));
 
-        let c0 = self.write_user_id_plain_dict_col(names_plain, names_count, person_keys);
+        let c0 = self.write_user_id_plain_dict_col_impl(names_plain, names_count, person_keys, run_lens);
         let c1 = self.write_day_col(day);
         let c2 = self.write_sessions_col(sessions);
         let c3 = self.write_events_col(events);
@@ -1871,6 +2001,67 @@ impl FastUserDailyWriter {
         cat_dict_data: &[u8],
         cat_dict_offsets: &[u32],
     ) {
+        self.write_nonz_i64_direct_impl(
+            names_plain,
+            names_count,
+            person_keys,
+            None,
+            day,
+            sessions,
+            events,
+            revenue_i64,
+            top_category,
+            cat_dict_data,
+            cat_dict_offsets,
+        );
+    }
+
+    /// Streams a pre-split non-zero chunk using pre-tracked `run_lens` (zero key scan, `INT64` revenue).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_nonz_i64_direct_with_runs(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        run_lens: &[u32],
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+        revenue_i64: &[u64],
+        top_category: &[u8],
+        cat_dict_data: &[u8],
+        cat_dict_offsets: &[u32],
+    ) {
+        self.write_nonz_i64_direct_impl(
+            names_plain,
+            names_count,
+            person_keys,
+            Some(run_lens),
+            day,
+            sessions,
+            events,
+            revenue_i64,
+            top_category,
+            cat_dict_data,
+            cat_dict_offsets,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_nonz_i64_direct_impl(
+        &mut self,
+        names_plain: &[u8],
+        names_count: usize,
+        person_keys: &[u32],
+        run_lens: Option<&[u32]>,
+        day: &[i32],
+        sessions: &[i32],
+        events: &[i32],
+        revenue_i64: &[u64],
+        top_category: &[u8],
+        cat_dict_data: &[u8],
+        cat_dict_offsets: &[u32],
+    ) {
         let n = day.len();
         if n == 0 {
             return;
@@ -1884,7 +2075,7 @@ impl FastUserDailyWriter {
         debug_assert_eq!(top_category.len(), n);
         self.buf.reserve(n.saturating_mul(6));
 
-        let c0 = self.write_user_id_plain_dict_col(names_plain, names_count, person_keys);
+        let c0 = self.write_user_id_plain_dict_col_impl(names_plain, names_count, person_keys, run_lens);
         let c1 = self.write_day_col(day);
         let c2 = self.write_sessions_col(sessions);
         let c3 = self.write_events_col(events);
@@ -1973,11 +2164,12 @@ impl FastUserDailyWriter {
     }
 
     /// 1a. `user_id` (`BYTE_ARRAY`, `REQUIRED`) directly from pre-encoded `PLAIN` dictionary bytes.
-    fn write_user_id_plain_dict_col(
+    fn write_user_id_plain_dict_col_impl(
         &mut self,
         names_plain: &[u8],
         names_count: usize,
         person_keys: &[u32],
+        run_lens: Option<&[u32]>,
     ) -> ColChunkMeta {
         debug_assert!(names_count > 0);
         debug_assert!(!person_keys.is_empty());
@@ -2007,8 +2199,26 @@ impl FastUserDailyWriter {
 
         let w = bit_width((names_count - 1) as u32);
         self.page_buf.clear();
-        debug_assert_eq!(names_count, count_runs_u32(person_keys));
-        encode_rle_or_bitpack_keys_with_runs(person_keys, 0, w, names_count, &mut self.page_buf);
+        if let Some(rl) = run_lens {
+            #[cfg(debug_assertions)]
+            {
+                assert_eq!(rl.len(), names_count);
+                let mut pos = 0usize;
+                for (k, &run_len) in rl.iter().enumerate() {
+                    assert!(run_len > 0);
+                    for _ in 0..run_len {
+                        assert_eq!(person_keys[pos], k as u32);
+                        pos += 1;
+                    }
+                }
+                assert_eq!(pos, person_keys.len());
+                assert_eq!(names_count, count_runs_u32(person_keys));
+            }
+            encode_rle_or_bitpack_keys_from_run_lens(person_keys, rl, w, &mut self.page_buf);
+        } else {
+            debug_assert_eq!(names_count, count_runs_u32(person_keys));
+            encode_rle_or_bitpack_keys_with_runs(person_keys, 0, w, names_count, &mut self.page_buf);
+        }
         let (data_off, data_sz) =
             emit_data_page_into(self.file_offset, &mut self.buf, person_keys.len(), E_RLE_DICT, &self.page_buf);
 
@@ -3469,5 +3679,62 @@ print(f"I64 rows={df2.height} nulls={df2['top_category'].null_count()} rev={df2[
 
         let _ = std::fs::remove_file(&stream_path);
         let _ = std::fs::remove_file(&i64_path);
+    }
+
+    #[test]
+    fn test_with_runs_byte_identical_parity() {
+        let tmp_dir = std::env::temp_dir();
+        let (cat_data, cat_off) = crate::group::build_cat_dict(&[b"books".to_vec(), b"music".to_vec()]);
+
+        // Test both RLE-selected (avg run >= 2) and bitpack-selected (avg run == 1)
+        for &(n_users, repeats) in &[(1usize, 5usize), (200, 3), (300, 1)] {
+            let names: Vec<String> = (0..n_users).map(|i| format!("u{i:04}")).collect();
+            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            let names_plain = encode_plain_names(&name_refs);
+            let mut pk = Vec::new();
+            let mut run_lens = Vec::new();
+            for u in 0..n_users {
+                let r = if repeats == 1 { 1 } else { 1 + (u % repeats) };
+                run_lens.push(r as u32);
+                for _ in 0..r {
+                    pk.push(u as u32);
+                }
+            }
+            let n = pk.len();
+            let day: Vec<i32> = (0..n).map(|i| 20700 + (i % 10) as i32).collect();
+            let sess: Vec<i32> = vec![1; n];
+            let ev: Vec<i32> = (0..n).map(|i| 1 + (i % 4) as i32).collect();
+            let rev32: Vec<i32> = (0..n).map(|i| 100 + i as i32).collect();
+            let rev64: Vec<u64> = (0..n).map(|i| (i32::MAX as u64) + 1 + i as u64).collect();
+            let cat: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+
+            let p_ref = tmp_dir.join(format!("runs_ref_{n_users}_{repeats}.parquet"));
+            let p_run = tmp_dir.join(format!("runs_new_{n_users}_{repeats}.parquet"));
+
+            let mut w1 = FastUserDailyWriter::create(&p_ref);
+            w1.write_zero_rev_direct(&names_plain, n_users, &pk, &day, &sess, &ev);
+            w1.write_nonz_direct(&names_plain, n_users, &pk, &day, &sess, &ev, &rev32, &cat, &cat_data, &cat_off);
+            w1.finish();
+
+            let mut w2 = FastUserDailyWriter::create(&p_run);
+            w2.write_zero_rev_direct_with_runs(&names_plain, n_users, &pk, &run_lens, &day, &sess, &ev);
+            w2.write_nonz_direct_with_runs(&names_plain, n_users, &pk, &run_lens, &day, &sess, &ev, &rev32, &cat, &cat_data, &cat_off);
+            w2.finish();
+
+            assert_eq!(std::fs::read(&p_ref).unwrap(), std::fs::read(&p_run).unwrap());
+
+            let mut w3 = FastUserDailyWriter::create(&p_ref);
+            w3.write_nonz_i64_direct(&names_plain, n_users, &pk, &day, &sess, &ev, &rev64, &cat, &cat_data, &cat_off);
+            w3.finish();
+
+            let mut w4 = FastUserDailyWriter::create(&p_run);
+            w4.write_nonz_i64_direct_with_runs(&names_plain, n_users, &pk, &run_lens, &day, &sess, &ev, &rev64, &cat, &cat_data, &cat_off);
+            w4.finish();
+
+            assert_eq!(std::fs::read(&p_ref).unwrap(), std::fs::read(&p_run).unwrap());
+
+            let _ = std::fs::remove_file(&p_ref);
+            let _ = std::fs::remove_file(&p_run);
+        }
     }
 }

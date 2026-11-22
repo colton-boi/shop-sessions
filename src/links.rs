@@ -8,6 +8,8 @@ use std::sync::atomic::{
     AtomicU64,
     Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
 
 const SWEEP_PREFETCH_BUCKETS: usize = 4;
 
@@ -25,6 +27,8 @@ struct Bucket {
 pub struct LinkTable {
     buckets: *const Bucket,
     bucket_mask: usize,
+    #[cfg(debug_assertions)]
+    dead: AtomicBool,
 }
 unsafe impl Sync for LinkTable {}
 
@@ -38,7 +42,26 @@ impl LinkTable {
         debug_assert!(num_buckets.is_power_of_two() && num_buckets >= 1);
         let buckets = map_zeroed_huge(num_buckets * std::mem::size_of::<Bucket>()) as *const Bucket;
         debug_assert_eq!(buckets as usize & 63, 0);
-        LinkTable { buckets, bucket_mask: num_buckets - 1 }
+        LinkTable {
+            buckets,
+            bucket_mask: num_buckets - 1,
+            #[cfg(debug_assertions)]
+            dead: AtomicBool::new(false),
+        }
+    }
+
+    /// Marks the table dead (`DROP_LINKS`): no lookup or union may touch it afterwards.
+    pub fn mark_dead(&self) {
+        #[cfg(debug_assertions)]
+        self.dead.store(true, Release);
+    }
+
+    /// Exposes the dead table's backing pages as mutable bytes for slab recycling during `dedup`.
+    /// Safety: caller must guarantee no thread touches `LinkTable` lookups/unions in or after `dedup`.
+    pub unsafe fn as_mut_bytes(&self) -> &'static mut [u8] {
+        self.mark_dead();
+        let bytes = (self.bucket_mask + 1) * std::mem::size_of::<Bucket>();
+        std::slice::from_raw_parts_mut(self.buckets as *mut u8, bytes)
     }
 
     /// Frees the table's pages in `[from, to)` slot ranges once no lookup can happen.
@@ -63,6 +86,8 @@ impl LinkTable {
     /// Prefetches the 64 B bucket of a token whose `mix` is `h`.
     #[inline(always)]
     pub fn prefetch_hashed(&self, h: u64) {
+        #[cfg(debug_assertions)]
+        debug_assert!(!self.dead.load(Relaxed), "LinkTable accessed after DROP_LINKS");
         unsafe { _mm_prefetch(self.buckets.add(h as usize & self.bucket_mask) as *const i8, _MM_HINT_T0) }
     }
 
@@ -223,6 +248,8 @@ impl LinkTable {
     /// mentions is its own person. Read-only during `parse`.
     #[inline(always)]
     pub unsafe fn person_hashed(&self, token: u64, h: u64) -> u64 {
+        #[cfg(debug_assertions)]
+        debug_assert!(!self.dead.load(Relaxed), "LinkTable accessed after DROP_LINKS");
         debug_assert!(token >> 56 != 0);
         let target = _mm256_set1_epi64x(token as i64);
         let zero = _mm256_setzero_si256();
@@ -239,6 +266,31 @@ impl LinkTable {
                 return if m != 0 { v } else { token };
             }
             b_idx = (b_idx + 1) & self.bucket_mask;
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn slot_kv_relaxed(&self, s: usize) -> (u64, u64) {
+        let b = &*self.buckets.add(s >> 2);
+        let lane = s & 3;
+        (b.keys[lane].load(Relaxed), b.vals[lane].load(Relaxed))
+    }
+
+    #[inline(always)]
+    pub unsafe fn set_slot_val_relaxed(&self, s: usize, val: u64) {
+        let b = &*self.buckets.add(s >> 2);
+        b.vals[s & 3].store(val, Relaxed);
+    }
+
+    /// Restores root `vals` back to their root tokens if V6 falls back to V5 after seeding.
+    pub unsafe fn restore_roots(&self, from: usize, to: usize) {
+        for s in from..to {
+            let b = &*self.buckets.add(s >> 2);
+            let lane = s & 3;
+            let k = b.keys[lane].load(Relaxed);
+            if k != 0 && (b.vals[lane].load(Relaxed) >> 56) == 0 {
+                b.vals[lane].store(k, Relaxed);
+            }
         }
     }
 }
