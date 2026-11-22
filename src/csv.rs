@@ -34,11 +34,15 @@ impl Reader {
     }
 
     /// Indexes the `n` bytes at `buf`, which start at a line start and end
-    /// with a newline. Dispatches to AVX-512BW when supported and enabled, else AVX2.
-    #[inline(always)]
+    /// with a newline. Dispatches to 256-bit AVX-512VL when compiled with
+    /// AVX-512BW+VL or supported and enabled at runtime, else AVX2.
+    /// Kept out-of-line so PGO profiles generated on x86-64-v3 stay valid for `scan`.
+    #[inline(never)]
     unsafe fn index(&mut self, buf: *const u8, n: usize) {
-        if crate::sys::use_avx512() {
-            self.index_avx512(buf, n);
+        if cfg!(all(target_feature = "avx512bw", target_feature = "avx512vl"))
+            || crate::sys::use_avx512()
+        {
+            self.index_avx512vl(buf, n);
             return;
         }
         self.index_avx2(buf, n);
@@ -135,13 +139,13 @@ impl Reader {
         *fdst = fdst.add(found);
     }
 
-    #[target_feature(enable = "avx512f,avx512bw,bmi2,lzcnt")]
-    unsafe fn index_avx512(&mut self, buf: *const u8, n: usize) {
+    #[target_feature(enable = "avx512bw,avx512vl,bmi2,lzcnt")]
+    unsafe fn index_avx512vl(&mut self, buf: *const u8, n: usize) {
         let ent = self.ent.as_mut_ptr();
         let flags = self.flags.as_mut_ptr();
-        let comma = _mm512_set1_epi8(b',' as i8);
-        let newline = _mm512_set1_epi8(b'\n' as i8);
-        let quote = _mm512_set1_epi8(b'"' as i8);
+        let comma = _mm256_set1_epi8(b',' as i8);
+        let newline = _mm256_set1_epi8(b'\n' as i8);
+        let quote = _mm256_set1_epi8(b'"' as i8);
         *ent = (buf as u32).wrapping_sub(1);
         *flags = (b'\n' as u32) << 8 | (*buf as u32) << 16 | (*buf.add(1) as u32) << 24;
         self.strays.clear();
@@ -152,18 +156,27 @@ impl Reader {
         let full_end = buf.add(n & !63);
         let end = buf.add(n);
         while p < full_end {
-            let v = _mm512_loadu_si512(p as *const __m512i);
-            let d = _mm512_cmpeq_epi8_mask(v, comma) | _mm512_cmpeq_epi8_mask(v, newline);
-            let q = _mm512_cmpeq_epi8_mask(v, quote);
+            let a = _mm256_loadu_si256(p as *const __m256i);
+            let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+            let da = _mm256_cmpeq_epi8_mask(a, comma) | _mm256_cmpeq_epi8_mask(a, newline);
+            let db = _mm256_cmpeq_epi8_mask(b, comma) | _mm256_cmpeq_epi8_mask(b, newline);
+            let d = (da as u64) | ((db as u64) << 32);
+            let q = (_mm256_cmpeq_epi8_mask(a, quote) as u64)
+                | ((_mm256_cmpeq_epi8_mask(b, quote) as u64) << 32);
             self.index_step::<true>(
                 buf, p, 64, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,
             );
             p = p.add(64);
         }
         if p < end {
-            let v = _mm512_loadu_si512(p as *const __m512i);
-            let d = _mm512_cmpeq_epi8_mask(v, comma) | _mm512_cmpeq_epi8_mask(v, newline);
-            let q = _mm512_cmpeq_epi8_mask(v, quote);
+            // `scan` guarantees >= 64 bytes of readable padding past `buf + n`, matching `index_avx2`.
+            let a = _mm256_loadu_si256(p as *const __m256i);
+            let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+            let da = _mm256_cmpeq_epi8_mask(a, comma) | _mm256_cmpeq_epi8_mask(a, newline);
+            let db = _mm256_cmpeq_epi8_mask(b, comma) | _mm256_cmpeq_epi8_mask(b, newline);
+            let d = (da as u64) | ((db as u64) << 32);
+            let q = (_mm256_cmpeq_epi8_mask(a, quote) as u64)
+                | ((_mm256_cmpeq_epi8_mask(b, quote) as u64) << 32);
             let left = end.offset_from(p) as usize;
             self.index_step::<false>(
                 buf, p, left, d, q, &mut dst, &mut fdst, &mut pd, &mut pq, &mut pfs, &mut carry,

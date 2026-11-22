@@ -125,8 +125,8 @@ impl SplitScratch {
         self.nonz_revenue.clear();
         self.nonz_category.clear();
 
-        // +16 slack allows full 16-lane AVX-512 compressed stores without trailing bounds checks.
-        let rcap = cap + 16;
+        // +8 slack allows full 8-lane AVX-512VL compressed stores without trailing bounds checks.
+        let rcap = cap + 8;
         self.zero_person.reserve(rcap);
         self.zero_day.reserve(rcap);
         self.zero_sessions.reserve(rcap);
@@ -995,7 +995,7 @@ unsafe fn encode_top_category_defs_avx2(
     cat_u8_buf.set_len(cat_len);
 }
 
-/// Returns `true` when 512-bit AVX-512 should be used.
+/// Returns `true` when 256-bit AVX-512VL should be used.
 /// When compiled with `-C target-cpu=cascadelake` (`avx512f+avx512bw+avx512vl`),
 /// this folds to a compile-time constant `true` with zero runtime overhead unless `SS_NO_AVX512` is set.
 #[inline(always)]
@@ -1033,14 +1033,15 @@ fn use_avx512() -> bool {
 }
 
 /// Checks whether a slice of `i32` has identical min and max (and returns `(min, max)`).
-/// Uses AVX-512 when available (or compiled with AVX-512 target features), else AVX2.
-#[inline(always)]
+/// Uses 256-bit AVX-512VL when available (or compiled with AVX-512 target features), else AVX2.
+/// Kept out-of-line so PGO profiles generated on x86-64-v3 stay valid for column writers.
+#[inline(never)]
 pub fn min_max_i32(slice: &[i32]) -> (i32, i32) {
     debug_assert!(!slice.is_empty());
     #[cfg(target_arch = "x86_64")]
     {
         if use_avx512() {
-            return unsafe { min_max_i32_avx512(slice) };
+            return unsafe { min_max_i32_avx512vl(slice) };
         }
         return unsafe { min_max_i32_avx2(slice) };
     }
@@ -1062,21 +1063,29 @@ pub fn min_max_i32(slice: &[i32]) -> (i32, i32) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-unsafe fn min_max_i32_avx512(slice: &[i32]) -> (i32, i32) {
+unsafe fn min_max_i32_avx512vl(slice: &[i32]) -> (i32, i32) {
     let n = slice.len();
     let ptr = slice.as_ptr();
     let mut i = 0usize;
     let first = *ptr;
-    let mut vmin = _mm512_set1_epi32(first);
+    let mut vmin = _mm256_set1_epi32(first);
     let mut vmax = vmin;
-    while i + 16 <= n {
-        let v = _mm512_loadu_si512(ptr.add(i) as *const _);
-        vmin = _mm512_min_epi32(vmin, v);
-        vmax = _mm512_max_epi32(vmax, v);
-        i += 16;
+    while i + 8 <= n {
+        let v = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        vmin = _mm256_min_epi32(vmin, v);
+        vmax = _mm256_max_epi32(vmax, v);
+        i += 8;
     }
-    let mut lo = _mm512_reduce_min_epi32(vmin);
-    let mut hi = _mm512_reduce_max_epi32(vmax);
+    let min128 = _mm_min_epi32(_mm256_castsi256_si128(vmin), _mm256_extracti128_si256(vmin, 1));
+    let min64 = _mm_min_epi32(min128, _mm_shuffle_epi32(min128, 0x4E));
+    let min32 = _mm_min_epi32(min64, _mm_shuffle_epi32(min64, 0xB1));
+    let mut lo = _mm_cvtsi128_si32(min32);
+
+    let max128 = _mm_max_epi32(_mm256_castsi256_si128(vmax), _mm256_extracti128_si256(vmax, 1));
+    let max64 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, 0x4E));
+    let max32 = _mm_max_epi32(max64, _mm_shuffle_epi32(max64, 0xB1));
+    let mut hi = _mm_cvtsi128_si32(max32);
+
     while i < n {
         let v = *ptr.add(i);
         if v < lo {
@@ -1189,7 +1198,7 @@ fn compact_person_dict(
 /// 1. `zero_rev`: rows where `revenue_cents == 0 && top_category == 0xFF`
 /// 2. `non_zero`: rows where `revenue_cents != 0 || top_category != 0xFF`
 ///
-/// Uses 512-bit AVX-512 `_mm512_maskz_compress_epi32` when available, else 256-bit AVX2.
+/// Uses 256-bit AVX-512VL `_mm256_maskz_compress_epi32` when available, else 256-bit AVX2.
 pub fn split_zero_revenue_chunks<'a>(
     cols: &UserDailyCols<'a>,
     scratch: &'a mut SplitScratch,
@@ -1197,7 +1206,7 @@ pub fn split_zero_revenue_chunks<'a>(
     split_zero_revenue_impl::<true>(cols, scratch)
 }
 
-#[inline(always)]
+#[inline(never)]
 fn split_zero_revenue_impl<'a, const FILL_ZERO_CONSTS: bool>(
     cols: &UserDailyCols<'a>,
     scratch: &'a mut SplitScratch,
@@ -1207,7 +1216,7 @@ fn split_zero_revenue_impl<'a, const FILL_ZERO_CONSTS: bool>(
     #[cfg(target_arch = "x86_64")]
     {
         if use_avx512() {
-            unsafe { split_zero_revenue_avx512::<FILL_ZERO_CONSTS>(cols, scratch) };
+            unsafe { split_zero_revenue_avx512vl::<FILL_ZERO_CONSTS>(cols, scratch) };
         } else {
             unsafe { split_zero_revenue_avx2::<FILL_ZERO_CONSTS>(cols, scratch) };
         }
@@ -1259,7 +1268,7 @@ fn split_zero_revenue_impl<'a, const FILL_ZERO_CONSTS: bool>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
-unsafe fn split_zero_revenue_avx512<const FILL_ZERO_CONSTS: bool>(
+unsafe fn split_zero_revenue_avx512vl<const FILL_ZERO_CONSTS: bool>(
     cols: &UserDailyCols<'_>,
     scratch: &mut SplitScratch,
 ) {
@@ -1280,43 +1289,43 @@ unsafe fn split_zero_revenue_avx512<const FILL_ZERO_CONSTS: bool>(
     let nzr = scratch.nonz_revenue.as_mut_ptr();
     let nzc = scratch.nonz_category.as_mut_ptr();
 
-    let zero32 = _mm512_setzero_si512();
+    let zero32 = _mm256_setzero_si256();
     let null8 = _mm_set1_epi8(-1);
 
-    while i + 16 <= n {
-        let r = _mm512_loadu_si512(cols.revenue_cents.as_ptr().add(i) as *const _);
-        let r_zero = _mm512_cmpeq_epi32_mask(r, zero32);
-        let c = _mm_loadu_si128(cols.top_category.as_ptr().add(i) as *const __m128i);
-        let c_null = _mm_cmpeq_epi8_mask(c, null8);
-        let zmask: __mmask16 = r_zero & c_null;
+    while i + 8 <= n {
+        let r = _mm256_loadu_si256(cols.revenue_cents.as_ptr().add(i) as *const __m256i);
+        let r_zero: __mmask8 = _mm256_cmpeq_epi32_mask(r, zero32);
+        let c = _mm_loadl_epi64(cols.top_category.as_ptr().add(i) as *const __m128i);
+        let c_null = (_mm_cmpeq_epi8_mask(c, null8) & 0xFF) as __mmask8;
+        let zmask: __mmask8 = r_zero & c_null;
 
-        let vp = _mm512_loadu_si512(cols.person_keys.as_ptr().add(i) as *const _);
-        let vd = _mm512_loadu_si512(cols.day.as_ptr().add(i) as *const _);
-        let vs = _mm512_loadu_si512(cols.sessions.as_ptr().add(i) as *const _);
-        let ve = _mm512_loadu_si512(cols.events.as_ptr().add(i) as *const _);
+        let vp = _mm256_loadu_si256(cols.person_keys.as_ptr().add(i) as *const __m256i);
+        let vd = _mm256_loadu_si256(cols.day.as_ptr().add(i) as *const __m256i);
+        let vs = _mm256_loadu_si256(cols.sessions.as_ptr().add(i) as *const __m256i);
+        let ve = _mm256_loadu_si256(cols.events.as_ptr().add(i) as *const __m256i);
 
-        if zmask == 0xFFFF {
-            _mm512_storeu_si512(zp.add(z_len) as *mut _, vp);
-            _mm512_storeu_si512(zd.add(z_len) as *mut _, vd);
-            _mm512_storeu_si512(zs.add(z_len) as *mut _, vs);
-            _mm512_storeu_si512(ze.add(z_len) as *mut _, ve);
-            z_len += 16;
+        if zmask == 0xFF {
+            _mm256_storeu_si256(zp.add(z_len) as *mut __m256i, vp);
+            _mm256_storeu_si256(zd.add(z_len) as *mut __m256i, vd);
+            _mm256_storeu_si256(zs.add(z_len) as *mut __m256i, vs);
+            _mm256_storeu_si256(ze.add(z_len) as *mut __m256i, ve);
+            z_len += 8;
         } else {
             let z_cnt = zmask.count_ones() as usize;
-            let nz_cnt = 16 - z_cnt;
+            let nz_cnt = 8 - z_cnt;
             if z_cnt > 0 {
-                _mm512_storeu_si512(zp.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, vp));
-                _mm512_storeu_si512(zd.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, vd));
-                _mm512_storeu_si512(zs.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, vs));
-                _mm512_storeu_si512(ze.add(z_len) as *mut _, _mm512_maskz_compress_epi32(zmask, ve));
+                _mm256_storeu_si256(zp.add(z_len) as *mut __m256i, _mm256_maskz_compress_epi32(zmask, vp));
+                _mm256_storeu_si256(zd.add(z_len) as *mut __m256i, _mm256_maskz_compress_epi32(zmask, vd));
+                _mm256_storeu_si256(zs.add(z_len) as *mut __m256i, _mm256_maskz_compress_epi32(zmask, vs));
+                _mm256_storeu_si256(ze.add(z_len) as *mut __m256i, _mm256_maskz_compress_epi32(zmask, ve));
                 z_len += z_cnt;
             }
-            let nzmask = !zmask;
-            _mm512_storeu_si512(nzp.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, vp));
-            _mm512_storeu_si512(nzd.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, vd));
-            _mm512_storeu_si512(nzs.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, vs));
-            _mm512_storeu_si512(nze.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, ve));
-            _mm512_storeu_si512(nzr.add(nz_len) as *mut _, _mm512_maskz_compress_epi32(nzmask, r));
+            let nzmask: __mmask8 = !zmask;
+            _mm256_storeu_si256(nzp.add(nz_len) as *mut __m256i, _mm256_maskz_compress_epi32(nzmask, vp));
+            _mm256_storeu_si256(nzd.add(nz_len) as *mut __m256i, _mm256_maskz_compress_epi32(nzmask, vd));
+            _mm256_storeu_si256(nzs.add(nz_len) as *mut __m256i, _mm256_maskz_compress_epi32(nzmask, vs));
+            _mm256_storeu_si256(nze.add(nz_len) as *mut __m256i, _mm256_maskz_compress_epi32(nzmask, ve));
+            _mm256_storeu_si256(nzr.add(nz_len) as *mut __m256i, _mm256_maskz_compress_epi32(nzmask, r));
             let mut m = nzmask;
             let mut dst_c = nzc.add(nz_len);
             while m != 0 {
@@ -1327,7 +1336,7 @@ unsafe fn split_zero_revenue_avx512<const FILL_ZERO_CONSTS: bool>(
             }
             nz_len += nz_cnt;
         }
-        i += 16;
+        i += 8;
     }
 
     while i < n {
