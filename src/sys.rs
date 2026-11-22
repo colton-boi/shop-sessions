@@ -173,6 +173,11 @@ pub fn host_profile() -> &'static HostProfile {
     HOST_PROFILE.get_or_init(|| probe_host(std::path::Path::new("/data")))
 }
 
+#[allow(dead_code)]
+pub fn use_avx512() -> bool {
+    host_profile().simd != SimdTier::Avx2 && std::env::var_os("SS_FORCE_AVX2").is_none()
+}
+
 const PAGE: usize = 4096;
 
 /// A whole file mapped read-only, with a zero page before it (`ts::digits` loads up to 15 bytes

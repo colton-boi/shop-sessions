@@ -37,7 +37,7 @@ impl Reader {
     /// with a newline. Dispatches to AVX-512BW when supported and enabled, else AVX2.
     #[inline(always)]
     unsafe fn index(&mut self, buf: *const u8, n: usize) {
-        if crate::unscramble::use_avx512() {
+        if crate::sys::use_avx512() {
             self.index_avx512(buf, n);
             return;
         }

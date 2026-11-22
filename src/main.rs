@@ -1,13 +1,7 @@
 mod csv;
 mod diag;
 mod dims;
-pub mod fast_arena;
-pub mod fast_b36;
-pub mod fast_links;
 pub mod fast_parquet;
-pub mod fast_parse;
-pub mod fast_pipeline;
-pub mod fast_sess;
 mod group;
 mod ids;
 mod links;
@@ -15,7 +9,6 @@ mod parquet;
 mod scatter;
 mod sys;
 mod ts;
-pub mod unscramble;
 
 use csv::Reader;
 use dims::KeyMap;
@@ -505,11 +498,10 @@ fn main() {
 
     if verbose { eprintln!("  manifest {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
     // Products and campaigns are first needed by the event parse; load them beside the links.
-    let mut dims_loader = Some({
+    let dims_loader = {
         let data = data.clone();
         std::thread::spawn(move || dims::load(&data))
-    });
-    let mut dims_fallback: Option<dims::Dims> = None;
+    };
     let knob = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
     let extent = knob("SS_EXTENT", EXTENT);
     let read_buf = knob("SS_READ_BUF", READ_BUF as u64) as usize;
@@ -518,28 +510,6 @@ fn main() {
     let mut click_input = list_csv(&data.join("clicks"), extent);
     std::fs::create_dir_all(output.join("user_daily")).expect("create output");
     std::fs::create_dir_all(output.join("campaign_daily")).expect("create output");
-
-    if fast_pipeline::try_run_fast(
-        t0,
-        &output,
-        threads,
-        verbose,
-        counters.as_ref(),
-        window_start,
-        window_end,
-        base_ms,
-        first_day,
-        days,
-        read_buf,
-        &mut dims_loader,
-        &mut dims_fallback,
-        &mut link_input,
-        &mut event_input,
-        &mut click_input,
-    ) {
-        sys::prof::finish();
-        sys::exit_now();
-    }
 
     // The links are parsed first; the other files' last bytes are read in parallel during that parse.
     for i in 0..link_input.files.len() {
@@ -647,13 +617,9 @@ fn main() {
     let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
     let (d_parts, p_parts) = (parts(16_384), parts(16_384));
     let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
-    let dims = dims_fallback.unwrap_or_else(|| {
-        dims_loader
-            .take()
-            .expect("dims_loader")
-            .join()
-            .expect("loading products and campaigns")
-    });
+    let dims = dims_loader
+        .join()
+        .expect("loading products and campaigns");
     let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
     let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
     let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
