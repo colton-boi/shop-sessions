@@ -1,7 +1,7 @@
 use crate::group::Cell;
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::path::Path;
 
 pub const NULL_CAT: u8 = 0xFF;
@@ -757,18 +757,17 @@ unsafe fn encode_sub_min_bitpacked_avx2(values: &[i32], base: i32, width: usize,
     out.set_len(start_len + total_bytes);
 }
 
-/// Encodes `keys` (relative to `base_key`) using Parquet RLE/Bit-Packing Hybrid (`RLE_DICTIONARY`
-/// payload after the 1-byte bit-width). Chooses the smaller of pure RLE runs and pure bit-packing.
-pub fn encode_rle_or_bitpack_keys(keys: &[u32], base_key: u32, width: u8, out: &mut Vec<u8>) {
-    out.push(width);
-    if keys.is_empty() {
-        return;
-    }
-    let val_bytes = (width as usize).div_ceil(8);
+#[inline]
+fn count_runs_u32(keys: &[u32]) -> usize {
     #[cfg(target_arch = "x86_64")]
-    let runs = unsafe { count_runs_u32_avx2(keys) };
+    {
+        unsafe { count_runs_u32_avx2(keys) }
+    }
     #[cfg(not(target_arch = "x86_64"))]
-    let runs = {
+    {
+        if keys.is_empty() {
+            return 0;
+        }
         let mut r = 1usize;
         for i in 1..keys.len() {
             if keys[i] != keys[i - 1] {
@@ -776,7 +775,33 @@ pub fn encode_rle_or_bitpack_keys(keys: &[u32], base_key: u32, width: u8, out: &
             }
         }
         r
-    };
+    }
+}
+
+/// Encodes `keys` (relative to `base_key`) using Parquet RLE/Bit-Packing Hybrid (`RLE_DICTIONARY`
+/// payload after the 1-byte bit-width). Chooses the smaller of pure RLE runs and pure bit-packing.
+pub fn encode_rle_or_bitpack_keys(keys: &[u32], base_key: u32, width: u8, out: &mut Vec<u8>) {
+    if keys.is_empty() {
+        out.push(width);
+        return;
+    }
+    let runs = count_runs_u32(keys);
+    encode_rle_or_bitpack_keys_with_runs(keys, base_key, width, runs, out);
+}
+
+/// Encodes `keys` when `runs` (the number of contiguous equal-value runs in `keys`) is already known.
+fn encode_rle_or_bitpack_keys_with_runs(
+    keys: &[u32],
+    base_key: u32,
+    width: u8,
+    runs: usize,
+    out: &mut Vec<u8>,
+) {
+    out.push(width);
+    if keys.is_empty() {
+        return;
+    }
+    let val_bytes = (width as usize).div_ceil(8);
     let rle_est = runs * (1 + val_bytes);
     let bp_groups = keys.len().div_ceil(8);
     let bp_est = 2 + bp_groups * (width as usize);
@@ -1549,6 +1574,33 @@ fn emit_data_page_into(
     (base_offset + off, written)
 }
 
+fn write_two_vectored(file: &mut File, mut a: &[u8], mut b: &[u8]) {
+    while !a.is_empty() || !b.is_empty() {
+        let res = if !a.is_empty() && !b.is_empty() {
+            let iov = [IoSlice::new(a), IoSlice::new(b)];
+            file.write_vectored(&iov)
+        } else if !a.is_empty() {
+            file.write(a)
+        } else {
+            file.write(b)
+        };
+        match res {
+            Ok(0) => panic!("write Parquet output returned 0"),
+            Ok(n) => {
+                if n <= a.len() {
+                    a = &a[n..];
+                } else {
+                    let rem = n - a.len();
+                    a = &[];
+                    b = &b[rem..];
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("write Parquet output failed: {e}"),
+        }
+    }
+}
+
 impl FastUserDailyWriter {
     pub fn create(path: &Path) -> Self {
         let file = File::create(path).expect("create fast_parquet output");
@@ -1820,17 +1872,18 @@ impl FastUserDailyWriter {
         }
         let hdr_len = (self.buf.len() - hdr_start) as u64;
         let dict_sz = hdr_len + names_plain.len() as u64;
-        if names_plain.len() >= (64 << 10) {
-            self.flush_buf();
-            self.file.write_all(names_plain).expect("write user_id dict");
-            self.file_offset += names_plain.len() as u64;
+        if names_plain.len() >= 4096 {
+            write_two_vectored(&mut self.file, &self.buf, names_plain);
+            self.file_offset += (self.buf.len() + names_plain.len()) as u64;
+            self.buf.clear();
         } else {
             self.buf.extend_from_slice(names_plain);
         }
 
         let w = bit_width((names_count - 1) as u32);
         self.page_buf.clear();
-        encode_rle_or_bitpack_keys(person_keys, 0, w, &mut self.page_buf);
+        debug_assert_eq!(names_count, count_runs_u32(person_keys));
+        encode_rle_or_bitpack_keys_with_runs(person_keys, 0, w, names_count, &mut self.page_buf);
         let (data_off, data_sz) =
             emit_data_page_into(self.file_offset, &mut self.buf, person_keys.len(), E_RLE_DICT, &self.page_buf);
 
