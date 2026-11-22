@@ -1,14 +1,24 @@
 use crate::fast_parquet::{FastUserDailyWriter, UserDailyCols, NULL_CAT};
 use crate::ids::{append_tok_bytes, click_less, event_canon_key, event_eq};
 use crate::ts::DAY_MS;
-use crate::sys::mix;
+use crate::sys::{mix, SlabBuf, SlabSlice};
 use crate::{CRec, DRec, PRec, Shared, DEAD, NONE};
 use std::arch::x86_64::*;
 use std::path::PathBuf;
 
 const SESSION_GAP: u32 = 1_800_000;
 const WEEK: u32 = 604_800_000;
+#[cfg(test)]
 const DAY_MS_U32: u32 = DAY_MS as u32;
+
+/// Exact branchless division `x / DAY_MS_U32` for all `x: u32`.
+/// `86_400_000 = 512 * 168_750`, so `(x >> 9) / 168_750` fits in a 32-bit magic multiply.
+#[inline(always)]
+const fn div_day_ms(x: u32) -> u32 {
+    const SHIFT: u32 = 49;
+    const MAGIC: u64 = (1u64 << SHIFT).div_ceil(168_750);
+    ((((x >> 9) as u64) * MAGIC) >> SHIFT) as u32
+}
 
 const FLUSH_ROWS: usize = 65_536;
 
@@ -39,6 +49,7 @@ pub struct UserOut {
     z_names_plain: Vec<u8>,
     z_names_count: u32,
     z_person_keys: Vec<u32>,
+    z_run_lens: Vec<u32>,
     z_day: Vec<i32>,
     z_sessions: Vec<i32>,
     z_events: Vec<i32>,
@@ -48,6 +59,7 @@ pub struct UserOut {
     nz_names_plain: Vec<u8>,
     nz_names_count: u32,
     nz_person_keys: Vec<u32>,
+    nz_run_lens: Vec<u32>,
     nz_day: Vec<i32>,
     nz_sessions: Vec<i32>,
     nz_events: Vec<i32>,
@@ -99,6 +111,7 @@ impl UserOut {
             z_names_plain: Vec::with_capacity(if z_cap > 0 { 256 << 10 } else { 0 }),
             z_names_count: 0,
             z_person_keys,
+            z_run_lens: Vec::with_capacity(z_cap),
             z_day,
             z_sessions,
             z_events,
@@ -108,6 +121,7 @@ impl UserOut {
             nz_names_plain: Vec::with_capacity(if nz_cap > 0 { 64 << 10 } else { 0 }),
             nz_names_count: 0,
             nz_person_keys: Vec::with_capacity(nz_cap),
+            nz_run_lens: Vec::with_capacity(nz_cap),
             nz_day: Vec::with_capacity(nz_cap),
             nz_sessions: Vec::with_capacity(nz_cap),
             nz_events: Vec::with_capacity(nz_cap),
@@ -185,10 +199,11 @@ impl UserOut {
             }
             w
         });
-        w.write_zero_rev_direct(
+        w.write_zero_rev_direct_with_runs(
             &self.z_names_plain,
             self.z_names_count as usize,
             &self.z_person_keys,
+            &self.z_run_lens,
             &self.z_day,
             &self.z_sessions,
             &self.z_events,
@@ -196,6 +211,7 @@ impl UserOut {
         self.z_names_plain.clear();
         self.z_names_count = 0;
         self.z_person_keys.clear();
+        self.z_run_lens.clear();
         self.z_day.clear();
         self.z_sessions.clear();
         self.z_events.clear();
@@ -230,10 +246,11 @@ impl UserOut {
                 }
             }
             let w = self.writer.as_mut().unwrap();
-            w.write_nonz_i64_direct(
+            w.write_nonz_i64_direct_with_runs(
                 &self.nz_names_plain,
                 self.nz_names_count as usize,
                 &self.nz_person_keys,
+                &self.nz_run_lens,
                 &self.nz_day,
                 &self.nz_sessions,
                 &self.nz_events,
@@ -246,10 +263,11 @@ impl UserOut {
             let w = self
                 .writer
                 .get_or_insert_with(|| FastUserDailyWriter::create(&self.path));
-            w.write_nonz_direct(
+            w.write_nonz_direct_with_runs(
                 &self.nz_names_plain,
                 self.nz_names_count as usize,
                 &self.nz_person_keys,
+                &self.nz_run_lens,
                 &self.nz_day,
                 &self.nz_sessions,
                 &self.nz_events,
@@ -262,6 +280,7 @@ impl UserOut {
         self.nz_names_plain.clear();
         self.nz_names_count = 0;
         self.nz_person_keys.clear();
+        self.nz_run_lens.clear();
         self.nz_day.clear();
         self.nz_sessions.clear();
         self.nz_events.clear();
@@ -294,8 +313,10 @@ impl UserOut {
         let pk = if self.cur_person_z_key == u32::MAX {
             let k = append_plain_tok(person_tok, &mut self.z_names_plain, &mut self.z_names_count);
             self.cur_person_z_key = k;
+            self.z_run_lens.push(1);
             k
         } else {
+            unsafe { *self.z_run_lens.last_mut().unwrap_unchecked() += 1 };
             self.cur_person_z_key
         };
         self.push_zero_raw(pk, day, sessions, events);
@@ -307,6 +328,7 @@ impl UserOut {
             self.flush_zero();
         }
         let pk = append_plain_tok(person_tok, &mut self.z_names_plain, &mut self.z_names_count);
+        self.z_run_lens.push(1);
         self.push_zero_raw(pk, day, sessions, events);
     }
 
@@ -326,8 +348,10 @@ impl UserOut {
             let pk = if self.cur_person_nz_key == u32::MAX {
                 let k = append_plain_tok(person_tok, &mut self.nz_names_plain, &mut self.nz_names_count);
                 self.cur_person_nz_key = k;
+                self.nz_run_lens.push(1);
                 k
             } else {
+                unsafe { *self.nz_run_lens.last_mut().unwrap_unchecked() += 1 };
                 self.cur_person_nz_key
             };
             self.nz_person_keys.push(pk);
@@ -453,8 +477,6 @@ struct DayRow {
 
 struct SessEmitState {
     day_origin: u32,
-    cur_day: u32,
-    next_day_start: u32,
     day: u32,
     day_sessions: u32,
     day_events: u32,
@@ -485,31 +507,31 @@ pub struct Grouper {
     keys: Vec<u64>,
     ids: Vec<u32>,
     dirty_keys: Vec<u32>,
-    people: Vec<u64>,
-    ev_count: Vec<u32>,
-    pu_count: Vec<u32>,
-    ck_count: Vec<u32>,
+    people: SlabBuf<u64>,
+    ev_count: SlabBuf<u32>,
+    pu_count: SlabBuf<u32>,
+    ck_count: SlabBuf<u32>,
     /// Unscattered event person IDs and raw timestamps.
-    ev_pid: Vec<u32>,
-    ev_ts: Vec<u32>,
-    /// Scattered per-person raw event timestamps `ts` (`< 2^31`).
-    ev_u32: Vec<u32>,
+    ev_pid: SlabBuf<u32>,
+    ev_ts: SlabBuf<u32>,
+    /// Scattered per-person raw event timestamps `ts` (`< 2^31`), with `+ 8` zero tail pad.
+    ev_u32: SlabBuf<u32>,
     /// Scratch buffer for large per-person L1 radix sort.
-    ev_tmp: Vec<u32>,
+    ev_tmp: SlabBuf<u32>,
     /// Whole-partition radix buffers (used when `SS_SORT_MODE=radix`).
     ev_a: Vec<u64>,
     ev_b: Vec<u64>,
     hist: Box<[[u32; RADIX]; 2]>,
     /// Compact click scatter buffers (`ts << 32 | campaign << 16 | local_idx`).
-    ck_pid: Vec<u32>,
-    ck_packed_in: Vec<u64>,
-    ck_packed: Vec<u64>,
-    ck_at: Vec<u32>,
+    ck_pid: SlabBuf<u32>,
+    ck_packed_in: SlabBuf<u64>,
+    ck_packed: SlabBuf<u64>,
+    ck_at: SlabBuf<u32>,
     /// Fallback click buffers for >65,536 campaigns or >65,536 clicks in one partition.
     ck_a: Vec<Click>,
     ck_b: Vec<Click>,
     /// (sort key `(id << 32) | ts`, payload) of every purchase, in sort-key order once sorted.
-    purchases: Vec<(u64, u32)>,
+    purchases: SlabBuf<(u64, u32)>,
     starts: Vec<u32>,
     day_rows: Vec<DayRow>,
     sess_row: Vec<u32>,
@@ -528,29 +550,36 @@ pub struct Grouper {
 }
 
 impl Grouper {
+    #[allow(dead_code)]
     pub fn new(path: PathBuf, cells: usize, categories: &[Vec<u8>]) -> Self {
+        Self::with_slab(path, cells, categories, SlabSlice::empty())
+    }
+
+    pub fn with_slab(path: PathBuf, cells: usize, categories: &[Vec<u8>], slab: SlabSlice) -> Self {
+        let [s_people, s_evc, s_puc, s_ckc, s_pid, s_ts, s_u32, s_tmp, s_ckp, s_cki, s_cko, s_cka, s_pu] =
+            slab.split_weights([3, 2, 2, 2, 3, 3, 3, 1, 2, 3, 3, 2, 3]);
         Grouper {
             keys: vec![0; 2048],
             ids: vec![0; 2048],
             dirty_keys: Vec::with_capacity(512),
-            people: Vec::new(),
-            ev_count: Vec::new(),
-            pu_count: Vec::new(),
-            ck_count: Vec::new(),
-            ev_pid: Vec::new(),
-            ev_ts: Vec::new(),
-            ev_u32: Vec::new(),
-            ev_tmp: Vec::new(),
+            people: SlabBuf::with_slab(s_people),
+            ev_count: SlabBuf::with_slab(s_evc),
+            pu_count: SlabBuf::with_slab(s_puc),
+            ck_count: SlabBuf::with_slab(s_ckc),
+            ev_pid: SlabBuf::with_slab(s_pid),
+            ev_ts: SlabBuf::with_slab(s_ts),
+            ev_u32: SlabBuf::with_slab(s_u32),
+            ev_tmp: SlabBuf::with_slab(s_tmp),
             ev_a: Vec::new(),
             ev_b: Vec::new(),
             hist: Box::new([[0; RADIX]; 2]),
-            ck_pid: Vec::new(),
-            ck_packed_in: Vec::new(),
-            ck_packed: Vec::new(),
-            ck_at: Vec::new(),
+            ck_pid: SlabBuf::with_slab(s_ckp),
+            ck_packed_in: SlabBuf::with_slab(s_cki),
+            ck_packed: SlabBuf::with_slab(s_cko),
+            ck_at: SlabBuf::with_slab(s_cka),
             ck_a: Vec::new(),
             ck_b: Vec::new(),
-            purchases: Vec::new(),
+            purchases: SlabBuf::with_slab(s_pu),
             starts: Vec::new(),
             day_rows: Vec::new(),
             sess_row: Vec::new(),
@@ -632,10 +661,8 @@ impl Grouper {
         self.purchases.clear();
 
         let ev_total: usize = events.iter().map(|c| c.1 as usize).sum();
-        self.ev_pid.clear();
-        self.ev_pid.reserve(ev_total);
-        self.ev_ts.clear();
-        self.ev_ts.reserve(ev_total);
+        self.ev_pid.clear_and_reserve(ev_total);
+        self.ev_ts.clear_and_reserve(ev_total);
         let pid_ptr = self.ev_pid.as_mut_ptr();
         let ts_ptr = self.ev_ts.as_mut_ptr();
         let mut ev_n = 0usize;
@@ -664,10 +691,11 @@ impl Grouper {
             return;
         }
 
-        // Scatter or radix-sort events into `self.ev_u32` (holding raw `r.ts`).
-        self.ev_u32.clear();
-        self.ev_u32.reserve(ev_n);
+        // Scatter or radix-sort events into `self.ev_u32` (holding raw `r.ts`),
+        // reserving `+ 8` zero tail padding so 1-YMM loads at `ptr.add(1)` stay in-bounds.
+        self.ev_u32.clear_and_reserve(ev_n + 8);
         self.ev_u32.set_len(ev_n);
+        std::ptr::write_bytes(self.ev_u32.as_mut_ptr().add(ev_n), 0, 8);
         if self.sort_mode == SortMode::Avx2 {
             let mut sum = 0u32;
             for c in self.ev_count.iter_mut() {
@@ -755,14 +783,10 @@ impl Grouper {
         people: usize,
         ck_total: usize,
     ) {
-        self.ck_at.clear();
-        self.ck_at.reserve(ck_total);
-        self.ck_pid.clear();
-        self.ck_pid.reserve(ck_total);
-        self.ck_packed_in.clear();
-        self.ck_packed_in.reserve(ck_total);
-        self.ck_count.clear();
-        self.ck_count.resize(people, 0);
+        self.ck_at.clear_and_reserve(ck_total);
+        self.ck_pid.clear_and_reserve(ck_total);
+        self.ck_packed_in.clear_and_reserve(ck_total);
+        self.ck_count.clear_and_resize(people, 0);
 
         let ck_at_ptr = self.ck_at.as_mut_ptr();
         let ck_pid_ptr = self.ck_pid.as_mut_ptr();
@@ -786,8 +810,7 @@ impl Grouper {
         self.ck_pid.set_len(ck_n);
         self.ck_packed_in.set_len(ck_n);
 
-        self.ck_packed.clear();
-        self.ck_packed.reserve(ck_n);
+        self.ck_packed.clear_and_reserve(ck_n);
         self.ck_packed.set_len(ck_n);
         {
             let mut sum = 0u32;
@@ -845,8 +868,7 @@ impl Grouper {
     ) {
         self.ck_a.clear();
         self.ck_a.reserve(ck_total);
-        self.ck_count.clear();
-        self.ck_count.resize(people, 0);
+        self.ck_count.clear_and_resize(people, 0);
         for &(first, count) in clicks {
             let recs: &[CRec] = std::slice::from_raw_parts(sh.c_arena.base.add(first as usize), count as usize);
             for (k, r) in recs.iter().enumerate() {
@@ -949,19 +971,27 @@ impl Grouper {
     ) {
         let day_i32 = (sh.first_day + day as i64) as i32;
         if HAS_PURCH {
-            let mut best: Option<u8> = None;
-            for &c in &self.cats {
-                let sum = self.cat_sum[c as usize];
-                // Category indexes are in byte-wise name order, so the smaller index wins a tie.
-                best = match best {
-                    Some(b) if (self.cat_sum[b as usize], std::cmp::Reverse(b)) >= (sum, std::cmp::Reverse(c)) => Some(b),
-                    _ => Some(c),
-                };
-            }
-            for &c in &self.cats {
+            let best = if self.cats.len() == 1 {
+                let c = unsafe { *self.cats.get_unchecked(0) };
                 self.cat_sum[c as usize] = 0;
-            }
-            self.cats.clear();
+                self.cats.clear();
+                Some(c)
+            } else {
+                let mut best: Option<u8> = None;
+                for &c in &self.cats {
+                    let sum = self.cat_sum[c as usize];
+                    // Category indexes are in byte-wise name order, so the smaller index wins a tie.
+                    best = match best {
+                        Some(b) if (self.cat_sum[b as usize], std::cmp::Reverse(b)) >= (sum, std::cmp::Reverse(c)) => Some(b),
+                        _ => Some(c),
+                    };
+                }
+                for &c in &self.cats {
+                    self.cat_sum[c as usize] = 0;
+                }
+                self.cats.clear();
+                best
+            };
             self.out.add(person, day_i32, sessions, events, revenue, best);
         } else {
             self.out.add_zero(person, day_i32, sessions, events);
@@ -1001,7 +1031,7 @@ impl Grouper {
         if !HAS_CLICKS && !HAS_PURCH && events.len() == 1 {
             let day_origin = (sh.first_day * DAY_MS - sh.base_ms) as u32;
             let start = *events.get_unchecked(0);
-            let day = (start - day_origin) / DAY_MS_U32;
+            let day = div_day_ms(start - day_origin);
             *self
                 .cell_sessions
                 .get_unchecked_mut(sh.campaigns.len() * sh.days + day as usize) += 1;
@@ -1012,7 +1042,7 @@ impl Grouper {
         if events.len() >= 9 {
             self.person_impl_simd::<HAS_PURCH, HAS_CLICKS, C>(sh, person, events, purchases, clicks, ck_at);
         } else {
-            self.person_impl_scalar::<HAS_PURCH, HAS_CLICKS, C>(sh, person, events, purchases, clicks, ck_at);
+            self.person_impl_small::<HAS_PURCH, HAS_CLICKS, C>(sh, person, events, purchases, clicks, ck_at);
         }
     }
 
@@ -1033,21 +1063,7 @@ impl Grouper {
         let days = sh.days;
         let organic = sh.campaigns.len();
         let start = *events.get_unchecked(sess_start);
-        let start_day = if start < st.next_day_start {
-            st.cur_day
-        } else {
-            let next2 = st.next_day_start + DAY_MS_U32;
-            if start < next2 {
-                st.cur_day += 1;
-                st.next_day_start = next2;
-                st.cur_day
-            } else {
-                let d = (start - st.day_origin) / DAY_MS_U32;
-                st.cur_day = d;
-                st.next_day_start = st.day_origin + (d + 1) * DAY_MS_U32;
-                d
-            }
-        };
+        let start_day = div_day_ms(start - st.day_origin);
         if start_day != st.day {
             if st.day != u32::MAX {
                 self.flush_day::<HAS_PURCH>(sh, person, st.day, st.day_sessions, st.day_events, st.day_revenue);
@@ -1136,8 +1152,6 @@ impl Grouper {
         let day_origin = (sh.first_day * DAY_MS - sh.base_ms) as u32;
         let mut st = SessEmitState {
             day_origin,
-            cur_day: 0,
-            next_day_start: day_origin + DAY_MS_U32,
             day: u32::MAX,
             day_sessions: 0,
             day_events: 0,
@@ -1202,7 +1216,9 @@ impl Grouper {
         }
     }
 
-    unsafe fn person_impl_scalar<const HAS_PURCH: bool, const HAS_CLICKS: bool, C: ClickItem>(
+    /// 1-YMM branchless AVX2 sessionizer for `1 <= n <= 8` (requires `events` to have `+ 8`
+    /// readable `u32`s past `events.as_ptr()` when `n >= 2`).
+    unsafe fn person_impl_small<const HAS_PURCH: bool, const HAS_CLICKS: bool, C: ClickItem>(
         &mut self,
         sh: &Shared,
         person: u64,
@@ -1211,6 +1227,28 @@ impl Grouper {
         clicks: &[C],
         ck_at: &[u32],
     ) {
+        let n = events.len();
+        let ptr = events.as_ptr();
+        let mask = if n >= 2 {
+            let ts0_v = _mm256_loadu_si256(ptr as *const __m256i);
+            let ts1_v = _mm256_loadu_si256(ptr.add(1) as *const __m256i);
+            let diff = _mm256_sub_epi32(ts1_v, ts0_v);
+            let cmp = _mm256_cmpgt_epi32(diff, _mm256_set1_epi32(SESSION_GAP as i32));
+            (_mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32) & ((1u32 << (n - 1)) - 1)
+        } else {
+            0
+        };
+        if mask == 0 && !HAS_PURCH && !HAS_CLICKS {
+            let day_origin = (sh.first_day * DAY_MS - sh.base_ms) as u32;
+            let ts0 = *ptr;
+            let day = div_day_ms(ts0 - day_origin);
+            *self
+                .cell_sessions
+                .get_unchecked_mut(sh.campaigns.len() * sh.days + day as usize) += 1;
+            self.out
+                .add_zero_single(person, (sh.first_day + day as i64) as i32, 1, n as u32);
+            return;
+        }
         self.out.begin_person();
         if HAS_CLICKS {
             self.starts.clear();
@@ -1218,12 +1256,9 @@ impl Grouper {
             self.day_rows.clear();
         }
         let days = sh.days;
-        let n = events.len();
         let day_origin = (sh.first_day * DAY_MS - sh.base_ms) as u32;
         let mut st = SessEmitState {
             day_origin,
-            cur_day: 0,
-            next_day_start: day_origin + DAY_MS_U32,
             day: u32::MAX,
             day_sessions: 0,
             day_events: 0,
@@ -1237,18 +1272,16 @@ impl Grouper {
         };
 
         let mut sess_start = 0usize;
-        let mut prev_ts = *events.get_unchecked(0);
-        let mut j = 1usize;
-        while j < n {
-            let t = *events.get_unchecked(j);
-            if t - prev_ts > SESSION_GAP {
-                self.emit_session::<HAS_PURCH, HAS_CLICKS, C>(
-                    sh, person, events, purchases, clicks, ck_at, &mut st, sess_start, j, t,
-                );
-                sess_start = j;
-            }
-            prev_ts = t;
-            j += 1;
+        let mut m = mask;
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            let boundary = k + 1;
+            let next_ts = *events.get_unchecked(boundary);
+            self.emit_session::<HAS_PURCH, HAS_CLICKS, C>(
+                sh, person, events, purchases, clicks, ck_at, &mut st, sess_start, boundary, next_ts,
+            );
+            sess_start = boundary;
+            m &= m - 1;
         }
         self.emit_session::<HAS_PURCH, HAS_CLICKS, C>(
             sh, person, events, purchases, clicks, ck_at, &mut st, sess_start, n, u32::MAX,
@@ -1259,6 +1292,49 @@ impl Grouper {
             self.day_rows.push(DayRow { day: st.day, first: st.day_first, end: st.session_index });
             self.starts.push(u32::MAX);
             self.assists(days, clicks);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn add_multiday_assisted(&mut self, base: usize, from: usize, hi: usize) {
+        let mut r = *self.sess_row.get_unchecked(from) as usize;
+        loop {
+            let row = self.day_rows.get_unchecked(r);
+            let end = (row.end as usize).min(hi);
+            *self.assisted.get_unchecked_mut(base + row.day as usize) +=
+                (end - from.max(row.first as usize)) as u32;
+            if end == hi {
+                break;
+            }
+            r += 1;
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn record_assist_range<const SINGLE_DAY: bool>(
+        &mut self,
+        days: usize,
+        d0: usize,
+        camp: usize,
+        gen32: u32,
+        gen: u64,
+        lo: usize,
+        hi: usize,
+    ) {
+        let slot = self.covered.get_unchecked_mut(camp);
+        let prev_val = *slot;
+        let prev = if (prev_val >> 32) as u32 == gen32 {
+            prev_val as u32 as usize
+        } else {
+            0
+        };
+        let from = lo.max(prev);
+        *slot = gen | (hi as u64);
+        let base = camp * days;
+        if SINGLE_DAY {
+            *self.assisted.get_unchecked_mut(base + d0) += hi.saturating_sub(from) as u32;
+        } else if from < hi {
+            self.add_multiday_assisted(base, from, hi);
         }
     }
 
@@ -1278,16 +1354,65 @@ impl Grouper {
     unsafe fn assists_impl<const SINGLE_DAY: bool, C: ClickItem>(&mut self, days: usize, clicks: &[C]) {
         debug_assert!(!self.starts.is_empty());
         debug_assert_eq!(*self.starts.last().unwrap(), u32::MAX);
-        self.generation += 1;
-        let gen = (self.generation as u64) << 32;
-        let s = self.starts.as_ptr();
         let ns = self.starts.len() - 1;
+        if ns == 0 || clicks.is_empty() {
+            return;
+        }
+        self.generation += 1;
+        let gen32 = self.generation;
+        let gen = (gen32 as u64) << 32;
+        let s = self.starts.as_ptr();
         let d0 = if SINGLE_DAY {
             debug_assert_eq!(self.day_rows.len(), 1);
             self.day_rows.get_unchecked(0).day as usize
         } else {
             0
         };
+        if ns <= 16
+            && *s.add(ns - 1) < (i32::MAX as u32)
+            && clicks.last().unwrap_unchecked().ts() <= (i32::MAX as u32)
+        {
+            let all_max = _mm256_set1_epi32(i32::MAX);
+            if ns <= 8 {
+                let m0 = lane_mask_32(ns);
+                let l0 = _mm256_maskload_epi32(s as *const i32, m0);
+                let sv = _mm256_blendv_epi8(all_max, l0, m0);
+                for &c in clicks {
+                    let ts = c.ts();
+                    let lo = (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
+                        _mm256_set1_epi32(ts as i32),
+                        sv,
+                    ))) as u32)
+                        .count_ones() as usize;
+                    let reach_p1 = (ts as u64 + WEEK as u64 + 1).min(i32::MAX as u64) as i32;
+                    let hi = (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
+                        _mm256_set1_epi32(reach_p1),
+                        sv,
+                    ))) as u32)
+                        .count_ones() as usize;
+                    self.record_assist_range::<SINGLE_DAY>(days, d0, c.campaign(), gen32, gen, lo, hi);
+                }
+            } else {
+                let sv0 = _mm256_loadu_si256(s as *const __m256i);
+                let m1 = lane_mask_32(ns - 8);
+                let l1 = _mm256_maskload_epi32(s.add(8) as *const i32, m1);
+                let sv1 = _mm256_blendv_epi8(all_max, l1, m1);
+                for &c in clicks {
+                    let ts = c.ts();
+                    let ts_v = _mm256_set1_epi32(ts as i32);
+                    let lo0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(ts_v, sv0))) as u32;
+                    let lo1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(ts_v, sv1))) as u32;
+                    let lo = (lo0 | (lo1 << 8)).count_ones() as usize;
+                    let reach_p1 = (ts as u64 + WEEK as u64 + 1).min(i32::MAX as u64) as i32;
+                    let rp1_v = _mm256_set1_epi32(reach_p1);
+                    let hi0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(rp1_v, sv0))) as u32;
+                    let hi1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(rp1_v, sv1))) as u32;
+                    let hi = (hi0 | (hi1 << 8)).count_ones() as usize;
+                    self.record_assist_range::<SINGLE_DAY>(days, d0, c.campaign(), gen32, gen, lo, hi);
+                }
+            }
+            return;
+        }
         let (mut lo, mut hi) = (0usize, 0usize);
         for &c in clicks {
             let ts = c.ts();
@@ -1301,29 +1426,7 @@ impl Grouper {
             while (*s.add(hi) as u64) <= reach {
                 hi += 1;
             }
-            let camp = c.campaign();
-            let slot = self.covered.get_unchecked_mut(camp);
-            let from = if *slot >> 32 == gen >> 32 { lo.max(*slot as u32 as usize) } else { lo };
-            *slot = gen | hi as u64;
-            if from >= hi {
-                continue;
-            }
-            let base = camp * days;
-            if SINGLE_DAY {
-                *self.assisted.get_unchecked_mut(base + d0) += (hi - from) as u32;
-            } else {
-                let mut r = *self.sess_row.get_unchecked(from) as usize;
-                loop {
-                    let row = self.day_rows.get_unchecked(r);
-                    let end = (row.end as usize).min(hi);
-                    *self.assisted.get_unchecked_mut(base + row.day as usize) +=
-                        (end - from.max(row.first as usize)) as u32;
-                    if end == hi {
-                        break;
-                    }
-                    r += 1;
-                }
-            }
+            self.record_assist_range::<SINGLE_DAY>(days, d0, c.campaign(), gen32, gen, lo, hi);
         }
     }
 }
@@ -1612,7 +1715,7 @@ unsafe fn bitonic_64_pad(ptr: *mut u32, n: usize) {
 
 #[cold]
 #[inline(never)]
-fn radix_u32_2pass(ev: &mut [u32], tmp: &mut Vec<u32>) {
+fn radix_u32_2pass(ev: &mut [u32], tmp: &mut SlabBuf<u32>) {
     let n = ev.len();
     if n <= 256 {
         ev.sort_unstable();
@@ -1630,8 +1733,7 @@ fn radix_u32_2pass(ev: &mut [u32], tmp: &mut Vec<u32>) {
             (*c, sum) = (sum, sum + *c);
         }
     }
-    tmp.clear();
-    tmp.reserve(n);
+    tmp.clear_and_reserve(n);
     unsafe {
         tmp.set_len(n);
         let pe = ev.as_mut_ptr();
@@ -1655,7 +1757,7 @@ fn radix_u32_2pass(ev: &mut [u32], tmp: &mut Vec<u32>) {
 /// Branchless AVX2 register bitonic sort for per-person `u32` event timestamps (`<= 64`),
 /// falling back to `sort_unstable` / 2-pass L1 11-bit radix + `fix_order_u32` for larger slices.
 #[inline(always)]
-pub(crate) fn sort_u32_avx2(ev: &mut [u32], tmp: &mut Vec<u32>) {
+pub(crate) fn sort_u32_avx2(ev: &mut [u32], tmp: &mut SlabBuf<u32>) {
     let n = ev.len();
     if n <= 1 {
         return;
@@ -1923,10 +2025,10 @@ unsafe fn credit_tie_click(sh: &Shared, clicks: &[Click], last: usize, ts: u32) 
 /// One thread's working memory for event_id dedup.
 #[derive(Default)]
 pub struct Dedup {
-    bits_pair: Vec<[u64; 2]>,
-    buckets: Vec<u32>,
-    candidates: Vec<u32>,
-    table: Vec<u64>,
+    bits_pair: SlabBuf<[u64; 2]>,
+    buckets: SlabBuf<u32>,
+    candidates: SlabBuf<u32>,
+    table: SlabBuf<u64>,
 }
 
 #[inline(always)]
@@ -1935,6 +2037,16 @@ fn dedup_bucket(event: u64, mask: usize) -> usize {
 }
 
 impl Dedup {
+    pub fn with_slab(slab: SlabSlice) -> Self {
+        let [s_bp, s_bk, s_cand, s_tab] = slab.split_weights([10, 8, 8, 6]);
+        Self {
+            bits_pair: SlabBuf::with_slab(s_bp),
+            buckets: SlabBuf::with_slab(s_bk),
+            candidates: SlabBuf::with_slab(s_cand),
+            table: SlabBuf::with_slab(s_tab),
+        }
+    }
+
     /// Keeps, per event_id, the copy with the smallest ingest_ts and kills the
     /// payload record of every other copy. Two interleaved bitmaps over a hash
     /// of the ID mark the buckets hit more than once; only records in those
@@ -1945,10 +2057,8 @@ impl Dedup {
         let total: usize = chunks.iter().map(|c| c.1 as usize).sum();
         let bits = (total * 8).next_power_of_two().max(64);
         let mask = bits - 1;
-        self.bits_pair.clear();
-        self.bits_pair.resize(bits / 64, [0; 2]);
-        self.buckets.clear();
-        self.buckets.reserve(total);
+        self.bits_pair.clear_and_resize(bits / 64, [0; 2]);
+        self.buckets.clear_and_reserve(total);
         let base = sh.d_arena.base;
         let (bits_pair, buckets) = (self.bits_pair.as_mut_ptr(), self.buckets.as_mut_ptr());
         let mut k = 0;
@@ -1995,8 +2105,7 @@ impl Dedup {
                 }
             }
         }
-        self.candidates.clear();
-        self.candidates.reserve(total);
+        self.candidates.clear_and_reserve(total);
         let cands = self.candidates.as_mut_ptr();
         let (mut k, mut nc) = (0usize, 0usize);
         for &(first, count) in chunks {
@@ -2014,8 +2123,7 @@ impl Dedup {
         }
         self.candidates.set_len(nc);
         let cap = (self.candidates.len() * 2).next_power_of_two().max(16);
-        self.table.clear();
-        self.table.resize(cap, 0);
+        self.table.clear_and_resize(cap, 0);
         let mask = cap - 1;
         let table = self.table.as_mut_ptr();
         let kill = |r: &DRec| {
@@ -2219,7 +2327,7 @@ print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
 
     #[test]
     fn sort_u32_avx2_exhaustive_0_to_150_and_stress() {
-        fn verify_sorted(mut buf: Vec<u32>, n: usize, tmp: &mut Vec<u32>) {
+        fn verify_sorted(mut buf: Vec<u32>, n: usize, tmp: &mut SlabBuf<u32>) {
             const SENTINEL: u32 = 0xDEAD_BEEF;
             let mut expected = buf[..n].to_vec();
             expected.sort_unstable();
@@ -2229,7 +2337,7 @@ print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
             assert!(buf[n..].iter().all(|&x| x == SENTINEL), "sentinel clobbered for n={n}");
         }
 
-        let mut tmp = Vec::new();
+        let mut tmp = SlabBuf::new();
         let mut pat = [0u32; 16];
         for n in 2..=14usize {
             let total = 1usize << n;
@@ -2541,7 +2649,7 @@ print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
             clicks_u64.sort_unstable();
             clicks_fb.sort_by_key(|c| c.ts());
 
-            let mut events = Vec::with_capacity(n_ev);
+            let mut events = Vec::with_capacity(n_ev + 8);
             let mut purchases = Vec::new();
             let mut ts = day_origin + (next_u64() as u32 % (5 * DAY_MS_U32));
             let max_ts = day_origin + (days as u32 - 1) * DAY_MS_U32;
@@ -2563,10 +2671,11 @@ print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
                     purchases.push(((1u64 << 32) | (ts as u64), cat | price));
                 }
             }
+            events.resize(n_ev + 8, 0);
 
             unsafe {
-                g_simd.person(&sh, person, &events, &purchases, &clicks_u64, &ck_at);
-                ref_person_scalar(&mut g_scal, &sh, person, &events, &purchases, &clicks_fb);
+                g_simd.person(&sh, person, &events[..n_ev], &purchases, &clicks_u64, &ck_at);
+                ref_person_scalar(&mut g_scal, &sh, person, &events[..n_ev], &purchases, &clicks_fb);
             }
 
             if stream % 500 == 499 || stream == 19_999 {
@@ -2576,12 +2685,14 @@ print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
                 assert_eq!(g_simd.out.z_names_plain, g_scal.out.z_names_plain, "stream {stream}: z_names_plain");
                 assert_eq!(g_simd.out.z_names_count, g_scal.out.z_names_count, "stream {stream}: z_names_count");
                 assert_eq!(g_simd.out.z_person_keys, g_scal.out.z_person_keys, "stream {stream}: z_person_keys");
+                assert_eq!(g_simd.out.z_run_lens, g_scal.out.z_run_lens, "stream {stream}: z_run_lens");
                 assert_eq!(g_simd.out.z_day, g_scal.out.z_day, "stream {stream}: z_day");
                 assert_eq!(g_simd.out.z_sessions, g_scal.out.z_sessions, "stream {stream}: z_sessions");
                 assert_eq!(g_simd.out.z_events, g_scal.out.z_events, "stream {stream}: z_events");
                 assert_eq!(g_simd.out.nz_names_plain, g_scal.out.nz_names_plain, "stream {stream}: nz_names_plain");
                 assert_eq!(g_simd.out.nz_names_count, g_scal.out.nz_names_count, "stream {stream}: nz_names_count");
                 assert_eq!(g_simd.out.nz_person_keys, g_scal.out.nz_person_keys, "stream {stream}: nz_person_keys");
+                assert_eq!(g_simd.out.nz_run_lens, g_scal.out.nz_run_lens, "stream {stream}: nz_run_lens");
                 assert_eq!(g_simd.out.nz_day, g_scal.out.nz_day, "stream {stream}: nz_day");
                 assert_eq!(g_simd.out.nz_sessions, g_scal.out.nz_sessions, "stream {stream}: nz_sessions");
                 assert_eq!(g_simd.out.nz_events, g_scal.out.nz_events, "stream {stream}: nz_events");
@@ -2592,12 +2703,14 @@ print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
                     out.z_names_plain.clear();
                     out.z_names_count = 0;
                     out.z_person_keys.clear();
+                    out.z_run_lens.clear();
                     out.z_day.clear();
                     out.z_sessions.clear();
                     out.z_events.clear();
                     out.nz_names_plain.clear();
                     out.nz_names_count = 0;
                     out.nz_person_keys.clear();
+                    out.nz_run_lens.clear();
                     out.nz_day.clear();
                     out.nz_sessions.clear();
                     out.nz_events.clear();
@@ -2741,5 +2854,187 @@ print(f"OVF2 rows={duck_o2[0]} rev={duck_o2[1]}")
         assert_eq!(g_avx2.out.nz_events, g_radix.out.nz_events);
         assert_eq!(g_avx2.out.nz_revenue, g_radix.out.nz_revenue);
         assert_eq!(g_avx2.out.nz_top_category, g_radix.out.nz_top_category);
+    }
+
+    #[test]
+    fn test_div_day_ms_exhaustive() {
+        for k in 0..(1u32 << 23) {
+            let x0 = k << 9;
+            let x1 = x0 + 511;
+            assert_eq!(div_day_ms(x0), x0 / DAY_MS_U32, "mismatch at x0={x0}");
+            assert_eq!(div_day_ms(x1), x1 / DAY_MS_U32, "mismatch at x1={x1}");
+        }
+    }
+
+    #[test]
+    fn test_assists_avx2_vs_scalar() {
+        fn ref_assists_scalar(
+            starts: &[u32],
+            day_rows: &[DayRow],
+            sess_row: &[u32],
+            days: usize,
+            num_campaigns: usize,
+            clicks: &[u64],
+            out: &mut [u32],
+        ) {
+            let ns = starts.len() - 1;
+            let mut covered = vec![0usize; num_campaigns];
+            let (mut lo, mut hi) = (0usize, 0usize);
+            for &c in clicks {
+                let ts = c.ts();
+                while starts[lo] < ts {
+                    lo += 1;
+                }
+                if lo == ns {
+                    break;
+                }
+                let reach = ts as u64 + WEEK as u64;
+                while (starts[hi] as u64) <= reach {
+                    hi += 1;
+                }
+                let camp = c.campaign();
+                let from = lo.max(covered[camp]);
+                covered[camp] = hi;
+                if from >= hi {
+                    continue;
+                }
+                let base = camp * days;
+                if day_rows.len() == 1 {
+                    out[base + day_rows[0].day as usize] += (hi - from) as u32;
+                } else {
+                    let mut r = sess_row[from] as usize;
+                    loop {
+                        let row = &day_rows[r];
+                        let end = (row.end as usize).min(hi);
+                        out[base + row.day as usize] += (end - from.max(row.first as usize)) as u32;
+                        if end == hi {
+                            break;
+                        }
+                        r += 1;
+                    }
+                }
+            }
+        }
+
+        let days = 24usize;
+        let num_campaigns = 5usize;
+        let max_safe = (i32::MAX as u32) - 1;
+        let mut g = Grouper::new(PathBuf::new(), num_campaigns * days, &[]);
+        g.covered.resize(num_campaigns, 0);
+        let mut ref_assisted = vec![0u32; num_campaigns * days];
+
+        let mut run_case = |starts_real: &[u32], sess_days: &[u32], clicks: &[u64]| {
+            assert_eq!(starts_real.len(), sess_days.len());
+            g.starts.clear();
+            g.starts.extend_from_slice(starts_real);
+            g.starts.push(u32::MAX);
+            g.day_rows.clear();
+            g.sess_row.clear();
+            if !sess_days.is_empty() {
+                let mut cur_day = sess_days[0];
+                let mut first = 0u32;
+                for (i, &d) in sess_days.iter().enumerate() {
+                    if d != cur_day {
+                        g.day_rows.push(DayRow { day: cur_day, first, end: i as u32 });
+                        cur_day = d;
+                        first = i as u32;
+                    }
+                    g.sess_row.push(g.day_rows.len() as u32);
+                }
+                g.day_rows.push(DayRow { day: cur_day, first, end: sess_days.len() as u32 });
+            }
+            unsafe { g.assists(days, clicks) };
+            ref_assists_scalar(
+                &g.starts,
+                &g.day_rows,
+                &g.sess_row,
+                days,
+                num_campaigns,
+                clicks,
+                &mut ref_assisted,
+            );
+            assert_eq!(g.assisted, ref_assisted, "assists mismatch for ns={}", starts_real.len());
+        };
+
+        // 1. Edge cases: ts=0, exact WEEK boundary, ties, gaps, near i32::MAX
+        run_case(
+            &[0, 0, WEEK, WEEK + 1, max_safe - WEEK, max_safe - 1, max_safe],
+            &[0, 0, 7, 7, 15, 23, 23],
+            &[
+                (0u64 << 32) | (0 << 16) | 0,
+                (0u64 << 32) | (1 << 16) | 1,
+                (1u64 << 32) | (0 << 16) | 2,
+                ((max_safe as u64 - WEEK as u64) << 32) | (2 << 16) | 3,
+                ((max_safe as u64) << 32) | (0 << 16) | 4,
+            ],
+        );
+        // Single-day exact i32::MAX - 1 boundary + click == i32::MAX
+        run_case(
+            &[0, 100, WEEK, max_safe - 1, max_safe],
+            &[3, 3, 3, 3, 3],
+            &[
+                (0u64 << 32) | (0 << 16) | 0,
+                (((max_safe - WEEK) as u64) << 32) | (0 << 16) | 1,
+                (((i32::MAX as u32) as u64) << 32) | (1 << 16) | 2,
+            ],
+        );
+        // All clicks before first session or after last session
+        run_case(
+            &[WEEK + 100, WEEK + 200],
+            &[8, 8],
+            &[
+                (0u64 << 32) | (0 << 16) | 0,
+                (((WEEK + 500) as u64) << 32) | (1 << 16) | 1,
+            ],
+        );
+
+        // 2. Randomized fuzz across ns = 1..=20 (covering 1-YMM, 2-YMM, and scalar), single-day & multi-day
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        let mut next_u64 = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed
+        };
+
+        for ns in 1..=20usize {
+            for iter in 0..200usize {
+                let single_day = iter % 2 == 0;
+                let mut starts_real = Vec::with_capacity(ns);
+                let mut sess_days = Vec::with_capacity(ns);
+                let mut ts = (next_u64() as u32) % (3 * DAY_MS_U32);
+                let base_day = (next_u64() as u32) % 4;
+                for i in 0..ns {
+                    if i > 0 {
+                        let step = match next_u64() % 5 {
+                            0 => 0,
+                            1 => DAY_MS_U32,
+                            2 => WEEK / 2,
+                            _ => (next_u64() as u32) % DAY_MS_U32,
+                        };
+                        ts = ts.saturating_add(step).min(max_safe);
+                    }
+                    starts_real.push(ts);
+                    let day = if single_day {
+                        base_day
+                    } else {
+                        ((ts / DAY_MS_U32) as usize).min(days - 1) as u32
+                    };
+                    sess_days.push(day);
+                }
+                let nck = 1 + (next_u64() as usize % 12);
+                let mut clicks = Vec::with_capacity(nck);
+                let mut cts = (next_u64() as u32) % (2 * DAY_MS_U32);
+                for c_idx in 0..nck {
+                    let step = match next_u64() % 4 {
+                        0 => 0,
+                        1 => WEEK,
+                        _ => (next_u64() as u32) % (2 * DAY_MS_U32),
+                    };
+                    cts = cts.saturating_add(step).min(i32::MAX as u32);
+                    let camp = (next_u64() as usize) % num_campaigns;
+                    clicks.push(((cts as u64) << 32) | ((camp as u64) << 16) | (c_idx as u64));
+                }
+                run_case(&starts_real, &sess_days, &clicks);
+            }
+        }
     }
 }

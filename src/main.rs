@@ -794,9 +794,21 @@ fn main() {
         || by_partition(&c_logs, sh.p_parts),
     );
 
+    let use_slab = std::env::var("SS_SLAB").map_or(true, |v| v != "0");
+    const DROP_LINKS: bool = true;
+    let link_slabs = if use_slab && DROP_LINKS {
+        let raw = unsafe { sh.links.as_mut_bytes() };
+        sys::SlabSlice::from_raw(raw.as_mut_ptr(), raw.len()).split_even(threads)
+    } else {
+        if DROP_LINKS {
+            sh.links.mark_dead();
+        }
+        vec![sys::SlabSlice::empty(); threads]
+    };
+
     let next = AtomicUsize::new(0);
-    phase(4, &|_| {
-        let mut work = group::Dedup::default();
+    phase(4, &|t| {
+        let mut work = group::Dedup::with_slab(link_slabs[t]);
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(chunks) = d_chunks.get(i) else { break };
@@ -809,6 +821,12 @@ fn main() {
     let size_of = |chunks: &Vec<(u32, u32)>| chunks.iter().map(|c| c.1 as u64).sum::<u64>();
     let mut order: Vec<usize> = (0..sh.p_parts).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(size_of(&p_chunks[i]) + size_of(&c_chunks[i])));
+    let d_touched = populated[0].max(sh.d_arena.used_bytes()).min(sh.d_arena.cap_bytes());
+    let g_slabs = if use_slab {
+        sys::SlabSlice::from_raw(sh.d_arena.base as *mut u8, d_touched).split_even(threads)
+    } else {
+        vec![sys::SlabSlice::empty(); threads]
+    };
     // Tearing memory down at exit is serial and on the clock when THP is off, so free in parallel
     // only under NoHuge; with hugepages active, exit_now() tears down 2 MiB PMDs immediately.
     let release = std::env::var_os("SS_NORELEASE").is_none() && sys::host_profile().thp == sys::ThpPolicy::NoHuge;
@@ -819,16 +837,25 @@ fn main() {
         let split = |regions: &[(usize, usize)]| -> Vec<(usize, usize)> {
             regions.iter().flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at)))).collect()
         };
+        let d_piece = touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes());
+        let p_piece = touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes());
+        let c_piece = touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes());
+        // When slab recycling is active, Grouper uses `d_arena` throughout `sessions`, so it must
+        // stay live until `campaigns` (phase 7) rather than draining in `drain_dead` during `sessions`.
+        let (dead_regs, live_regs): (Vec<(usize, usize)>, Vec<(usize, usize)>) = if use_slab {
+            (
+                vec![(sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes())],
+                vec![d_piece, p_piece, c_piece, (sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes())],
+            )
+        } else {
+            (
+                vec![d_piece, (sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes())],
+                vec![p_piece, c_piece, (sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes())],
+            )
+        };
         (
-            split(&[
-                touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes()),
-                (sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes()),
-            ]),
-            split(&[
-                touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes()),
-                touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes()),
-                (sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes()),
-            ]),
+            split(&dead_regs),
+            split(&live_regs),
             sh.links.slots().div_ceil(REL_SWEEP),
         )
     } else {
@@ -849,10 +876,11 @@ fn main() {
     let per_thread_cells = PerThread::new(threads, |_| Vec::<Cell>::new());
     let next = AtomicUsize::new(0);
     phase(5, &|t| unsafe {
-        let mut g = Grouper::new(
+        let mut g = Grouper::with_slab(
             user_daily_dir.join(format!("part-{t:03}.parquet")),
             (sh.campaigns.len() + 1) * days,
             &sh.categories,
+            g_slabs[t],
         );
         loop {
             let i = next.fetch_add(1, Relaxed);
