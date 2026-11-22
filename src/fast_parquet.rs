@@ -615,6 +615,32 @@ fn encode_rle_u32_scalar(values: &[u32], width: u8, out: &mut Vec<u8>) {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+unsafe fn count_runs_u32_avx512vl(keys: &[u32]) -> usize {
+    let n = keys.len();
+    if n <= 1 {
+        return n;
+    }
+    let ptr = keys.as_ptr();
+    let mut runs = 1usize;
+    let mut i = 1usize;
+    while i + 8 <= n {
+        let cur = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        let prev = _mm256_loadu_si256(ptr.add(i - 1) as *const __m256i);
+        let neq = _mm256_cmpneq_epi32_mask(cur, prev);
+        runs += (neq as u32).count_ones() as usize;
+        i += 8;
+    }
+    while i < n {
+        if *ptr.add(i) != *ptr.add(i - 1) {
+            runs += 1;
+        }
+        i += 1;
+    }
+    runs
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi2,lzcnt")]
 unsafe fn count_runs_u32_avx2(keys: &[u32]) -> usize {
     let n = keys.len();
@@ -761,6 +787,9 @@ unsafe fn encode_sub_min_bitpacked_avx2(values: &[i32], base: i32, width: usize,
 fn count_runs_u32(keys: &[u32]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
+        if use_avx512() {
+            return unsafe { count_runs_u32_avx512vl(keys) };
+        }
         unsafe { count_runs_u32_avx2(keys) }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -885,12 +914,46 @@ fn encode_rle_or_bitpack_keys_with_runs(
 fn has_non_null_u8(cats: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
+        if use_avx512() {
+            return unsafe { has_non_null_u8_avx512vl(cats) };
+        }
         return unsafe { has_non_null_u8_avx2(cats) };
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
         cats.iter().any(|&c| c != NULL_CAT)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+unsafe fn has_non_null_u8_avx512vl(cats: &[u8]) -> bool {
+    let n = cats.len();
+    let ptr = cats.as_ptr();
+    let null_vec = _mm256_set1_epi8(-1);
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let v0 = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        let v1 = _mm256_loadu_si256(ptr.add(i + 32) as *const __m256i);
+        if (_mm256_cmpneq_epi8_mask(v0, null_vec) | _mm256_cmpneq_epi8_mask(v1, null_vec)) != 0 {
+            return true;
+        }
+        i += 64;
+    }
+    while i + 32 <= n {
+        let v = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        if _mm256_cmpneq_epi8_mask(v, null_vec) != 0 {
+            return true;
+        }
+        i += 32;
+    }
+    while i < n {
+        if *ptr.add(i) != NULL_CAT {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -935,17 +998,26 @@ pub fn encode_top_category_chunk(
     out.reserve(num_groups + 4);
 
     cat_u8_buf.clear();
-    cat_u8_buf.reserve(n);
+    cat_u8_buf.reserve(n + 16);
 
     let def_start = out.len();
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        encode_top_category_defs_avx2(
-            cats.as_ptr(),
-            n,
-            out.as_mut_ptr().add(def_start),
-            cat_u8_buf,
-        );
+        if use_avx512() {
+            encode_top_category_defs_avx512vl(
+                cats.as_ptr(),
+                n,
+                out.as_mut_ptr().add(def_start),
+                cat_u8_buf,
+            );
+        } else {
+            encode_top_category_defs_avx2(
+                cats.as_ptr(),
+                n,
+                out.as_mut_ptr().add(def_start),
+                cat_u8_buf,
+            );
+        }
         out.set_len(def_start + num_groups);
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -968,6 +1040,59 @@ pub fn encode_top_category_chunk(
     let w = bit_width(num_cats.saturating_sub(1) as u32).max(5);
     out.push(w);
     encode_bitpacked_u8(cat_u8_buf, w, out);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,bmi2,lzcnt")]
+unsafe fn encode_top_category_defs_avx512vl(
+    cats_ptr: *const u8,
+    n: usize,
+    mut def_dst: *mut u8,
+    cat_u8_buf: &mut Vec<u8>,
+) {
+    let null_vec = _mm256_set1_epi8(-1);
+    let mut cat_dst = cat_u8_buf.as_mut_ptr();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        let v = _mm256_loadu_si256(cats_ptr.add(i) as *const __m256i);
+        let present = _mm256_cmpneq_epi8_mask(v, null_vec);
+        (def_dst as *mut u32).write_unaligned(present.to_le());
+        def_dst = def_dst.add(4);
+        if present == 0xFFFF_FFFF {
+            _mm256_storeu_si256(cat_dst as *mut __m256i, v);
+            cat_dst = cat_dst.add(32);
+        } else if present != 0 {
+            for q in 0..4 {
+                let m8 = ((present >> (q * 8)) & 0xFF) as __mmask8;
+                if m8 != 0 {
+                    let v8 = _mm_loadl_epi64(cats_ptr.add(i + q * 8) as *const __m128i);
+                    let v32 = _mm256_cvtepu8_epi32(v8);
+                    let comp = _mm256_maskz_compress_epi32(m8, v32);
+                    let packed = _mm256_cvtepi32_epi8(comp);
+                    _mm_storel_epi64(cat_dst as *mut __m128i, packed);
+                    cat_dst = cat_dst.add(m8.count_ones() as usize);
+                }
+            }
+        }
+        i += 32;
+    }
+    while i < n {
+        let rem = (n - i).min(8);
+        let mut mask = 0u8;
+        for b in 0..rem {
+            let c = *cats_ptr.add(i + b);
+            if c != NULL_CAT {
+                mask |= 1 << b;
+                *cat_dst = c;
+                cat_dst = cat_dst.add(1);
+            }
+        }
+        *def_dst = mask;
+        def_dst = def_dst.add(1);
+        i += 8;
+    }
+    let cat_len = cat_dst.offset_from(cat_u8_buf.as_ptr()) as usize;
+    cat_u8_buf.set_len(cat_len);
 }
 
 #[cfg(target_arch = "x86_64")]

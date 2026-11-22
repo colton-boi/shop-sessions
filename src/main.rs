@@ -166,13 +166,14 @@ pub(crate) struct Input {
     pub(crate) files: Vec<Mapped>,
     /// Extents of each file not yet parsed; the last one to finish unmaps the file.
     remaining: Vec<AtomicUsize>,
+    unmap_on_done: bool,
     pub(crate) extents: Vec<Extent>,
     pub(crate) bytes: u64,
 }
 
 impl Input {
     pub(crate) fn done(&self, x: &Extent) {
-        if self.remaining[x.file].fetch_sub(1, Relaxed) == 1 {
+        if self.unmap_on_done && self.remaining[x.file].fetch_sub(1, Relaxed) == 1 {
             sys::unmap_file(self.files[x.file].0, self.files[x.file].1);
         }
     }
@@ -213,10 +214,11 @@ fn list_csv_paths(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn build_input(mapped: &[sys::ContiguousMappedFile], extent: u64) -> Input {
+fn build_input(mapped: &[sys::ContiguousMappedFile], extent: u64, unmap_on_done: bool) -> Input {
     let mut input = Input {
         files: Vec::with_capacity(mapped.len()),
         remaining: Vec::with_capacity(mapped.len()),
+        unmap_on_done,
         extents: Vec::new(),
         bytes: 0,
     };
@@ -236,23 +238,33 @@ fn build_input(mapped: &[sys::ContiguousMappedFile], extent: u64) -> Input {
     input
 }
 
-fn load_all_inputs(data: &Path, link_extent: u64, extent: u64) -> (Input, Input, Input) {
-    let links_paths = list_csv_paths(&data.join("links"));
-    let events_paths = list_csv_paths(&data.join("events"));
-    let clicks_paths = list_csv_paths(&data.join("clicks"));
+fn map_all_inputs(
+    links_paths: Vec<PathBuf>,
+    events_paths: Vec<PathBuf>,
+    clicks_paths: Vec<PathBuf>,
+    link_extent: u64,
+    extent: u64,
+    threads: usize,
+) -> (Input, Input, Input) {
     let n_links = links_paths.len();
     let n_events = events_paths.len();
     let mut all_paths = Vec::with_capacity(n_links + n_events + clicks_paths.len());
     all_paths.extend(links_paths);
     all_paths.extend(events_paths);
     all_paths.extend(clicks_paths);
-    let region = sys::map_files_contiguous(&all_paths);
+    let region = sys::map_files_contiguous_par(&all_paths, threads);
+    let total_input_bytes: usize = region.files.iter().map(|f| f.size).sum();
+    let unmap_parse = match std::env::var("SS_UNMAP_PARSE").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => total_input_bytes > (12usize << 30),
+    };
     let (links_m, rest) = region.files.split_at(n_links);
     let (events_m, clicks_m) = rest.split_at(n_events);
     (
-        build_input(links_m, link_extent),
-        build_input(events_m, extent),
-        build_input(clicks_m, extent),
+        build_input(links_m, link_extent, unmap_parse),
+        build_input(events_m, extent, unmap_parse),
+        build_input(clicks_m, extent, unmap_parse),
     )
 }
 
@@ -557,15 +569,27 @@ fn main() {
     let read_buf = knob("SS_READ_BUF", READ_BUF as u64) as usize;
     let user_daily_dir = output.join("user_daily");
     let campaign_daily_dir = output.join("campaign_daily");
-    let (dims, (mut link_input, mut event_input, mut click_input), ()) = sys::join3(
+    let (dims, (links_paths, events_paths, clicks_paths), ()) = sys::join3(
         threads,
         || dims::load(&data),
-        || load_all_inputs(&data, extent.min(128 << 10), extent),
+        || (
+            list_csv_paths(&data.join("links")),
+            list_csv_paths(&data.join("events")),
+            list_csv_paths(&data.join("clicks")),
+        ),
         || {
             diag::host(threads);
             std::fs::create_dir_all(&user_daily_dir).expect("create output");
             std::fs::create_dir_all(&campaign_daily_dir).expect("create output");
         },
+    );
+    let (mut link_input, mut event_input, mut click_input) = map_all_inputs(
+        links_paths,
+        events_paths,
+        clicks_paths,
+        extent.min(128 << 10),
+        extent,
+        threads,
     );
     init_hex_user_table((link_input.bytes + event_input.bytes + click_input.bytes) as usize);
 
@@ -573,6 +597,90 @@ fn main() {
     for i in 0..link_input.files.len() {
         link_input.end_line(i);
     }
+
+    // Guardrail C5: finish ALL mmap() allocations (LinkTable and all large arenas) BEFORE any
+    // MADV_POPULATE_WRITE runs.
+    let link_pairs_est = if link_input.bytes <= (2 << 20) {
+        ((link_input.bytes / 4) as usize).max(16)
+    } else {
+        ((link_input.bytes / 20) as usize).max(16)
+    };
+    let links = LinkTable::new(link_pairs_est);
+    let rows_guess = (event_input.bytes / 78) as usize;
+    let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
+    let (d_parts, p_parts) = (parts(16_384), parts(16_384));
+    let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
+    let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
+    let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
+    let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
+    const SIDE_CHUNK: usize = 4096;
+    let e_side_recs = (event_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
+    let c_side_recs = (click_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
+    let use_rel = base_ms % 1000 == 0;
+    let date_lut = DateLut::new(window_start, window_end, base_ms.div_euclid(1000));
+    let mut sh = Shared {
+        window_start,
+        window_end,
+        base_ms,
+        use_rel,
+        date_lut,
+        first_day,
+        days,
+        products: dims.products,
+        product_category: dims.product_category,
+        direct_prod_cat: dims.direct_prod_cat,
+        unknown_category: dims.unknown_category,
+        categories: dims.categories,
+        campaign_ids: dims.campaign_ids,
+        direct_camp: dims.direct_camp,
+        campaigns: dims.campaigns,
+        links,
+        d_arena: Arena::new(d_recs, D_CHUNK),
+        p_arena: Arena::new(p_recs, P_CHUNK),
+        c_arena: Arena::new(c_recs, C_CHUNK),
+        e_side_arena: Arena::new(e_side_recs, SIDE_CHUNK),
+        c_side_arena: Arena::new(c_side_recs, SIDE_CHUNK),
+        d_parts,
+        p_parts,
+    };
+
+    // Committing the expected arenas in interleaved 4 MiB blocks overlaps cleanly with the
+    // link-stage idle tails and avoids page-by-page faults during parse.
+    let d_pop_rows = (event_input.bytes / 81) as usize;
+    let p_pop_rows = (event_input.bytes / 83) as usize;
+    let ck_pop_rows = (click_input.bytes / 52) as usize;
+    let populated = [
+        ((d_pop_rows + (threads * d_parts / 2) * D_CHUNK) * std::mem::size_of::<DRec>())
+            .min(sh.d_arena.cap_bytes()),
+        ((p_pop_rows + (threads * p_parts / 2) * P_CHUNK) * std::mem::size_of::<PRec>())
+            .min(sh.p_arena.cap_bytes()),
+        ((ck_pop_rows + (threads * p_parts / 2) * C_CHUNK) * std::mem::size_of::<CRec>())
+            .min(sh.c_arena.cap_bytes()),
+        ((event_input.bytes / 42) as usize).min(sh.e_side_arena.cap_bytes()),
+        ((click_input.bytes / 42) as usize).min(sh.c_side_arena.cap_bytes()),
+    ];
+    let pop_pieces: Vec<(usize, usize)> = {
+        const PIECE: usize = 4 << 20;
+        let regions = [
+            (sh.d_arena.base as usize, populated[0]),
+            (sh.p_arena.base as usize, populated[1]),
+            (sh.c_arena.base as usize, populated[2]),
+            (sh.e_side_arena.base as usize, populated[3]),
+            (sh.c_side_arena.base as usize, populated[4]),
+        ];
+        let max_len = regions.iter().map(|&(_, n)| n).max().unwrap_or(0);
+        let mut pieces = Vec::with_capacity(regions.iter().map(|&(_, n)| n.div_ceil(PIECE)).sum());
+        for at in (0..max_len).step_by(PIECE) {
+            for &(b, n) in &regions {
+                if at < n {
+                    pieces.push((b + at, PIECE.min(n - at)));
+                }
+            }
+        }
+        pieces
+    };
+    let pop_next = AtomicUsize::new(0);
+    let overlap_pop = std::env::var("SS_OVERLAP_POP").ok().as_deref() != Some("0");
 
     if verbose { eprintln!("  listed {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
     let workers = PerThread::new(threads, |_| Worker {
@@ -611,10 +719,22 @@ fn main() {
         }
     };
 
+    let drain_pop_while = |active: &AtomicUsize| {
+        if !overlap_pop {
+            return;
+        }
+        while active.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            let i = pop_next.fetch_add(1, Relaxed);
+            let Some(&(at, n)) = pop_pieces.get(i) else { break };
+            sys::populate(at as *mut u8, n);
+        }
+    };
+
     let next = AtomicUsize::new(0);
     let tails = event_input.files.len() + click_input.files.len();
     let next_tail = AtomicUsize::new(0);
     let unended: Vec<std::sync::atomic::AtomicBool> = (0..tails).map(|_| Default::default()).collect();
+    let active0 = AtomicUsize::new(threads);
     phase(0, &|t| unsafe {
         loop {
             let i = next_tail.fetch_add(1, Relaxed);
@@ -627,9 +747,11 @@ fn main() {
             };
             unended[i].store(lacks, Relaxed);
         }
-        parse_links(&link_input, &next, workers.get(t), t)
+        parse_links(&link_input, &next, workers.get(t), t);
+        active0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        drain_pop_while(&active0);
     });
-    // Rare, and done before the populate so no mapping change contends with it for the mmap lock.
+    // Rare, and done before the remaining populate so no mapping change contends for the mmap lock.
     for (i, u) in unended.iter().enumerate() {
         if u.load(Relaxed) {
             match i.checked_sub(event_input.files.len()) {
@@ -643,7 +765,10 @@ fn main() {
 
     let pair_lists: Vec<&[(u64, u64)]> = (0..threads).map(|t| unsafe { workers.get(t).pairs.as_slice() }).collect();
     let pairs: usize = pair_lists.iter().map(|p| p.len()).sum();
-    let links = LinkTable::new(pairs);
+    if pairs.saturating_mul(2) > sh.links.slots() * 4 / 5 {
+        sh.links.release(0, sh.links.slots());
+        sh.links = LinkTable::new(pairs);
+    }
     const LINK_BLOCK: usize = 2048;
     let blocks: Vec<(usize, usize)> = pair_lists
         .iter()
@@ -651,103 +776,47 @@ fn main() {
         .flat_map(|(t, p)| (0..p.len()).step_by(LINK_BLOCK).map(move |from| (t, from)))
         .collect();
     let next = AtomicUsize::new(0);
-    phase(1, &|_| loop {
-        let i = next.fetch_add(1, Relaxed);
-        let Some(&(t, from)) = blocks.get(i) else { break };
-        let list = pair_lists[t];
-        unsafe { links.link_all(&list[from..(from + LINK_BLOCK).min(list.len())]) };
+    let active1 = AtomicUsize::new(threads);
+    phase(1, &|_| {
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            let Some(&(t, from)) = blocks.get(i) else { break };
+            let list = pair_lists[t];
+            unsafe { sh.links.link_all(&list[from..(from + LINK_BLOCK).min(list.len())]) };
+        }
+        active1.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        drain_pop_while(&active1);
     });
     const SWEEP: usize = 1 << 14;
-    let sweeps = links.slots().div_ceil(SWEEP);
+    let sweeps = sh.links.slots().div_ceil(SWEEP);
     let sweep = |f: &(dyn Fn(usize, usize) + Sync)| {
         let next = AtomicUsize::new(0);
-        phase(2, &|_| loop {
-            let i = next.fetch_add(1, Relaxed);
-            if i >= sweeps {
-                break;
+        let active2 = AtomicUsize::new(threads);
+        phase(2, &|_| {
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= sweeps {
+                    break;
+                }
+                f(i * SWEEP, ((i + 1) * SWEEP).min(sh.links.slots()));
             }
-            f(i * SWEEP, ((i + 1) * SWEEP).min(links.slots()));
+            active2.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            drain_pop_while(&active2);
         });
     };
-    sweep(&|from, to| unsafe { links.compress_and_resolve(from, to) });
+    sweep(&|from, to| unsafe { sh.links.compress_and_resolve(from, to) });
     marks.push(mark("links join"));
     log_stage(&marks);
 
-    let rows_guess = (event_input.bytes / 78) as usize;
-    let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
-    let (d_parts, p_parts) = (parts(16_384), parts(16_384));
-    let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
-    let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
-    let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
-    let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
-    const SIDE_CHUNK: usize = 4096;
-    let e_side_recs = (event_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
-    let c_side_recs = (click_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
-    let use_rel = base_ms % 1000 == 0;
-    let date_lut = DateLut::new(window_start, window_end, base_ms.div_euclid(1000));
-    let sh = Shared {
-        window_start,
-        window_end,
-        base_ms,
-        use_rel,
-        date_lut,
-        first_day,
-        days,
-        products: dims.products,
-        product_category: dims.product_category,
-        direct_prod_cat: dims.direct_prod_cat,
-        unknown_category: dims.unknown_category,
-        categories: dims.categories,
-        campaign_ids: dims.campaign_ids,
-        direct_camp: dims.direct_camp,
-        campaigns: dims.campaigns,
-        links,
-        d_arena: Arena::new(d_recs, D_CHUNK),
-        p_arena: Arena::new(p_recs, P_CHUNK),
-        c_arena: Arena::new(c_recs, C_CHUNK),
-        e_side_arena: Arena::new(e_side_recs, SIDE_CHUNK),
-        c_side_arena: Arena::new(c_side_recs, SIDE_CHUNK),
-        d_parts,
-        p_parts,
-    };
-
-    // Committing the expected arena in 4 MB blocks costs about a third of the kernel
-    // time that eight threads faulting it in page by page take during the parse.
-    let ev_pop_rows = (event_input.bytes / 80) as usize;
-    let ck_pop_rows = (click_input.bytes / 52) as usize;
-    let populated = [
-        ((ev_pop_rows + (threads * d_parts / 2) * D_CHUNK) * std::mem::size_of::<DRec>())
-            .min(sh.d_arena.cap_bytes()),
-        ((ev_pop_rows + (threads * p_parts / 2) * P_CHUNK) * std::mem::size_of::<PRec>())
-            .min(sh.p_arena.cap_bytes()),
-        ((ck_pop_rows + (threads * p_parts / 2) * C_CHUNK) * std::mem::size_of::<CRec>())
-            .min(sh.c_arena.cap_bytes()),
-    ];
-    {
-        const PIECE: usize = 4 << 20;
-        let regions = [
-            (sh.d_arena.base as usize, populated[0]),
-            (sh.p_arena.base as usize, populated[1]),
-            (sh.c_arena.base as usize, populated[2]),
-        ];
-        let max_len = regions.iter().map(|&(_, n)| n).max().unwrap_or(0);
-        let mut pieces = Vec::with_capacity(regions.iter().map(|&(_, n)| n.div_ceil(PIECE)).sum());
-        for at in (0..max_len).step_by(PIECE) {
-            for &(b, n) in &regions {
-                if at < n {
-                    pieces.push((b + at, PIECE.min(n - at)));
-                }
-            }
-        }
-        let next = AtomicUsize::new(0);
+    if pop_next.load(Relaxed) < pop_pieces.len() {
         phase(6, &|_| loop {
-            let i = next.fetch_add(1, Relaxed);
-            let Some(&(at, n)) = pieces.get(i) else { break };
+            let i = pop_next.fetch_add(1, Relaxed);
+            let Some(&(at, n)) = pop_pieces.get(i) else { break };
             sys::populate(at as *mut u8, n);
         });
-        marks.push(mark("populate"));
-    log_stage(&marks);
     }
+    marks.push(mark("populate"));
+    log_stage(&marks);
     // Largest work first, so the tail of the phase is made of small pieces.
     let mut work: Vec<(bool, usize)> = (0..event_input.extents.len())
         .map(|i| (true, i))
@@ -822,12 +891,12 @@ fn main() {
         (
             split(&[
                 touched(sh.d_arena.base as usize, sh.d_arena.used_bytes(), populated[0], sh.d_arena.cap_bytes()),
-                (sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes()),
+                touched(sh.e_side_arena.base as usize, sh.e_side_arena.used_bytes(), populated[3], sh.e_side_arena.cap_bytes()),
             ]),
             split(&[
                 touched(sh.p_arena.base as usize, sh.p_arena.used_bytes(), populated[1], sh.p_arena.cap_bytes()),
                 touched(sh.c_arena.base as usize, sh.c_arena.used_bytes(), populated[2], sh.c_arena.cap_bytes()),
-                (sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes()),
+                touched(sh.c_side_arena.base as usize, sh.c_side_arena.used_bytes(), populated[4], sh.c_side_arena.cap_bytes()),
             ]),
             sh.links.slots().div_ceil(REL_SWEEP),
         )

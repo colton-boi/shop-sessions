@@ -263,11 +263,28 @@ pub struct ContiguousInputRegion {
 unsafe impl Send for ContiguousInputRegion {}
 unsafe impl Sync for ContiguousInputRegion {}
 
+struct SyncSlots<T>(Vec<UnsafeCell<T>>);
+unsafe impl<T: Send> Sync for SyncSlots<T> {}
+impl<T> SyncSlots<T> {
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slot(&self, i: usize) -> &mut T {
+        &mut *self.0[i].get()
+    }
+}
+
 /// Reserves one anonymous virtual range covering all `files` padded to 2 MiB boundaries
 /// (with a leading 2 MiB zero guard) and maps each non-empty file into its 2 MiB-aligned slot
-/// using `MAP_PRIVATE | MAP_FIXED`.
+/// using `MAP_SHARED | MAP_FIXED`.
+#[allow(dead_code)]
 pub fn map_files_contiguous(files: &[std::path::PathBuf]) -> ContiguousInputRegion {
+    map_files_contiguous_par(files, 1)
+}
+
+/// Parallel version of `map_files_contiguous`: parallelizes `open`+`fstat` and `mmap(MAP_SHARED | MAP_FIXED)`
+/// across `threads` workers while preserving exact file ordering and the 2 MiB leading zero guard.
+pub fn map_files_contiguous_par(files: &[std::path::PathBuf], threads: usize) -> ContiguousInputRegion {
     use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     if files.is_empty() {
         return ContiguousInputRegion {
             reserve_base: std::ptr::null_mut(),
@@ -277,45 +294,97 @@ pub fn map_files_contiguous(files: &[std::path::PathBuf]) -> ContiguousInputRegi
             files: Vec::new(),
         };
     }
-    let mut opened = Vec::with_capacity(files.len());
-    let mut rel_offset = 0usize;
-    for path in files {
-        let f = std::fs::File::open(path).expect("open input file");
+    let n = files.len();
+    let par_threads = threads.min(n).max(1);
+    let opened: SyncSlots<Option<(std::fs::File, usize)>> =
+        SyncSlots((0..n).map(|_| UnsafeCell::new(None)).collect());
+    let open_one = |i: usize| {
+        let f = std::fs::File::open(&files[i]).expect("open input file");
         let size = f.metadata().expect("stat input file").len() as usize;
+        unsafe { *opened.slot(i) = Some((f, size)) };
+    };
+    if par_threads > 1 {
+        let next = AtomicUsize::new(0);
+        par(par_threads, |_| loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= n {
+                break;
+            }
+            open_one(i);
+        });
+    } else {
+        for i in 0..n {
+            open_one(i);
+        }
+    }
+
+    let mut offsets = Vec::with_capacity(n);
+    let mut rel_offset = 0usize;
+    for i in 0..n {
+        let size = unsafe { (*opened.slot(i)).as_ref().unwrap().1 };
+        offsets.push(rel_offset);
         // Leave at least one trailing zero page after each file and align the next slot to 2 MiB.
         let slot_span = ((size + PAGE).max(1) + HUGE - 1) & !(HUGE - 1);
-        opened.push((f, size, rel_offset));
         rel_offset += slot_span;
     }
     let total_span = rel_offset;
     let reserve_len = HUGE + total_span + HUGE;
+    let file_huge_ok = host_profile().file_huge_ok;
     unsafe {
         // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
         let raw = mmap(std::ptr::null_mut(), reserve_len, 1, 0x02 | 0x20 | 0x4000, -1, 0);
         assert!(raw as isize != -1, "contiguous mmap reserve failed");
-        let region_base = ((raw as usize + HUGE) & !(HUGE - 1)) as *const u8;
-        let mut mapped = Vec::with_capacity(opened.len());
-        for (f, size, off) in opened {
-            let slot_ptr = region_base.add(off);
+        let region_addr = (raw as usize + HUGE) & !(HUGE - 1);
+        let mapped: SyncSlots<ContiguousMappedFile> = SyncSlots(
+            (0..n)
+                .map(|_| {
+                    UnsafeCell::new(ContiguousMappedFile {
+                        ptr: std::ptr::null(),
+                        rel_offset: 0,
+                        size: 0,
+                    })
+                })
+                .collect(),
+        );
+        let map_one = |i: usize| {
+            let (f, size) = opened.slot(i).take().unwrap();
+            let off = offsets[i];
+            let slot_addr = region_addr + off;
             if size > 0 {
-                let p = mmap(slot_ptr as *mut c_void, size, 1, 0x02 | 0x10, f.as_raw_fd(), 0);
-                assert!(p as usize == slot_ptr as usize, "contiguous MAP_FIXED input mmap failed");
-                if size >= HUGE && host_profile().file_huge_ok {
-                    madvise(slot_ptr as *mut c_void, size & !(HUGE - 1), 14);
+                // MAP_SHARED | MAP_FIXED (0x01 | 0x10)
+                let p = mmap(slot_addr as *mut c_void, size, 1, 0x01 | 0x10, f.as_raw_fd(), 0);
+                assert!(p as usize == slot_addr, "contiguous MAP_FIXED input mmap failed");
+                if size >= HUGE && file_huge_ok {
+                    madvise(slot_addr as *mut c_void, size & !(HUGE - 1), 14);
                 }
             }
-            mapped.push(ContiguousMappedFile {
-                ptr: slot_ptr,
+            drop(f);
+            *mapped.slot(i) = ContiguousMappedFile {
+                ptr: slot_addr as *const u8,
                 rel_offset: off as u64,
                 size,
+            };
+        };
+        if par_threads > 1 {
+            let next = AtomicUsize::new(0);
+            par(par_threads, |_| loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= n {
+                    break;
+                }
+                map_one(i);
             });
+        } else {
+            for i in 0..n {
+                map_one(i);
+            }
         }
         ContiguousInputRegion {
             reserve_base: raw as *mut u8,
             reserve_len,
-            region_base,
+            region_base: region_addr as *const u8,
             total_span,
-            files: mapped,
+            files: mapped.0.into_iter().map(UnsafeCell::into_inner).collect(),
         }
     }
 }
@@ -375,15 +444,29 @@ impl HugeBump {
 }
 
 /// The length of a `map_file` mapping once it ends with a newline: when the file lacks one, a
-/// newline is written after its last byte (into a private copy of that page).
+/// newline is written after its last byte (into a private anonymous copy of that tail page).
 pub unsafe fn end_line(data: *const u8, size: usize) -> usize {
     if size == 0 || *data.add(size - 1) == b'\n' {
         return size;
     }
     let at = data.add(size) as usize;
-    // PROT_READ | PROT_WRITE
-    assert!(mprotect((at & !(PAGE - 1)) as *mut c_void, PAGE, 3) == 0, "mprotect failed");
-    *(at as *mut u8) = b'\n';
+    let page_base = at & !(PAGE - 1);
+    let in_page = at - page_base;
+    if in_page == 0 {
+        // `at` is on the anonymous zero page immediately following the file mapping.
+        // PROT_READ | PROT_WRITE
+        assert!(mprotect(page_base as *mut c_void, PAGE, 3) == 0, "mprotect failed");
+        *(at as *mut u8) = b'\n';
+    } else {
+        // Remap only the last partial page as MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED so this
+        // works safely on read-only MAP_SHARED file mappings without SIGSEGV/EACCES.
+        let mut tmp = [0u8; PAGE];
+        std::ptr::copy_nonoverlapping(page_base as *const u8, tmp.as_mut_ptr(), in_page);
+        tmp[in_page] = b'\n';
+        let p = mmap(page_base as *mut c_void, PAGE, 3, 0x02 | 0x20 | 0x10, -1, 0);
+        assert!(p as usize == page_base, "end_line anonymous remap failed");
+        std::ptr::copy_nonoverlapping(tmp.as_ptr(), page_base as *mut u8, in_page + 1);
+    }
     size + 1
 }
 
@@ -976,14 +1059,28 @@ mod tests {
         std::fs::write(&p2, b"").unwrap();
         std::fs::write(&p3, b"a,b\n1,2").unwrap();
 
-        let region = map_files_contiguous(&[p1.clone(), p2.clone(), p3.clone()]);
+        let region = map_files_contiguous_par(&[p1.clone(), p2.clone(), p3.clone()], 4);
         assert_eq!(region.files.len(), 3);
         for f in &region.files {
             assert_eq!((f.ptr as usize) & (HUGE - 1), 0);
             // At least 64 bytes of readable zero padding after every file for SIMD over-reads.
             let pad = unsafe { std::slice::from_raw_parts(f.ptr.add(f.size), 64) };
             assert!(pad.iter().all(|&b| b == 0));
+            // Verify C1: leading zero guard page before mapped file.
+            let lead = unsafe { std::slice::from_raw_parts(f.ptr.sub(PAGE), PAGE) };
+            assert!(lead.iter().all(|&b| b == 0));
         }
+        unsafe {
+            assert_eq!(end_line(region.files[0].ptr, region.files[0].size), PAGE + 1);
+            assert_eq!(*region.files[0].ptr.add(PAGE), b'\n');
+            assert_eq!(end_line(region.files[1].ptr, region.files[1].size), 0);
+            assert_eq!(end_line(region.files[2].ptr, region.files[2].size), 8);
+            let s3 = std::slice::from_raw_parts(region.files[2].ptr, 8);
+            assert_eq!(s3, b"a,b\n1,2\n");
+            let pad3 = std::slice::from_raw_parts(region.files[2].ptr.add(8), 64);
+            assert!(pad3.iter().all(|&b| b == 0));
+        }
+        assert_eq!(std::fs::read(&p3).unwrap(), b"a,b\n1,2", "MAP_SHARED end_line must not modify disk");
         release(region.reserve_base, region.reserve_len);
         let _ = std::fs::remove_dir_all(&dir);
     }

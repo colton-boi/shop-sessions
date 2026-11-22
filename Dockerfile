@@ -8,9 +8,18 @@ COPY src src
 COPY gen gen
 RUN if cargo run --release --manifest-path gen/Cargo.toml -- --seed 77 --events 300000 --clicks 75000 --output /tmp/pgo-data --threads 4 && \
         mkdir -p /tmp/pgo /tmp/pgo-out && \
-        RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static -C relocation-model=static -C link-arg=-no-pie -C force-unwind-tables=no -C link-arg=-Wl,--gc-sections -C llvm-args=-x86-branches-within-32B-boundaries --cfg pgo_gen -C profile-generate=/tmp/pgo" \
-        cargo build --release --locked --bin sessions && \
-        SS_THREADS=8 /src/target/release/sessions /tmp/pgo-data /tmp/pgo-out && \
+        PGO_COMMON="-C relocation-model=static -C link-arg=-no-pie -C force-unwind-tables=no -C link-arg=-Wl,--gc-sections -C llvm-args=-x86-branches-within-32B-boundaries --cfg pgo_gen -C profile-generate=/tmp/pgo" && \
+        if RUSTFLAGS="-C target-cpu=${FINAL_CPU} -C target-feature=+crt-static,-evex512 -C llvm-args=-x86-pad-max-prefix-size=5 -C llvm-args=--slp-max-reg-size=256 -C llvm-args=--disable-vector-combine -C llvm-args=--force-tail-folding-style=none -C llvm-args=--enable-interleaved-mem-accesses=false -C llvm-args=--vectorize-slp=false ${PGO_COMMON}" \
+            cargo build --release --locked --bin sessions && \
+            SS_THREADS=8 /src/target/release/sessions /tmp/pgo-data /tmp/pgo-out; then \
+            echo "Native ${FINAL_CPU} PGO training succeeded"; \
+        else \
+            echo "Native ${FINAL_CPU} PGO run unavailable on build host, falling back to x86-64-v3" >&2; \
+            rm -rf /tmp/pgo/* /tmp/pgo-out/* && \
+            RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static ${PGO_COMMON}" \
+            cargo build --release --locked --bin sessions && \
+            SS_THREADS=8 /src/target/release/sessions /tmp/pgo-data /tmp/pgo-out; \
+        fi && \
         "$(find "$(rustc --print sysroot)" -name "llvm-profdata" | head -n1)" merge -o /tmp/pgo/merged.profdata /tmp/pgo/*.profraw; then \
         echo "PGO training succeeded"; \
     else \
@@ -20,7 +29,7 @@ RUN if cargo run --release --manifest-path gen/Cargo.toml -- --seed 77 --events 
     rm -rf /tmp/pgo-data /tmp/pgo-out /tmp/pgo/*.profraw
 RUN PGO_FLAG=""; \
     if [ -s /tmp/pgo/merged.profdata ]; then PGO_FLAG="-C profile-use=/tmp/pgo/merged.profdata"; fi; \
-    RUSTFLAGS="-C target-cpu=${FINAL_CPU} -C target-feature=+crt-static,-evex512,-avx512f -C relocation-model=static -C link-arg=-no-pie -C force-unwind-tables=no -C link-arg=-Wl,--gc-sections -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -C llvm-args=--disable-vector-combine -C llvm-args=--force-tail-folding-style=none ${PGO_FLAG}" \
+    RUSTFLAGS="-C target-cpu=${FINAL_CPU} -C target-feature=+crt-static,-evex512 -C relocation-model=static -C link-arg=-no-pie -C force-unwind-tables=no -C link-arg=-Wl,--gc-sections -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -C llvm-args=--slp-max-reg-size=256 -C llvm-args=--disable-vector-combine -C llvm-args=--force-tail-folding-style=none -C llvm-args=--enable-interleaved-mem-accesses=false -C llvm-args=--vectorize-slp=false ${PGO_FLAG}" \
     cargo build --release --locked --bin sessions && \
     strip --strip-all -R .eh_frame -R .eh_frame_hdr -R .gcc_except_table -R .comment -R .note.gnu.build-id /src/target/release/sessions
 

@@ -71,8 +71,18 @@ pub unsafe fn parse_hex33(p: *const u8, len: usize) -> Option<(u8, u64, u64)> {
     }
     // Convert ASCII hex chars to nibbles 0..=15.
     let lo_nib = _mm256_and_si256(v, _mm256_set1_epi8(0x0F));
-    let is_alpha = _mm256_cmpgt_epi8(v, _mm256_set1_epi8(b'9' as i8));
-    let nibs = _mm256_add_epi8(lo_nib, _mm256_and_si256(is_alpha, _mm256_set1_epi8(9)));
+    let nibs = {
+        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vl"))]
+        {
+            let is_alpha = _mm256_cmpgt_epi8_mask(v, _mm256_set1_epi8(b'9' as i8));
+            _mm256_mask_add_epi8(lo_nib, is_alpha, lo_nib, _mm256_set1_epi8(9))
+        }
+        #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vl")))]
+        {
+            let is_alpha = _mm256_cmpgt_epi8(v, _mm256_set1_epi8(b'9' as i8));
+            _mm256_add_epi8(lo_nib, _mm256_and_si256(is_alpha, _mm256_set1_epi8(9)))
+        }
+    };
     // Pair adjacent nibbles: byte[2k] * 16 + byte[2k+1].
     let bytes = _mm256_maddubs_epi16(nibs, _mm256_set1_epi16(0x0110));
     let pack_bswap = _mm256_setr_epi8(
@@ -598,20 +608,40 @@ unsafe fn pack(p: *const u8, len: usize) -> u64 {
 /// `p0` and `p1` must be readable for 16 bytes; empty ID gives 0.
 #[inline(always)]
 unsafe fn try_pack_pair(p0: *const u8, l0: usize, p1: *const u8, l1: usize) -> Option<(u64, u64)> {
-    let raw = _mm256_loadu2_m128i(p1 as *const __m128i, p0 as *const __m128i);
-    let lens = _mm256_setr_m128i(_mm_set1_epi8(l0.min(16) as i8), _mm_set1_epi8(l1.min(16) as i8));
-    let idx = _mm256_setr_epi8(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    );
-    let keep = _mm256_cmpgt_epi8(lens, idx);
-    let x = _mm256_and_si256(raw, keep);
-    // Bytes past the ID read as 1, so a 0 or a high bit anywhere is a byte that does not pack.
-    let filled = _mm256_or_si256(x, _mm256_andnot_si256(keep, _mm256_set1_epi8(1)));
-    let bad = _mm256_movemask_epi8(_mm256_or_si256(filled, _mm256_cmpeq_epi8(filled, _mm256_setzero_si256())));
-    if (bad != 0) | (l0.max(l1) > 9) {
-        return None;
-    }
+    let x = {
+        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vl"))]
+        {
+            if l0.max(l1) > 9 {
+                return None;
+            }
+            let mask32 = ((1u32 << l0) - 1) | (((1u32 << l1) - 1) << 16);
+            let raw = _mm256_loadu2_m128i(p1 as *const __m128i, p0 as *const __m128i);
+            let x = _mm256_maskz_mov_epi8(mask32, raw);
+            let bad = _mm256_mask_cmpgt_epi8_mask(mask32, _mm256_set1_epi8(1), x);
+            if bad != 0 {
+                return None;
+            }
+            x
+        }
+        #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vl")))]
+        {
+            let raw = _mm256_loadu2_m128i(p1 as *const __m128i, p0 as *const __m128i);
+            let lens = _mm256_setr_m128i(_mm_set1_epi8(l0.min(16) as i8), _mm_set1_epi8(l1.min(16) as i8));
+            let idx = _mm256_setr_epi8(
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            );
+            let keep = _mm256_cmpgt_epi8(lens, idx);
+            let x = _mm256_and_si256(raw, keep);
+            // Bytes past the ID read as 1, so a 0 or a high bit anywhere is a byte that does not pack.
+            let filled = _mm256_or_si256(x, _mm256_andnot_si256(keep, _mm256_set1_epi8(1)));
+            let bad = _mm256_movemask_epi8(_mm256_or_si256(filled, _mm256_cmpeq_epi8(filled, _mm256_setzero_si256())));
+            if (bad != 0) | (l0.max(l1) > 9) {
+                return None;
+            }
+            x
+        }
+    };
     // Words (b0, b1): b0 << 7 | b1; then pairs of words: w0 << 14 | w1, so each dword packs four bytes.
     let w = _mm256_or_si256(_mm256_slli_epi16(_mm256_and_si256(x, _mm256_set1_epi16(0xFF)), 7), _mm256_srli_epi16(x, 8));
     let d = _mm256_madd_epi16(w, _mm256_setr_epi16(16384, 1, 16384, 1, 16384, 1, 16384, 1, 16384, 1, 16384, 1, 16384, 1, 16384, 1));

@@ -73,7 +73,7 @@ fn unquote(f: &[u8]) -> Option<&[u8]> {
 
 /// The data lines of a small two-column CSV, by the same dialect as the big files.
 fn two_columns(bytes: &[u8]) -> Vec<(&[u8], &[u8])> {
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(bytes.len() / 16);
     let mut lines = bytes.split(|&c| c == b'\n');
     lines.next();
     if bytes.last() == Some(&b'\n') {
@@ -162,19 +162,37 @@ pub unsafe fn lookup_prod_direct(lut: &[u8], unknown: u8, p: *const u8, len: usi
 pub fn load(dir: &Path) -> Dims {
     let products_csv = std::fs::read(dir.join("products.csv")).unwrap_or_default();
     let rows = two_columns(&products_csv);
-    let mut first_seen: HashMap<&[u8], u8> = HashMap::new();
-    let mut names: Vec<&[u8]> = vec![b"unknown"];
-    first_seen.insert(b"unknown", 0);
-    let provisional: Vec<u8> = rows
-        .iter()
-        .map(|r| {
-            *first_seen.entry(r.1).or_insert_with(|| {
-                names.push(r.1);
+    let mut names: Vec<&[u8]> = Vec::with_capacity(64);
+    names.push(b"unknown");
+    let mut first_seen: Option<HashMap<&[u8], u8>> = None;
+    let mut provisional: Vec<u8> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let cat = r.1;
+        let idx = if let Some(map) = first_seen.as_mut() {
+            *map.entry(cat).or_insert_with(|| {
+                names.push(cat);
                 assert!(names.len() <= 256, "more than 256 categories");
                 (names.len() - 1) as u8
             })
-        })
-        .collect();
+        } else if let Some(pos) = names.iter().position(|&n| n == cat) {
+            pos as u8
+        } else if names.len() < 64 {
+            names.push(cat);
+            (names.len() - 1) as u8
+        } else {
+            let mut map: HashMap<&[u8], u8> = HashMap::with_capacity(128);
+            for (i, &n) in names.iter().enumerate() {
+                map.insert(n, i as u8);
+            }
+            names.push(cat);
+            assert!(names.len() <= 256, "more than 256 categories");
+            let id = (names.len() - 1) as u8;
+            map.insert(cat, id);
+            first_seen = Some(map);
+            id
+        };
+        provisional.push(idx);
+    }
     let mut order: Vec<u8> = (0..names.len() as u8).collect();
     order.sort_by_key(|&i| names[i as usize]);
     let mut rank = vec![0u8; names.len()];
