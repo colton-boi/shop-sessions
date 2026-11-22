@@ -7,7 +7,6 @@ use std::io::Write;
 use std::os::raw::c_int;
 
 extern "C" {
-    fn sched_getaffinity(pid: c_int, size: usize, mask: *mut u8) -> c_int;
     fn sysconf(name: c_int) -> i64;
 }
 
@@ -43,37 +42,19 @@ fn avx512() -> String {
     format!("{}{}", have.join(","), if zmm { "" } else { "(os-off)" })
 }
 
-fn affinity() -> (usize, String) {
-    let mut mask = [0u8; 128];
-    if unsafe { sched_getaffinity(0, mask.len(), mask.as_mut_ptr()) } != 0 {
-        return (0, "?".into());
-    }
-    let on = |i: usize| mask[i / 8] >> (i % 8) & 1 != 0;
-    let (mut ranges, mut count, mut i) = (Vec::new(), 0, 0);
-    while i < 1024 {
-        if !on(i) {
-            i += 1;
-            continue;
-        }
-        let from = i;
-        while i < 1024 && on(i) {
-            i += 1;
-        }
-        count += i - from;
-        ranges.push(if i - from == 1 { format!("{from}") } else { format!("{from}-{}", i - 1) });
-    }
-    (count, ranges.join(","))
-}
-
 fn read_trim(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-/// cgroup v2 limits of this process's group, falling back to the namespace root.
-fn cgroup(file: &str) -> String {
-    let own = std::fs::read_to_string("/proc/self/cgroup")
+/// cgroup v2 path of this process's group, read once from `/proc/self/cgroup`.
+fn cgroup_self() -> Option<String> {
+    std::fs::read_to_string("/proc/self/cgroup")
         .ok()
-        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string)));
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string)))
+}
+
+/// cgroup v2 limits of this process's group, falling back to the namespace root.
+fn cgroup(own: Option<&str>, file: &str) -> String {
     if let Some(p) = own {
         if let Some(v) = read_trim(&format!("/sys/fs/cgroup{}/{file}", p.trim_end_matches('/'))) {
             return v;
@@ -93,17 +74,18 @@ fn emit(line: String) {
 }
 
 pub fn host(threads: usize) {
-    let (n_aff, aff) = affinity();
-    let online = unsafe { sysconf(84) }; // _SC_NPROCESSORS_ONLN
-    let (cpu_max, mem_max) = (cgroup("cpu.max"), cgroup("memory.max"));
-    let mem = mem_max.parse::<u64>().map_or(mem_max.clone(), |b| format!("{}M", b >> 20));
     let hp = crate::sys::host_profile();
+    let (n_aff, ref aff) = hp.affinity;
+    let online = unsafe { sysconf(84) }; // _SC_NPROCESSORS_ONLN
+    let own = cgroup_self();
+    let (cpu_max, mem_max) = (cgroup(own.as_deref(), "cpu.max"), cgroup(own.as_deref(), "memory.max"));
+    let mem = mem_max.parse::<u64>().map_or(mem_max.clone(), |b| format!("{}M", b >> 20));
     emit(format!(
         "ss host cpu=\"{}\" avx512={} nproc={online} affinity={aff}({n_aff}) threads={threads} cpu.max={} memory.max={mem} thp={}/{} kern={}.{} fs={:#x} o9={} simd={:?} thp_pol={:?} fhuge={}\n",
         cpu_brand(),
         avx512(),
         cpu_max.replace(' ', "/"),
-        thp("enabled"),
+        hp.thp_enabled,
         thp("defrag"),
         hp.kern_major,
         hp.kern_minor,

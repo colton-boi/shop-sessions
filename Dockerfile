@@ -20,7 +20,7 @@ RUN if cargo run --release --manifest-path gen/Cargo.toml -- --seed 77 --events 
     rm -rf /tmp/pgo-data /tmp/pgo-out /tmp/pgo/*.profraw
 RUN PGO_FLAG=""; \
     if [ -s /tmp/pgo/merged.profdata ]; then PGO_FLAG="-C profile-use=/tmp/pgo/merged.profdata"; fi; \
-    RUSTFLAGS="-C target-cpu=${FINAL_CPU} -C target-feature=+crt-static,+prefer-no-scatter,+prefer-no-gather -C relocation-model=static -C link-arg=-no-pie -C force-unwind-tables=no -C link-arg=-Wl,--gc-sections -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -C llvm-args=--slp-max-reg-size=256 -C llvm-args=--disable-vector-combine -C llvm-args=--force-tail-folding-style=none -C llvm-args=--enable-interleaved-mem-accesses=false -C llvm-args=--vectorize-slp=false ${PGO_FLAG}" \
+    RUSTFLAGS="-C target-cpu=${FINAL_CPU} -C target-feature=+crt-static,-evex512,-avx512f -C relocation-model=static -C link-arg=-no-pie -C force-unwind-tables=no -C link-arg=-Wl,--gc-sections -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -C llvm-args=--disable-vector-combine -C llvm-args=--force-tail-folding-style=none ${PGO_FLAG}" \
     cargo build --release --locked --bin sessions && \
     strip --strip-all -R .eh_frame -R .eh_frame_hdr -R .gcc_except_table -R .comment -R .note.gnu.build-id /src/target/release/sessions
 

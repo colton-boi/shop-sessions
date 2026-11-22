@@ -73,10 +73,12 @@ pub enum ThpPolicy {
 }
 
 /// What the host offers, probed once at startup in well under 100 us.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HostProfile {
     pub simd: SimdTier,
     pub thp: ThpPolicy,
+    pub thp_enabled: String,
+    pub affinity: (usize, String),
     pub file_huge_ok: bool,
     pub fs_magic: i64,
     pub kern_major: u32,
@@ -90,8 +92,26 @@ extern "C" {
     fn statfs(path: *const std::os::raw::c_char, buf: *mut [i64; 16]) -> c_int;
 }
 
-fn bracketed(s: &str, tag: &str) -> bool {
-    s.split_whitespace().any(|w| w.strip_prefix('[').and_then(|w| w.strip_suffix(']')) == Some(tag))
+fn probe_affinity() -> (usize, String) {
+    let mut mask = [0u8; 128];
+    if unsafe { sched_getaffinity(0, mask.len(), mask.as_mut_ptr()) } != 0 {
+        return (0, "?".into());
+    }
+    let on = |i: usize| mask[i / 8] >> (i % 8) & 1 != 0;
+    let (mut ranges, mut count, mut i) = (Vec::new(), 0, 0);
+    while i < 1024 {
+        if !on(i) {
+            i += 1;
+            continue;
+        }
+        let from = i;
+        while i < 1024 && on(i) {
+            i += 1;
+        }
+        count += i - from;
+        ranges.push(if i - from == 1 { format!("{from}") } else { format!("{from}-{}", i - 1) });
+    }
+    (count, ranges.join(","))
 }
 
 fn probe_simd() -> SimdTier {
@@ -131,22 +151,31 @@ fn order9_free() -> u32 {
 
 fn probe_host(data_dir: &std::path::Path) -> HostProfile {
     let en = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
-    let o9 = order9_free();
+    let thp_enabled = en
+        .split('[')
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .unwrap_or("-")
+        .to_string();
+    let o9 = if std::env::var_os("SS_STATS").is_some() {
+        order9_free()
+    } else {
+        u32::MAX
+    };
     let thp = if std::env::var_os("SS_NOHUGE").is_some() {
         ThpPolicy::NoHuge
     } else if std::env::var_os("SS_THP").is_some_and(|v| v == "advise") {
         // Models the scorer's thp=madvise on a host whose THP mode is `always`.
         ThpPolicy::AdviseHuge
-    } else if bracketed(&en, "always") {
-        // Without MADV_HUGEPAGE the kernel allocates huge pages opportunistically and never stalls to compact.
-        ThpPolicy::DefaultHuge
-    } else if bracketed(&en, "madvise") {
-        // The scorer's mode: MADV_HUGEPAGE is the only way to get huge pages (turning THP off costs +148 ms).
-        ThpPolicy::AdviseHuge
-    } else if bracketed(&en, "never") {
-        ThpPolicy::NoHuge
     } else {
-        ThpPolicy::AdviseHuge
+        match thp_enabled.as_str() {
+            // Without MADV_HUGEPAGE the kernel allocates huge pages opportunistically and never stalls to compact.
+            "always" => ThpPolicy::DefaultHuge,
+            // The scorer's mode: MADV_HUGEPAGE is the only way to get huge pages (turning THP off costs +148 ms).
+            "madvise" => ThpPolicy::AdviseHuge,
+            "never" => ThpPolicy::NoHuge,
+            _ => ThpPolicy::AdviseHuge,
+        }
     };
     let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let mut it = rel.trim().split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse::<u32>().unwrap_or(0));
@@ -162,7 +191,17 @@ fn probe_host(data_dir: &std::path::Path) -> HostProfile {
     let file_huge_ok = (fs_magic == 0x0102_1994 && kern >= (5, 15))
         || (fs_magic == 0x5846_5342 && kern >= (5, 18))
         || (fs_magic == 0xEF53 && kern >= (6, 8));
-    HostProfile { simd: probe_simd(), thp, file_huge_ok, fs_magic, kern_major, kern_minor, order9_free: o9 }
+    HostProfile {
+        simd: probe_simd(),
+        thp,
+        thp_enabled,
+        affinity: probe_affinity(),
+        file_huge_ok,
+        fs_magic,
+        kern_major,
+        kern_minor,
+        order9_free: o9,
+    }
 }
 
 pub fn init_host_profile(data_dir: &std::path::Path) -> &'static HostProfile {
@@ -261,6 +300,9 @@ pub fn map_files_contiguous(files: &[std::path::PathBuf]) -> ContiguousInputRegi
             if size > 0 {
                 let p = mmap(slot_ptr as *mut c_void, size, 1, 0x02 | 0x10, f.as_raw_fd(), 0);
                 assert!(p as usize == slot_ptr as usize, "contiguous MAP_FIXED input mmap failed");
+                if size >= HUGE && host_profile().file_huge_ok {
+                    madvise(slot_ptr as *mut c_void, size & !(HUGE - 1), 14);
+                }
             }
             mapped.push(ContiguousMappedFile {
                 ptr: slot_ptr,
@@ -696,6 +738,7 @@ impl<T> SyncCell<T> {
 }
 
 /// Runs two heterogeneous setup closures in parallel on the thread pool (must not nest `par`).
+#[allow(dead_code)]
 pub fn join2<A, B, RA, RB>(threads: usize, a: A, b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,

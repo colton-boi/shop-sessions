@@ -190,8 +190,19 @@ fn list_csv_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "csv") && p.is_file())
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().is_none_or(|x| x != "csv") {
+                    return None;
+                }
+                let is_file = match e.file_type() {
+                    Ok(ft) if ft.is_file() => true,
+                    Ok(ft) if ft.is_symlink() => p.is_file(),
+                    Ok(_) => false,
+                    Err(_) => p.is_file(),
+                };
+                is_file.then_some(p)
+            })
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -515,7 +526,6 @@ fn main() {
     // Counters must open before the pool starts so every worker thread inherits them.
     let counters = verbose.then(sys::Counters::open);
     sys::start_pool(threads);
-    diag::host(threads);
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let window_start = manifest_time(&manifest, "\"window_start\"");
@@ -530,14 +540,19 @@ fn main() {
     let knob = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
     let extent = knob("SS_EXTENT", EXTENT);
     let read_buf = knob("SS_READ_BUF", READ_BUF as u64) as usize;
-    let (dims, (mut link_input, mut event_input, mut click_input)) = sys::join2(
+    let user_daily_dir = output.join("user_daily");
+    let campaign_daily_dir = output.join("campaign_daily");
+    let (dims, (mut link_input, mut event_input, mut click_input), ()) = sys::join3(
         threads,
         || dims::load(&data),
         || load_all_inputs(&data, extent.min(128 << 10), extent),
+        || {
+            diag::host(threads);
+            std::fs::create_dir_all(&user_daily_dir).expect("create output");
+            std::fs::create_dir_all(&campaign_daily_dir).expect("create output");
+        },
     );
     init_hex_user_table((link_input.bytes + event_input.bytes + click_input.bytes) as usize);
-    std::fs::create_dir_all(output.join("user_daily")).expect("create output");
-    std::fs::create_dir_all(output.join("campaign_daily")).expect("create output");
 
     // The links are parsed first; the other files' last bytes are read in parallel during that parse.
     for i in 0..link_input.files.len() {
@@ -546,7 +561,7 @@ fn main() {
 
     if verbose { eprintln!("  listed {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
     let workers = PerThread::new(threads, |_| Worker {
-        reader: Reader::new(read_buf),
+        reader: Reader::lazy(read_buf),
         dates: DateCache::new(),
         pairs: Vec::new(),
         d: Scatter::new(),
@@ -700,10 +715,15 @@ fn main() {
             (sh.p_arena.base as usize, populated[1]),
             (sh.c_arena.base as usize, populated[2]),
         ];
-        let pieces: Vec<(usize, usize)> = regions
-            .iter()
-            .flat_map(|&(b, n)| (0..n).step_by(PIECE).map(move |at| (b + at, PIECE.min(n - at))))
-            .collect();
+        let max_len = regions.iter().map(|&(_, n)| n).max().unwrap_or(0);
+        let mut pieces = Vec::with_capacity(regions.iter().map(|&(_, n)| n.div_ceil(PIECE)).sum());
+        for at in (0..max_len).step_by(PIECE) {
+            for &(b, n) in &regions {
+                if at < n {
+                    pieces.push((b + at, PIECE.min(n - at)));
+                }
+            }
+        }
         let next = AtomicUsize::new(0);
         phase(6, &|_| loop {
             let i = next.fetch_add(1, Relaxed);
@@ -749,12 +769,15 @@ fn main() {
     marks.push(mark("parse"));
     log_stage(&marks);
 
-    let logs = |f: &dyn Fn(&Worker) -> &Vec<(u32, u32, u32)>| -> Vec<&Vec<(u32, u32, u32)>> {
-        (0..threads).map(|t| f(unsafe { workers.get(t) })).collect()
-    };
-    let d_chunks = by_partition(&logs(&|w| &w.d.log), sh.d_parts);
-    let p_chunks = by_partition(&logs(&|w| &w.p.log), sh.p_parts);
-    let c_chunks = by_partition(&logs(&|w| &w.c.log), sh.p_parts);
+    let d_logs: Vec<&Vec<(u32, u32, u32)>> = (0..threads).map(|t| unsafe { &workers.get(t).d.log }).collect();
+    let p_logs: Vec<&Vec<(u32, u32, u32)>> = (0..threads).map(|t| unsafe { &workers.get(t).p.log }).collect();
+    let c_logs: Vec<&Vec<(u32, u32, u32)>> = (0..threads).map(|t| unsafe { &workers.get(t).c.log }).collect();
+    let (d_chunks, p_chunks, c_chunks) = sys::join3(
+        threads,
+        || by_partition(&d_logs, sh.d_parts),
+        || by_partition(&p_logs, sh.p_parts),
+        || by_partition(&c_logs, sh.p_parts),
+    );
 
     let next = AtomicUsize::new(0);
     phase(4, &|_| {
@@ -808,22 +831,20 @@ fn main() {
             sys::release(at as *mut u8, n);
         }
     };
-    let groupers = PerThread::new(threads, |t| {
-        Grouper::new(
-            output.join("user_daily").join(format!("part-{t:03}.parquet")),
-            (sh.campaigns.len() + 1) * days,
-            &sh.categories,
-        )
-    });
+    let per_thread_cells = PerThread::new(threads, |_| Vec::<Cell>::new());
     let next = AtomicUsize::new(0);
     phase(5, &|t| unsafe {
-        let g = groupers.get(t);
+        let mut g = Grouper::new(
+            user_daily_dir.join(format!("part-{t:03}.parquet")),
+            (sh.campaigns.len() + 1) * days,
+            &sh.categories,
+        );
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(&part) = order.get(i) else { break };
             g.partition(&sh, &p_chunks[part], &c_chunks[part]);
         }
-        std::mem::replace(&mut g.out, group::UserOut::new(PathBuf::new())).finish(t == 0);
+        *per_thread_cells.get(t) = g.finish(t == 0);
         drain_dead();
     });
     marks.push(mark("sessions"));
@@ -831,8 +852,10 @@ fn main() {
 
     phase(7, &|t| {
         if t == 0 {
-            let cells: Vec<Vec<Cell>> = (0..threads).map(|t| unsafe { groupers.get(t).take_cells() }).collect();
-            write_campaigns(&sh, &output.join("campaign_daily").join("part-000.parquet"), &cells);
+            let cells: Vec<Vec<Cell>> = (0..threads)
+                .map(|t| std::mem::take(unsafe { per_thread_cells.get(t) }))
+                .collect();
+            write_campaigns(&sh, &campaign_daily_dir.join("part-000.parquet"), &cells);
         }
         drain_dead();
         while release {

@@ -20,10 +20,24 @@ pub struct Reader {
 }
 
 impl Reader {
+    #[allow(dead_code)]
     pub fn new(window: usize) -> Self {
-        let mut r = Reader { window: 0, ent: Vec::new(), flags: Vec::new(), strays: Vec::new(), count: 0 };
-        r.resize(window.max(64));
+        let mut r = Self::lazy(window);
+        r.ensure();
         r
+    }
+
+    pub fn lazy(window: usize) -> Self {
+        let window = window.max(64);
+        assert!(window < (u32::MAX >> 1) as usize, "line too long");
+        Reader { window, ent: Vec::new(), flags: Vec::new(), strays: Vec::new(), count: 0 }
+    }
+
+    #[inline(always)]
+    fn ensure(&mut self) {
+        if self.ent.is_empty() {
+            self.resize(self.window);
+        }
     }
 
     fn resize(&mut self, window: usize) {
@@ -296,6 +310,7 @@ impl Reader {
         b: usize,
         mut f: impl FnMut(*const u8, &[u32; 8], &[u32; 8]),
     ) {
+        self.ensure();
         // Skipping through the first newline drops the header when a == 0 and
         // the tail of the previous range's last line otherwise.
         let mut start = a.saturating_sub(1);
@@ -390,6 +405,7 @@ impl Reader {
     #[cfg(test)]
     #[allow(dead_code)]
     pub unsafe fn bench_index_only(&mut self, data: *const u8, size: usize) -> usize {
+        self.ensure();
         let mut start = 0usize;
         let mut total_delims = 0usize;
         while start < size {

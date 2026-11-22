@@ -52,6 +52,7 @@ pub fn build_cat_dict(categories: &[Vec<u8>]) -> (Vec<u8>, Vec<u32>) {
 }
 
 impl UserOut {
+    #[allow(dead_code)]
     pub fn new(path: PathBuf) -> Self {
         Self::with_categories(path, &[])
     }
@@ -504,11 +505,20 @@ impl Grouper {
         self.purchases = purchases;
     }
 
+    #[allow(dead_code)]
     pub fn take_cells(&mut self) -> Vec<Cell> {
         for (c, &a) in self.cells.iter_mut().zip(&self.assisted) {
             c.assisted = a;
         }
         std::mem::take(&mut self.cells)
+    }
+
+    pub fn finish(mut self, even_if_empty: bool) -> Vec<Cell> {
+        self.out.finish(even_if_empty);
+        for (c, &a) in self.cells.iter_mut().zip(&self.assisted) {
+            c.assisted = a;
+        }
+        self.cells
     }
 
     fn flush_day(&mut self, sh: &Shared, person: u64, day: u32, sessions: u32, events: u32, revenue: u64) {
@@ -753,39 +763,76 @@ unsafe fn credit(sh: &Shared, clicks: &[Click]) -> usize {
 /// One thread's working memory for event_id dedup.
 #[derive(Default)]
 pub struct Dedup {
-    once: Vec<u64>,
-    twice: Vec<u64>,
+    bits_pair: Vec<[u64; 2]>,
     buckets: Vec<u32>,
     candidates: Vec<u32>,
     table: Vec<u64>,
 }
 
+#[inline(always)]
+fn dedup_bucket(event: u64, mask: usize) -> usize {
+    ((event_canon_key(event).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 32) as usize) & mask
+}
+
 impl Dedup {
     /// Keeps, per event_id, the copy with the smallest ingest_ts and kills the
-    /// payload record of every other copy. Two bitmaps over a hash of the ID
-    /// mark the buckets hit more than once; only records in those buckets,
-    /// which include every copy of every duplicate, go through the exact table.
+    /// payload record of every other copy. Two interleaved bitmaps over a hash
+    /// of the ID mark the buckets hit more than once; only records in those
+    /// buckets, which include every copy of every duplicate, go through the
+    /// exact table.
     pub unsafe fn partition(&mut self, sh: &Shared, chunks: &[(u32, u32)]) {
+        const PF_AHEAD: usize = 8;
         let total: usize = chunks.iter().map(|c| c.1 as usize).sum();
         let bits = (total * 8).next_power_of_two().max(64);
         let mask = bits - 1;
-        self.once.clear();
-        self.once.resize(bits / 64, 0);
-        self.twice.clear();
-        self.twice.resize(bits / 64, 0);
+        self.bits_pair.clear();
+        self.bits_pair.resize(bits / 64, [0; 2]);
         self.buckets.clear();
         self.buckets.reserve(total);
         let base = sh.d_arena.base;
-        let (once, twice, buckets) = (self.once.as_mut_ptr(), self.twice.as_mut_ptr(), self.buckets.as_mut_ptr());
+        let (bits_pair, buckets) = (self.bits_pair.as_mut_ptr(), self.buckets.as_mut_ptr());
         let mut k = 0;
         for &(first, count) in chunks {
-            for at in first..first + count {
-                let b = mix(event_canon_key((*base.add(at as usize)).event)) as usize & mask;
-                *buckets.add(k) = b as u32;
-                k += 1;
-                let (w, bit) = (b / 64, 1u64 << (b % 64));
-                *twice.add(w) |= *once.add(w) & bit;
-                *once.add(w) |= bit;
+            let count = count as usize;
+            let chunk = base.add(first as usize);
+            if count > PF_AHEAD {
+                let mut ring = [0usize; PF_AHEAD];
+                for j in 0..PF_AHEAD {
+                    let b = dedup_bucket((*chunk.add(j)).event, mask);
+                    ring[j] = b;
+                    _mm_prefetch(bits_pair.add(b / 64) as *const i8, _MM_HINT_T0);
+                }
+                for j in 0..count - PF_AHEAD {
+                    let b = ring[j & (PF_AHEAD - 1)];
+                    let nb = dedup_bucket((*chunk.add(j + PF_AHEAD)).event, mask);
+                    ring[j & (PF_AHEAD - 1)] = nb;
+                    _mm_prefetch(bits_pair.add(nb / 64) as *const i8, _MM_HINT_T0);
+                    *buckets.add(k) = b as u32;
+                    k += 1;
+                    let (w, bit) = (b / 64, 1u64 << (b % 64));
+                    let pair = &mut *bits_pair.add(w);
+                    pair[1] |= pair[0] & bit;
+                    pair[0] |= bit;
+                }
+                for j in (count - PF_AHEAD)..count {
+                    let b = ring[j & (PF_AHEAD - 1)];
+                    *buckets.add(k) = b as u32;
+                    k += 1;
+                    let (w, bit) = (b / 64, 1u64 << (b % 64));
+                    let pair = &mut *bits_pair.add(w);
+                    pair[1] |= pair[0] & bit;
+                    pair[0] |= bit;
+                }
+            } else {
+                for j in 0..count {
+                    let b = dedup_bucket((*chunk.add(j)).event, mask);
+                    *buckets.add(k) = b as u32;
+                    k += 1;
+                    let (w, bit) = (b / 64, 1u64 << (b % 64));
+                    let pair = &mut *bits_pair.add(w);
+                    pair[1] |= pair[0] & bit;
+                    pair[0] |= bit;
+                }
             }
         }
         self.candidates.clear();
@@ -794,11 +841,15 @@ impl Dedup {
         let (mut k, mut nc) = (0usize, 0usize);
         for &(first, count) in chunks {
             for at in first..first + count {
+                if k + PF_AHEAD < total {
+                    let nb = *buckets.add(k + PF_AHEAD) as usize;
+                    _mm_prefetch(bits_pair.add(nb / 64) as *const i8, _MM_HINT_T0);
+                }
                 let b = *buckets.add(k) as usize;
                 k += 1;
                 // ~14% of records are candidates at random: a branch here mispredicts.
                 *cands.add(nc) = at;
-                nc += (*twice.add(b / 64) >> (b % 64)) as usize & 1;
+                nc += ((*bits_pair.add(b / 64))[1] >> (b % 64)) as usize & 1;
             }
         }
         self.candidates.set_len(nc);
