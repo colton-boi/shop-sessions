@@ -362,7 +362,7 @@ unsafe fn parse_events_impl<const REL: bool>(
             match len(4) {
                 4 => {
                     let ty = (at(4) as *const u32).read_unaligned();
-                    if (ty != VIEW) & (ty != CART) {
+                    if ty != VIEW && ty != CART {
                         break 'valid;
                     }
                 }

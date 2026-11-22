@@ -24,21 +24,21 @@ struct Bucket {
 /// larger-named root at the smaller-named one.
 pub struct LinkTable {
     buckets: *const Bucket,
-    num_buckets: usize,
+    bucket_mask: usize,
 }
 unsafe impl Sync for LinkTable {}
 
 impl LinkTable {
     pub fn new(pairs: usize) -> Self {
-        let slots = (pairs.saturating_mul(23) / 10).max(32);
-        Self::with_buckets(slots.div_ceil(4).max(8))
+        let cap = (pairs.saturating_mul(5) / 2).next_power_of_two().max(4);
+        Self::with_buckets(cap >> 2)
     }
 
     fn with_buckets(num_buckets: usize) -> Self {
-        assert!(num_buckets >= 1);
+        debug_assert!(num_buckets.is_power_of_two() && num_buckets >= 1);
         let buckets = map_zeroed_huge(num_buckets * std::mem::size_of::<Bucket>()) as *const Bucket;
         debug_assert_eq!(buckets as usize & 63, 0);
-        LinkTable { buckets, num_buckets }
+        LinkTable { buckets, bucket_mask: num_buckets - 1 }
     }
 
     /// Frees the table's pages in `[from, to)` slot ranges once no lookup can happen.
@@ -47,18 +47,7 @@ impl LinkTable {
     }
 
     pub fn slots(&self) -> usize {
-        self.num_buckets << 2
-    }
-
-    #[inline(always)]
-    fn bucket_of(&self, h: u64) -> usize {
-        (((h >> 32).wrapping_mul(self.num_buckets as u64)) >> 32) as usize
-    }
-
-    #[inline(always)]
-    fn next_bucket(&self, b: usize) -> usize {
-        let n = b + 1;
-        if n == self.num_buckets { 0 } else { n }
+        (self.bucket_mask + 1) << 2
     }
 
     #[inline(always)]
@@ -74,7 +63,7 @@ impl LinkTable {
     /// Prefetches the 64 B bucket of a token whose `mix` is `h`.
     #[inline(always)]
     pub fn prefetch_hashed(&self, h: u64) {
-        unsafe { _mm_prefetch(self.buckets.add(self.bucket_of(h)) as *const i8, _MM_HINT_T0) }
+        unsafe { _mm_prefetch(self.buckets.add(h as usize & self.bucket_mask) as *const i8, _MM_HINT_T0) }
     }
 
     /// Inserts `token` with precomputed `h = mix(token)`.
@@ -83,7 +72,7 @@ impl LinkTable {
     #[inline(always)]
     unsafe fn insert_hashed(&self, token: u64, h: u64) -> usize {
         debug_assert!(token >> 56 != 0);
-        let mut b_idx = self.bucket_of(h);
+        let mut b_idx = h as usize & self.bucket_mask;
         loop {
             let b = &*self.buckets.add(b_idx);
             for lane in 0..4 {
@@ -99,7 +88,7 @@ impl LinkTable {
                     }
                 }
             }
-            b_idx = self.next_bucket(b_idx);
+            b_idx = (b_idx + 1) & self.bucket_mask;
         }
     }
 
@@ -237,7 +226,7 @@ impl LinkTable {
         debug_assert!(token >> 56 != 0);
         let target = _mm256_set1_epi64x(token as i64);
         let zero = _mm256_setzero_si256();
-        let mut b_idx = self.bucket_of(h);
+        let mut b_idx = h as usize & self.bucket_mask;
         loop {
             let b = self.buckets.add(b_idx);
             let keys = _mm256_load_si256(b as *const __m256i);
@@ -249,7 +238,7 @@ impl LinkTable {
                 let v = (*b).vals.get_unchecked(lane).load(Relaxed);
                 return if m != 0 { v } else { token };
             }
-            b_idx = self.next_bucket(b_idx);
+            b_idx = (b_idx + 1) & self.bucket_mask;
         }
     }
 }
@@ -294,35 +283,6 @@ mod tests {
             t.compress_and_resolve(4, 8);
             for &id in &ids {
                 assert_eq!(t.person_hashed(id, mix(id)), ids[6]);
-            }
-            let absent = make_tok(b"u9999");
-            assert_eq!(t.person_hashed(absent, mix(absent)), absent);
-        }
-    }
-
-    #[test]
-    fn overflow_heavy_non_pow2_buckets_multithreaded() {
-        // 3 buckets = 12 slots, 10 distinct IDs (83.3% load factor), exercises Lemire fast-range & wraparound.
-        let t = LinkTable::with_buckets(3);
-        let ids: Vec<u64> = unsafe {
-            (0..10)
-                .map(|i| make_tok(format!("u{i:04}").as_bytes()))
-                .collect()
-        };
-        let mut pairs = Vec::new();
-        for w in ids.windows(2) {
-            pairs.push((w[0], w[1]));
-            pairs.push((w[1], w[0]));
-        }
-        std::thread::scope(|sc| {
-            for _ in 0..4 {
-                sc.spawn(|| unsafe { t.link_all(&pairs) });
-            }
-        });
-        unsafe {
-            t.compress_and_resolve(0, t.slots());
-            for &id in &ids {
-                assert_eq!(t.person_hashed(id, mix(id)), ids[0]);
             }
             let absent = make_tok(b"u9999");
             assert_eq!(t.person_hashed(absent, mix(absent)), absent);
