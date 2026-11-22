@@ -33,6 +33,15 @@ pub struct LinkTable {
 unsafe impl Sync for LinkTable {}
 
 impl LinkTable {
+    pub fn empty() -> Self {
+        LinkTable {
+            buckets: std::ptr::null(),
+            bucket_mask: 0,
+            #[cfg(debug_assertions)]
+            dead: AtomicBool::new(false),
+        }
+    }
+
     pub fn new(pairs: usize) -> Self {
         let cap = (pairs.saturating_mul(5) / 2).next_power_of_two().max(4);
         Self::with_buckets(cap >> 2)
@@ -283,6 +292,7 @@ impl LinkTable {
     }
 
     /// Restores root `vals` back to their root tokens if V6 falls back to V5 after seeding.
+    #[allow(dead_code)]
     pub unsafe fn restore_roots(&self, from: usize, to: usize) {
         for s in from..to {
             let b = &*self.buckets.add(s >> 2);

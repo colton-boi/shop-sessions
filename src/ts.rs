@@ -292,6 +292,61 @@ pub unsafe fn parse_f1_rel(p: *const u8, len: usize, lut: &DateLut, dc: &mut Dat
     }
 }
 
+/// Dual 256-bit AVX2 F1+F1 timestamp parse (`YYYY-MM-DDTHH:MM:SSZ` for both `p_ts` and `p_ing`).
+/// Returns `Some((ts_s_rel, ingest_s_rel))` when both are valid 20-byte F1 timestamps in `lut`,
+/// otherwise `None` (caller falls back to `parse_f1_rel` + `parse_ts_rel`).
+/// Both `p_ts` and `p_ing` must be readable for at least 27 bytes.
+#[inline(always)]
+pub unsafe fn parse_dual_f1_rel(p_ts: *const u8, p_ing: *const u8, lut: &DateLut) -> Option<(i32, i32)> {
+    let s0 = _pext_u32((p_ts.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
+    let s1 = _pext_u32((p_ing.add(6) as *const u32).read_unaligned(), 0x0F03_0001) as usize;
+    let e0 = lut.0.get_unchecked(s0);
+    let e1 = lut.0.get_unchecked(s1);
+    let lut_vec = _mm256_set_m128i(
+        _mm_load_si128(e1 as *const DateSlot as *const __m128i),
+        _mm_load_si128(e0 as *const DateSlot as *const __m128i),
+    );
+    let d_in = _mm256_loadu2_m128i(p_ing as *const __m128i, p_ts as *const __m128i);
+    let d_mask = _mm256_setr_epi8(
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0,
+    );
+    let d_bad = _mm256_and_si256(_mm256_xor_si256(d_in, lut_vec), d_mask);
+
+    let c_in = _mm256_loadu2_m128i(p_ing.add(11) as *const __m128i, p_ts.add(11) as *const __m128i);
+    let c_sub = _mm256_setr_epi8(
+        48, 48, 58, 48, 48, 58, 48, 48, 90, 0, 0, 0, 0, 0, 0, 0,
+        48, 48, 58, 48, 48, 58, 48, 48, 90, 0, 0, 0, 0, 0, 0, 0,
+    );
+    let c_lim = _mm256_setr_epi8(
+        2, 9, 0, 5, 9, 0, 5, 9, 0, -1, -1, -1, -1, -1, -1, -1,
+        2, 9, 0, 5, 9, 0, 5, 9, 0, -1, -1, -1, -1, -1, -1, -1,
+    );
+    let c_dig = _mm256_sub_epi8(c_in, c_sub);
+    let c_bad = _mm256_subs_epu8(c_dig, c_lim);
+    let bad = _mm256_or_si256(d_bad, c_bad);
+    if _mm256_testz_si256(bad, bad) == 0 {
+        return None;
+    }
+
+    let mul_ub = _mm256_setr_epi8(
+        10, 1, 0, 10, 1, 0, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        10, 1, 0, 10, 1, 0, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    let mul_16 = _mm256_setr_epi16(
+        3600, 60, 60, 1, 0, 0, 0, 0,
+        3600, 60, 60, 1, 0, 0, 0, 0,
+    );
+    let t = _mm256_madd_epi16(_mm256_maddubs_epi16(c_dig, mul_ub), mul_16);
+    let sum = _mm256_add_epi32(t, _mm256_shuffle_epi32(t, 1));
+    let sec_ts = _mm256_cvtsi256_si32(sum) as u32;
+    let sec_ing = _mm256_extract_epi32(sum, 4) as u32;
+    if (sec_ts >= 86_400) | (sec_ing >= 86_400) {
+        return None;
+    }
+    Some((e0.sec_rel + sec_ts as i32, e1.sec_rel + sec_ing as i32))
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn parse_ts_slow_rel(p: *const u8, len: usize, dc: &mut DateCache, base_ms: i64) -> i64 {
@@ -549,6 +604,90 @@ mod tests {
             let ts_exp = if ts_old == BAD { BAD } else { ts_old - base_ms };
             let ts_new = unsafe { parse_ts_rel(p, s.len(), &lut, &mut dc2, base_ms) };
             assert_eq!(ts_new, ts_exp, "parse_ts_rel mismatch on {:?}", String::from_utf8_lossy(s));
+        }
+    }
+
+    #[test]
+    fn test_parse_dual_f1_rel_exhaustive() {
+        let ws = days_from_civil(2028, 2, 20) * DAY_MS; // crosses 2028-02-29
+        let we = days_from_civil(2028, 3, 5) * DAY_MS;
+        let base_ms = ws - 7 * DAY_MS;
+        let base_s = base_ms / 1000;
+        let lut = DateLut::new(ws, we, base_s);
+        let mut dc = DateCache::new();
+
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        // Valid LUT dates at midnight boundaries and random times
+        for day_off in -9..=23i64 {
+            let day = ws.div_euclid(DAY_MS) + day_off;
+            let (y, m, d) = civil_from_days(day);
+            for (hh, mm, ss) in [(0, 0, 0), (0, 0, 1), (12, 34, 56), (23, 59, 58), (23, 59, 59)] {
+                samples.push(format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z").into_bytes());
+            }
+        }
+        // Invalid hours, mins, secs, delimiters, non-LUT dates, control chars
+        let bad_cases: &[&[u8]] = &[
+            b"2028-02-29T24:00:00Z",
+            b"2028-02-29T25:00:00Z",
+            b"2028-02-29T29:59:59Z",
+            b"2028-02-29T30:00:00Z",
+            b"2028-02-29T23:60:00Z",
+            b"2028-02-29T23:99:00Z",
+            b"2028-02-29T23:59:60Z",
+            b"2028-02-29T23:59:99Z",
+            b"2028-02-29T00:00:00z",
+            b"2028-02-29 00:00:00Z",
+            b"2028-02-29T00;00:00Z",
+            b"2028-02-29T00:00;00Z",
+            b"2028/02/29T00:00:00Z",
+            b"2028-02-29T0a:00:00Z",
+            b"2028-02-29T/0:00:00Z",
+            b"2027-02-29T00:00:00Z",
+            b"2028-02-10T00:00:00Z", // before LUT
+            b"2028-03-15T00:00:00Z", // after LUT
+            b"1970-01-01T00:00:00Z",
+            b"\n\n\n\n\n\n\n\n\n\n\n00:00:00Z",
+            b"\n\n\n\n\n\n\x0b\n\n\n\n00:00:00Z",
+        ];
+        for &c in bad_cases {
+            samples.push(c.to_vec());
+        }
+
+        // Compute expected parse_f1_lut for each sample
+        let mut expected: Vec<Option<i32>> = Vec::with_capacity(samples.len());
+        for s in &samples {
+            assert_eq!(s.len(), 20);
+            let mut buf = [0u8; 64];
+            buf[..20].copy_from_slice(s);
+            let exp_lut = unsafe { parse_f1_lut(buf.as_ptr(), &lut) };
+            // Also verify against scalar parse_f1_rel whenever LUT matches
+            let exp_scalar = unsafe { parse_f1_rel(buf.as_ptr(), 20, &lut, &mut dc, base_s) };
+            if let Some(v) = exp_lut {
+                assert_eq!(v, exp_scalar, "LUT vs scalar mismatch on {:?}", String::from_utf8_lossy(s));
+            }
+            expected.push(exp_lut);
+        }
+
+        // Test every pair (i, j)
+        for i in 0..samples.len() {
+            let mut b0 = [0u8; 64];
+            b0[..20].copy_from_slice(&samples[i]);
+            for j in 0..samples.len() {
+                let mut b1 = [0u8; 64];
+                b1[..20].copy_from_slice(&samples[j]);
+                let got = unsafe { parse_dual_f1_rel(b0.as_ptr(), b1.as_ptr(), &lut) };
+                let exp = match (expected[i], expected[j]) {
+                    (Some(a), Some(b)) => Some((a, b)),
+                    _ => None,
+                };
+                assert_eq!(
+                    got,
+                    exp,
+                    "dual mismatch on {:?} + {:?}",
+                    String::from_utf8_lossy(&samples[i]),
+                    String::from_utf8_lossy(&samples[j])
+                );
+            }
         }
     }
 }

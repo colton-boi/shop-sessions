@@ -1,19 +1,25 @@
 use crate::csv::Reader;
-use crate::dict::{pack_prefix_base37, pack_u_base37, PidLease, UserDict};
+use crate::dict::{
+    pack_eu_base37_pair, pack_pair_base37, pack_prefix_base37, pack_u_base37, PidLease, UserDict,
+};
 use crate::group::{sort_u64_clicks, Cell, Grouper, V6ClickFb, V6ClickU64};
 use crate::ids::{self, event_canon_key, event_eq, hash_hex, parse_hex33, tok_click, tok_event, SideWriter};
-use crate::scan4k;
+use crate::scan4k::{self, CsvRow, PreadBuf, RowHandler};
 use crate::sys::{self, map_zeroed_huge, mix, par, release, PerThread};
 use crate::ts::{self, DateCache, BAD, DAY_MS};
 use crate::{Extent, Input, Mapped, Shared, WEEK_MS};
 use std::arch::x86_64::*;
+use std::os::unix::io::RawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicUsize,
+    Ordering::{AcqRel, Acquire, Relaxed},
+};
 use std::sync::Mutex;
 
 const SLAB_BYTES: usize = 16 << 20;
 const BLOCK_BYTES: usize = 4160;
-const BATCH: usize = 16;
+const BATCH: usize = 32;
 
 const RAW_B: usize = 256;
 const RAW_SIDE_BIT: u64 = 1 << 63;
@@ -37,14 +43,10 @@ pub fn applicable(sh: &Shared, event_bytes: u64) -> bool {
 }
 
 #[inline(always)]
-const fn mix42(mut x: u64) -> u64 {
+const fn mix42(x: u64) -> u64 {
     const MASK42: u64 = (1u64 << 42) - 1;
-    x ^= x >> 21;
-    x = x.wrapping_mul(0x224B_A937_15B7) & MASK42;
-    x ^= x >> 17;
-    x = x.wrapping_mul(0x3B9A_CA00_7D59) & MASK42;
-    x ^= x >> 23;
-    x
+    let x = (x ^ (x >> 21)).wrapping_mul(0x224B_A937_15B7) & MASK42;
+    x ^ (x >> 21)
 }
 
 #[repr(C, align(64))]
@@ -464,7 +466,7 @@ struct RawUPre {
     u_ptr: *const u8,
     key42: u64,
     w0: u64,
-    val32: u32,
+    ts_rel_ms: u32,
     u_slot: u32,
     eb: u16,
     u_len: u16,
@@ -482,13 +484,33 @@ struct RawHPre {
     hi: u64,
     lo: u64,
     w0: u64,
-    val32: u32,
+    ts_rel_ms: u32,
     u_slot: u32,
     eb: u16,
     _pad: u16,
 }
 
 impl Default for RawHPre {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SidePre {
+    u_ptr: *const u8,
+    u_k1: u64,
+    u_k2: u64,
+    w0: u64,
+    side_idx: u32,
+    u_slot: u32,
+    eb: u16,
+    u_len: u16,
+    u_kind: u8,
+}
+
+impl Default for SidePre {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }
@@ -517,19 +539,33 @@ impl Default for LongPre {
 }
 
 #[derive(Clone, Copy)]
-struct CkPre {
+struct CkUPre {
     u_ptr: *const u8,
     u_len: u16,
-    u_kind: u8, // 1: u_base37, 2: hex33, 3: gen
-    u_slot: usize,
-    u_k1: u64,
-    u_k2: u64,
+    u_slot: u32,
+    key42: u64,
     click_id: u64,
     ts_rel_ms: u32,
     camp: u32,
 }
 
-impl Default for CkPre {
+impl Default for CkUPre {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CkHPre {
+    hi: u64,
+    lo: u64,
+    u_slot: u32,
+    click_id: u64,
+    ts_rel_ms: u32,
+    camp: u32,
+}
+
+impl Default for CkHPre {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }
@@ -537,6 +573,7 @@ impl Default for CkPre {
 
 struct ParseWorker {
     reader: Reader,
+    pbuf: Option<PreadBuf>,
     dates: DateCache,
     lease: PidLease,
     alloc: LocalBlockAlloc,
@@ -550,9 +587,10 @@ struct ParseWorker {
 }
 
 impl ParseWorker {
-    fn new(read_buf: usize) -> Self {
+    fn new(read_buf: usize, pread: bool) -> Self {
         Self {
             reader: Reader::lazy(read_buf),
+            pbuf: pread.then(PreadBuf::new),
             dates: DateCache::new(),
             lease: PidLease::default(),
             alloc: LocalBlockAlloc::new(),
@@ -663,31 +701,12 @@ unsafe fn resolve_user_parts(
     }
 }
 
-#[inline(always)]
-unsafe fn emit_raw_with_pid(
-    w: &mut ParseWorker,
-    pool: &BlockSlabPool,
-    tid: usize,
-    eb: usize,
-    w0: u64,
-    val32: u32,
-    pid: u32,
-) {
-    let w1 = if (w0 & RAW_SIDE_BIT) == 0 {
-        ((val32 as u64) << 32) | ((pid as u64) << 8)
-    } else {
-        w.side_events.get_unchecked_mut(val32 as usize).pid = pid;
-        ((tid as u64) << 26) | (val32 as u64)
-    };
-    w.raw_writer.push(eb, RawEvent16 { w0, w1 }, &mut w.alloc, pool);
-}
-
+/// Flushes strictly valid short non-side events (zero `RAW_SIDE_BIT` check).
 #[inline(never)]
 unsafe fn flush_raw_u_batch(
     dict: &UserDict,
     w: &mut ParseWorker,
     pool: &BlockSlabPool,
-    tid: usize,
     batch: &[RawUPre],
 ) {
     for pre in batch {
@@ -698,10 +717,13 @@ unsafe fn flush_raw_u_batch(
             pre.u_len as usize,
             &mut w.lease,
         );
-        emit_raw_with_pid(w, pool, tid, pre.eb as usize, pre.w0, pre.val32, pid);
+        let w1 = ((pre.ts_rel_ms as u64) << 32) | ((pid as u64) << 8);
+        w.raw_writer
+            .push(pre.eb as usize, RawEvent16 { w0: pre.w0, w1 }, &mut w.alloc, pool);
     }
 }
 
+/// Flushes strictly valid hex non-side events (zero `RAW_SIDE_BIT` check).
 #[inline(never)]
 unsafe fn flush_raw_h_batch(
     dict: &UserDict,
@@ -718,7 +740,37 @@ unsafe fn flush_raw_h_batch(
             &mut w.lease,
             tid,
         );
-        emit_raw_with_pid(w, pool, tid, pre.eb as usize, pre.w0, pre.val32, pid);
+        let w1 = ((pre.ts_rel_ms as u64) << 32) | ((pid as u64) << 8);
+        w.raw_writer
+            .push(pre.eb as usize, RawEvent16 { w0: pre.w0, w1 }, &mut w.alloc, pool);
+    }
+}
+
+/// Flushes valid side/purchase raw events.
+#[inline(never)]
+unsafe fn flush_side_batch(
+    dict: &UserDict,
+    w: &mut ParseWorker,
+    pool: &BlockSlabPool,
+    tid: usize,
+    batch: &[SidePre],
+) {
+    for pre in batch {
+        let pid = resolve_user_parts(
+            dict,
+            pre.u_kind,
+            pre.u_slot as usize,
+            pre.u_k1,
+            pre.u_k2,
+            pre.u_ptr,
+            pre.u_len as usize,
+            &mut w.lease,
+            tid,
+        );
+        w.side_events.get_unchecked_mut(pre.side_idx as usize).pid = pid;
+        let w1 = ((tid as u64) << 26) | (pre.side_idx as u64);
+        w.raw_writer
+            .push(pre.eb as usize, RawEvent16 { w0: pre.w0, w1 }, &mut w.alloc, pool);
     }
 }
 
@@ -756,80 +808,49 @@ unsafe fn flush_long_batch(
     }
 }
 
-#[inline(always)]
-unsafe fn queue_raw_valid(
-    dict: &UserDict,
-    w: &mut ParseWorker,
-    pool: &BlockSlabPool,
-    tid: usize,
-    u_batch: &mut [RawUPre; BATCH],
-    u_nb: &mut usize,
-    h_batch: &mut [RawHPre; BATCH],
-    h_nb: &mut usize,
-    p1: *const u8,
-    l1: usize,
-    eb: usize,
-    w0: u64,
-    val32: u32,
-) {
-    if let Some(key42) = pack_u_base37(p1, l1) {
-        let u_slot = dict.prefetch_u(key42);
-        let pre = u_batch.get_unchecked_mut(*u_nb);
-        pre.u_ptr = p1;
-        pre.u_len = l1 as u16;
-        pre.key42 = key42;
-        pre.u_slot = u_slot as u32;
-        pre.w0 = w0;
-        pre.val32 = val32;
-        pre.eb = eb as u16;
-        *u_nb += 1;
-        if *u_nb == BATCH {
-            flush_raw_u_batch(dict, w, pool, tid, u_batch);
-            *u_nb = 0;
-        }
-    } else if l1 == 33 && *p1 == b'u' {
-        if let Some((_, hi, lo)) = parse_hex33(p1, l1) {
-            let u_slot = dict.prefetch_hex(hi, lo);
-            let pre = h_batch.get_unchecked_mut(*h_nb);
-            pre.hi = hi;
-            pre.lo = lo;
-            pre.u_slot = u_slot as u32;
-            pre.w0 = w0;
-            pre.val32 = val32;
-            pre.eb = eb as u16;
-            *h_nb += 1;
-            if *h_nb == BATCH {
-                flush_raw_h_batch(dict, w, pool, tid, h_batch);
-                *h_nb = 0;
-            }
-            return;
-        }
-        let pid = dict.get_or_insert_gen(p1, l1, &mut w.lease, tid);
-        emit_raw_with_pid(w, pool, tid, eb, w0, val32, pid);
+#[cold]
+#[inline(never)]
+unsafe fn parse_ts_pair_slow(
+    sh: &Shared,
+    dates: &mut DateCache,
+    base_s: i64,
+    event_win_ms: u64,
+    p2: *const u8,
+    l2: usize,
+    p3: *const u8,
+    l3: usize,
+    fields_ok: bool,
+) -> (i32, u32, bool) {
+    let ingest_s_rel = ts::parse_f1_rel(p3, l3, &sh.date_lut, dates, base_s);
+    if !fields_ok || ingest_s_rel == i32::MAX {
+        return (ingest_s_rel, 0, false);
+    }
+    let ts_rel = ts::parse_ts_rel(p2, l2, &sh.date_lut, dates, sh.base_ms);
+    let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
+    let late_bad = (ingest_s_rel as i64).wrapping_mul(1000).wrapping_sub(ts_rel) > DAY_MS;
+    if win_bad | late_bad {
+        (ingest_s_rel, 0, false)
     } else {
-        let pid = dict.get_or_insert_gen(p1, l1, &mut w.lease, tid);
-        emit_raw_with_pid(w, pool, tid, eb, w0, val32, pid);
+        (ingest_s_rel, ts_rel as u32, true)
     }
 }
 
 #[cold]
 #[inline(never)]
 unsafe fn push_side_raw_ev(
-    sh: &Shared,
     dict: &UserDict,
     w: &mut ParseWorker,
     pool: &BlockSlabPool,
     tid: usize,
     side_overflow: &AtomicBool,
-    u_batch: &mut [RawUPre; BATCH],
-    u_nb: &mut usize,
-    h_batch: &mut [RawHPre; BATCH],
-    h_nb: &mut usize,
+    side_batch: &mut [SidePre; BATCH],
+    side_nb: &mut usize,
     eb: usize,
     rem_w0_bits: u64,
     eid_tok: u64,
     p1: *const u8,
     l1: usize,
+    known_u_key42: Option<u64>,
     p3: *const u8,
     l3: usize,
     ingest_s_rel: i32,
@@ -873,99 +894,218 @@ unsafe fn push_side_raw_ev(
             .push(eb, RawEvent16 { w0, w1 }, &mut w.alloc, pool);
         return;
     }
-    let _ = sh;
-    queue_raw_valid(
-        dict,
-        w,
-        pool,
-        tid,
-        u_batch,
-        u_nb,
-        h_batch,
-        h_nb,
-        p1,
-        l1,
-        eb,
-        w0,
-        side_idx as u32,
-    );
+    let (u_kind, u_slot, u_k1, u_k2) = match known_u_key42 {
+        Some(key42) => (1u8, dict.prefetch_u(key42), key42, 0u64),
+        None => prep_user_prefetch(dict, p1, l1),
+    };
+    let pre = side_batch.get_unchecked_mut(*side_nb);
+    pre.u_ptr = p1;
+    pre.u_len = l1 as u16;
+    pre.u_kind = u_kind;
+    pre.u_slot = u_slot as u32;
+    pre.u_k1 = u_k1;
+    pre.u_k2 = u_k2;
+    pre.w0 = w0;
+    pre.side_idx = side_idx as u32;
+    pre.eb = eb as u16;
+    *side_nb += 1;
+    if *side_nb == BATCH {
+        flush_side_batch(dict, w, pool, tid, side_batch);
+        *side_nb = 0;
+    }
 }
 
-#[inline(never)]
-unsafe fn parse_events_v6(
-    sh: &Shared,
-    dict: &UserDict,
-    Mapped(data, size): Mapped,
-    x: &Extent,
-    w: &mut ParseWorker,
-    pool: &BlockSlabPool,
+struct EventRowParser<'a> {
+    sh: &'a Shared,
+    dict: &'a UserDict,
+    w: &'a mut ParseWorker,
+    pool: &'a BlockSlabPool,
     tid: usize,
-    side_overflow: &AtomicBool,
-) {
-    const VIEW: u32 = u32::from_le_bytes(*b"view");
-    const CART: u32 = u32::from_le_bytes(*b"cart");
-    let base_s = sh.base_ms.div_euclid(1000);
-    let event_win_ms = (sh.window_end - sh.window_start) as u64;
+    side_overflow: &'a AtomicBool,
+    base_s: i64,
+    event_win_ms: u64,
+    u_batch: [RawUPre; BATCH],
+    u_nb: usize,
+    h_batch: [RawHPre; BATCH],
+    h_nb: usize,
+    side_batch: [SidePre; BATCH],
+    side_nb: usize,
+    long_batch: [LongPre; BATCH],
+    long_nb: usize,
+}
 
-    let mut u_batch: [RawUPre; BATCH] = [RawUPre::default(); BATCH];
-    let mut u_nb = 0usize;
-    let mut h_batch: [RawHPre; BATCH] = [RawHPre::default(); BATCH];
-    let mut h_nb = 0usize;
-    let mut long_batch: [LongPre; BATCH] = [LongPre::default(); BATCH];
-    let mut long_nb = 0usize;
+impl<'a> EventRowParser<'a> {
+    #[inline(always)]
+    unsafe fn flush_all(&mut self) {
+        if self.u_nb > 0 {
+            flush_raw_u_batch(self.dict, self.w, self.pool, &self.u_batch[..self.u_nb]);
+            self.u_nb = 0;
+        }
+        if self.h_nb > 0 {
+            flush_raw_h_batch(
+                self.dict,
+                self.w,
+                self.pool,
+                self.tid,
+                &self.h_batch[..self.h_nb],
+            );
+            self.h_nb = 0;
+        }
+        if self.side_nb > 0 {
+            flush_side_batch(
+                self.dict,
+                self.w,
+                self.pool,
+                self.tid,
+                &self.side_batch[..self.side_nb],
+            );
+            self.side_nb = 0;
+        }
+        if self.long_nb > 0 {
+            flush_long_batch(
+                self.dict,
+                self.w,
+                self.pool,
+                self.tid,
+                &self.long_batch[..self.long_nb],
+            );
+            self.long_nb = 0;
+        }
+    }
+}
 
-    let mut reader = std::mem::replace(&mut w.reader, Reader::lazy(0));
-    scan4k::scan::<7>(data, size, x.from as usize, x.to as usize, &mut reader, |bptr, s, e| {
-        let l0 = (e[0] - s[0]) as usize;
+impl<'a> RowHandler for EventRowParser<'a> {
+    #[inline(always)]
+    unsafe fn before_refill(&mut self) {
+        self.flush_all();
+    }
+
+    #[inline(always)]
+    unsafe fn on_row<R: CsvRow>(&mut self, row: R) {
+        const VIEW: u32 = u32::from_le_bytes(*b"view");
+        const CART: u32 = u32::from_le_bytes(*b"cart");
+        let (p0, l0) = row.field(0);
         if l0 == 0 {
             return;
         }
-        w.total_event_lines += 1;
-        let p0 = bptr.add(s[0] as usize);
-        let p1 = bptr.add(s[1] as usize);
-        let l1 = (e[1] - s[1]) as usize;
-        let p2 = bptr.add(s[2] as usize);
-        let l2 = (e[2] - s[2]) as usize;
-        let p3 = bptr.add(s[3] as usize);
-        let l3 = (e[3] - s[3]) as usize;
-        let p4 = bptr.add(s[4] as usize);
-        let l4 = (e[4] - s[4]) as usize;
-        let p5 = bptr.add(s[5] as usize);
-        let l5 = (e[5] - s[5]) as usize;
-        let p6 = bptr.add(s[6] as usize);
-        let l6 = (e[6] - s[6]) as usize;
+        self.w.total_event_lines += 1;
+        let (p1, l1) = row.field(1);
+        let (p2, l2) = row.field(2);
+        let (p3, l3) = row.field(3);
+        let (p4, l4) = row.field(4);
+        let (p5, l5) = row.field(5);
 
-        let ingest_s_rel = ts::parse_f1_rel(p3, l3, &sh.date_lut, &mut w.dates, base_s);
-        let mut valid = l1 != 0 && l5 != 0 && ingest_s_rel != i32::MAX;
-        let mut ts_rel_ms = 0u32;
+        let fields_ok = (l1 != 0) & (l5 != 0);
+        let (ingest_s_rel, ts_rel_ms, mut valid) = if l2 == 20 && l3 == 20 {
+            if let Some((ts_s_rel, ing_s_rel)) = ts::parse_dual_f1_rel(p2, p3, &self.sh.date_lut)
+            {
+                let ts_rel = (ts_s_rel as i64) * 1000;
+                let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= self.event_win_ms;
+                let late_bad = (ing_s_rel as i64 - ts_s_rel as i64) > 86_400;
+                (ing_s_rel, ts_rel as u32, fields_ok & !win_bad & !late_bad)
+            } else {
+                parse_ts_pair_slow(
+                    self.sh,
+                    &mut self.w.dates,
+                    self.base_s,
+                    self.event_win_ms,
+                    p2,
+                    l2,
+                    p3,
+                    l3,
+                    fields_ok,
+                )
+            }
+        } else {
+            parse_ts_pair_slow(
+                self.sh,
+                &mut self.w.dates,
+                self.base_s,
+                self.event_win_ms,
+                p2,
+                l2,
+                p3,
+                l3,
+                fields_ok,
+            )
+        };
+
         let mut price = 0u32;
         let mut cat_id = 0u8;
-
         if valid {
-            let ts_rel = ts::parse_ts_rel(p2, l2, &sh.date_lut, &mut w.dates, sh.base_ms);
-            let win_bad = (ts_rel.wrapping_sub(WEEK_MS) as u64) >= event_win_ms;
-            let late_bad = (ingest_s_rel as i64).wrapping_mul(1000).wrapping_sub(ts_rel) > DAY_MS;
-            if win_bad | late_bad {
-                valid = false;
-            } else {
-                ts_rel_ms = ts_rel as u32;
-                match l4 {
-                    4 => {
-                        let ty = (p4 as *const u32).read_unaligned();
-                        if ty != VIEW && ty != CART {
-                            valid = false;
-                        }
+            if l4 == 4 {
+                let ty = (p4 as *const u32).read_unaligned();
+                valid &= !((ty != VIEW) & (ty != CART));
+            } else if l4 == 8 {
+                let (p6, l6) = row.field(6);
+                match parse_purchase_cold(self.sh, p4, p5, l5, p6, l6) {
+                    Some((c, pr)) => {
+                        cat_id = c;
+                        price = pr;
                     }
-                    8 => match parse_purchase_cold(sh, p4, p5, l5, p6, l6) {
-                        Some((c, pr)) => {
-                            cat_id = c;
-                            price = pr;
-                        }
-                        None => valid = false,
-                    },
-                    _ => valid = false,
+                    None => valid = false,
                 }
+            } else {
+                valid = false;
             }
+        }
+
+        if let Some((eid42, u_key42)) = pack_eu_base37_pair(p0, l0, p1, l1) {
+            let h42 = mix42(eid42);
+            let eb = (h42 >> 34) as usize;
+            let rem34 = h42 & RAW_REM_MASK;
+            let ing_off = ingest_s_rel - (604_800 - (1 << 19));
+            let in_range_ing =
+                ingest_s_rel != i32::MAX && ((ing_off - 1) as u32) < (RAW_ING_MAX as u32 - 1);
+            if in_range_ing && price == 0 {
+                if !valid {
+                    let w0 = ((ing_off as u64) << 41) | rem34;
+                    self.w
+                        .raw_writer
+                        .push(eb, RawEvent16 { w0, w1: 0 }, &mut self.w.alloc, self.pool);
+                    return;
+                }
+                let u_slot = self.dict.prefetch_u(u_key42);
+                let w0 = ((ing_off as u64) << 41) | rem34 | RAW_VALID_BIT;
+                let pre = self.u_batch.get_unchecked_mut(self.u_nb);
+                pre.u_ptr = p1;
+                pre.u_len = l1 as u16;
+                pre.key42 = u_key42;
+                pre.u_slot = u_slot as u32;
+                pre.w0 = w0;
+                pre.ts_rel_ms = ts_rel_ms;
+                pre.eb = eb as u16;
+                self.u_nb += 1;
+                if self.u_nb == BATCH {
+                    flush_raw_u_batch(self.dict, self.w, self.pool, &self.u_batch);
+                    self.u_nb = 0;
+                }
+            } else {
+                push_side_raw_ev(
+                    self.dict,
+                    self.w,
+                    self.pool,
+                    self.tid,
+                    self.side_overflow,
+                    &mut self.side_batch,
+                    &mut self.side_nb,
+                    eb,
+                    rem34,
+                    0,
+                    p1,
+                    l1,
+                    Some(u_key42),
+                    p3,
+                    l3,
+                    ingest_s_rel,
+                    self.base_s,
+                    ts_rel_ms,
+                    price,
+                    cat_id,
+                    valid,
+                );
+            }
+            return;
         }
 
         if let Some(eid42) = pack_prefix_base37(b'e', p0, l0) {
@@ -976,48 +1116,64 @@ unsafe fn parse_events_v6(
             let in_range_ing =
                 ingest_s_rel != i32::MAX && ((ing_off - 1) as u32) < (RAW_ING_MAX as u32 - 1);
             if in_range_ing && price == 0 {
-                let w0 = ((ing_off as u64) << 41) | rem34 | if valid { RAW_VALID_BIT } else { 0 };
                 if !valid {
-                    w.raw_writer
-                        .push(eb, RawEvent16 { w0, w1: 0 }, &mut w.alloc, pool);
+                    let w0 = ((ing_off as u64) << 41) | rem34;
+                    self.w
+                        .raw_writer
+                        .push(eb, RawEvent16 { w0, w1: 0 }, &mut self.w.alloc, self.pool);
                     return;
                 }
-                queue_raw_valid(
-                    dict,
-                    w,
-                    pool,
-                    tid,
-                    &mut u_batch,
-                    &mut u_nb,
-                    &mut h_batch,
-                    &mut h_nb,
-                    p1,
-                    l1,
-                    eb,
-                    w0,
-                    ts_rel_ms,
-                );
+                let w0 = ((ing_off as u64) << 41) | rem34 | RAW_VALID_BIT;
+                if l1 == 33 && *p1 == b'u' {
+                    if let Some((_, hi, lo)) = parse_hex33(p1, l1) {
+                        let u_slot = self.dict.prefetch_hex(hi, lo);
+                        let pre = self.h_batch.get_unchecked_mut(self.h_nb);
+                        pre.hi = hi;
+                        pre.lo = lo;
+                        pre.u_slot = u_slot as u32;
+                        pre.w0 = w0;
+                        pre.ts_rel_ms = ts_rel_ms;
+                        pre.eb = eb as u16;
+                        self.h_nb += 1;
+                        if self.h_nb == BATCH {
+                            flush_raw_h_batch(
+                                self.dict,
+                                self.w,
+                                self.pool,
+                                self.tid,
+                                &self.h_batch,
+                            );
+                            self.h_nb = 0;
+                        }
+                        return;
+                    }
+                }
+                let pid = self
+                    .dict
+                    .get_or_insert_gen(p1, l1, &mut self.w.lease, self.tid);
+                let w1 = ((ts_rel_ms as u64) << 32) | ((pid as u64) << 8);
+                self.w
+                    .raw_writer
+                    .push(eb, RawEvent16 { w0, w1 }, &mut self.w.alloc, self.pool);
             } else {
                 push_side_raw_ev(
-                    sh,
-                    dict,
-                    w,
-                    pool,
-                    tid,
-                    side_overflow,
-                    &mut u_batch,
-                    &mut u_nb,
-                    &mut h_batch,
-                    &mut h_nb,
+                    self.dict,
+                    self.w,
+                    self.pool,
+                    self.tid,
+                    self.side_overflow,
+                    &mut self.side_batch,
+                    &mut self.side_nb,
                     eb,
                     rem34,
                     0,
                     p1,
                     l1,
+                    None,
                     p3,
                     l3,
                     ingest_s_rel,
-                    base_s,
+                    self.base_s,
                     ts_rel_ms,
                     price,
                     cat_id,
@@ -1033,11 +1189,12 @@ unsafe fn parse_events_v6(
                 let ing40 = if ingest_s_rel != i32::MIN && ingest_s_rel < i32::MAX - 1 {
                     ((ingest_s_rel as i64) + (1i64 << 39)) as u64
                 } else {
-                    let exact_s = exact_ingest_s_cold(p3, l3, &mut w.dates);
+                    let exact_s = exact_ingest_s_cold(p3, l3, &mut self.w.dates);
                     if exact_s == i64::MAX {
                         LONG_ING_MAX
                     } else {
-                        (exact_s - base_s + (1i64 << 39)).clamp(0, (LONG_ING_MAX - 1) as i64) as u64
+                        (exact_s - self.base_s + (1i64 << 39))
+                            .clamp(0, (LONG_ING_MAX - 1) as i64) as u64
                     }
                 };
                 let payload = ((ts_rel_ms as u64) << 32)
@@ -1045,7 +1202,7 @@ unsafe fn parse_events_v6(
                     | ((cat_id as u64) << 1)
                     | (valid as u64);
                 if !valid {
-                    w.long_writer.push(
+                    self.w.long_writer.push(
                         lb,
                         LongEv32 {
                             k_lo: lo,
@@ -1053,13 +1210,13 @@ unsafe fn parse_events_v6(
                             ing_pid: ing40 << 24,
                             payload,
                         },
-                        &mut w.alloc,
-                        pool,
+                        &mut self.w.alloc,
+                        self.pool,
                     );
                     return;
                 }
-                let (u_kind, u_slot, u_k1, u_k2) = prep_user_prefetch(dict, p1, l1);
-                let pre = long_batch.get_unchecked_mut(long_nb);
+                let (u_kind, u_slot, u_k1, u_k2) = prep_user_prefetch(self.dict, p1, l1);
+                let pre = self.long_batch.get_unchecked_mut(self.long_nb);
                 pre.u_ptr = p1;
                 pre.u_len = l1 as u16;
                 pre.u_kind = u_kind;
@@ -1071,80 +1228,120 @@ unsafe fn parse_events_v6(
                 pre.ing40 = ing40;
                 pre.payload = payload;
                 pre.lb = lb as u8;
-                long_nb += 1;
-                if long_nb == BATCH {
-                    flush_long_batch(dict, w, pool, tid, &long_batch);
-                    long_nb = 0;
+                self.long_nb += 1;
+                if self.long_nb == BATCH {
+                    flush_long_batch(self.dict, self.w, self.pool, self.tid, &self.long_batch);
+                    self.long_nb = 0;
                 }
                 return;
             }
         }
 
-        let (eb, rem34, tok) = tok_event_cold(p0, l0, &mut w.e_side, sh);
+        let (eb, rem34, tok) = tok_event_cold(p0, l0, &mut self.w.e_side, self.sh);
         push_side_raw_ev(
+            self.dict,
+            self.w,
+            self.pool,
+            self.tid,
+            self.side_overflow,
+            &mut self.side_batch,
+            &mut self.side_nb,
+            eb,
+            rem34 | RAW_EID_SIDE_BIT,
+            tok,
+            p1,
+            l1,
+            None,
+            p3,
+            l3,
+            ingest_s_rel,
+            self.base_s,
+            ts_rel_ms,
+            price,
+            cat_id,
+            valid,
+        );
+    }
+}
+
+#[inline(never)]
+unsafe fn parse_events_v6(
+    sh: &Shared,
+    dict: &UserDict,
+    Mapped(data, size): Mapped,
+    fd: Option<RawFd>,
+    x: &Extent,
+    w: &mut ParseWorker,
+    pool: &BlockSlabPool,
+    tid: usize,
+    side_overflow: &AtomicBool,
+) {
+    let base_s = sh.base_ms.div_euclid(1000);
+    let event_win_ms = (sh.window_end - sh.window_start) as u64;
+    let mut reader = std::mem::replace(&mut w.reader, Reader::lazy(0));
+    let mut pbuf = w.pbuf.take();
+    {
+        let mut parser = EventRowParser {
             sh,
             dict,
             w,
             pool,
             tid,
             side_overflow,
-            &mut u_batch,
-            &mut u_nb,
-            &mut h_batch,
-            &mut h_nb,
-            eb,
-            rem34 | RAW_EID_SIDE_BIT,
-            tok,
-            p1,
-            l1,
-            p3,
-            l3,
-            ingest_s_rel,
             base_s,
-            ts_rel_ms,
-            price,
-            cat_id,
-            valid,
-        );
-    });
+            event_win_ms,
+            u_batch: [RawUPre::default(); BATCH],
+            u_nb: 0,
+            h_batch: [RawHPre::default(); BATCH],
+            h_nb: 0,
+            side_batch: [SidePre::default(); BATCH],
+            side_nb: 0,
+            long_batch: [LongPre::default(); BATCH],
+            long_nb: 0,
+        };
+        if let Some(fd) = fd {
+            let pb = pbuf.get_or_insert_with(PreadBuf::new);
+            scan4k::scan_rows_pread::<7, _>(
+                fd,
+                size,
+                x.from as usize,
+                x.to as usize,
+                &mut reader,
+                pb,
+                &mut parser,
+            );
+        } else {
+            scan4k::scan_rows::<7, _>(
+                data,
+                size,
+                x.from as usize,
+                x.to as usize,
+                &mut reader,
+                &mut parser,
+            );
+        }
+        parser.flush_all();
+    }
     w.reader = reader;
-    if u_nb > 0 {
-        flush_raw_u_batch(dict, w, pool, tid, &u_batch[..u_nb]);
-    }
-    if h_nb > 0 {
-        flush_raw_h_batch(dict, w, pool, tid, &h_batch[..h_nb]);
-    }
-    if long_nb > 0 {
-        flush_long_batch(dict, w, pool, tid, &long_batch[..long_nb]);
-    }
+    w.pbuf = pbuf;
 }
 
+/// Flushes short base37 click user batch (zero `u_kind` branch).
 #[inline(never)]
-unsafe fn flush_ck_batch(
+unsafe fn flush_ck_u_batch(
     dict: &UserDict,
     w: &mut ParseWorker,
     pool: &BlockSlabPool,
-    tid: usize,
-    batch: &[CkPre],
+    batch: &[CkUPre],
 ) {
     for pre in batch {
-        let pid = match pre.u_kind {
-            1 => dict.get_or_insert_u_prehashed(
-                pre.u_k1,
-                pre.u_slot,
-                pre.u_ptr,
-                pre.u_len as usize,
-                &mut w.lease,
-            ),
-            2 => dict.get_or_insert_hex_prehashed(
-                pre.u_k1,
-                pre.u_k2,
-                pre.u_slot,
-                &mut w.lease,
-                tid,
-            ),
-            _ => dict.get_or_insert_gen(pre.u_ptr, pre.u_len as usize, &mut w.lease, tid),
-        };
+        let pid = dict.get_or_insert_u_prehashed(
+            pre.key42,
+            pre.u_slot as usize,
+            pre.u_ptr,
+            pre.u_len as usize,
+            &mut w.lease,
+        );
         if pid == 0 {
             continue;
         }
@@ -1163,79 +1360,274 @@ unsafe fn flush_ck_batch(
     }
 }
 
+/// Flushes 33B hex click user batch (zero `u_kind` branch).
+#[inline(never)]
+unsafe fn flush_ck_h_batch(
+    dict: &UserDict,
+    w: &mut ParseWorker,
+    pool: &BlockSlabPool,
+    tid: usize,
+    batch: &[CkHPre],
+) {
+    for pre in batch {
+        let pid = dict.get_or_insert_hex_prehashed(
+            pre.hi,
+            pre.lo,
+            pre.u_slot as usize,
+            &mut w.lease,
+            tid,
+        );
+        if pid == 0 {
+            continue;
+        }
+        let meta = (((pid as u64) >> 8) << 44)
+            | ((pre.ts_rel_ms as u64) << 12)
+            | (pre.camp as u64 & 0xFFF);
+        w.c_writer.push(
+            (pid & 255) as usize,
+            CompactClick {
+                click_id: pre.click_id,
+                meta,
+            },
+            &mut w.alloc,
+            pool,
+        );
+    }
+}
+
+struct ClickRowParser<'a> {
+    sh: &'a Shared,
+    dict: &'a UserDict,
+    w: &'a mut ParseWorker,
+    pool: &'a BlockSlabPool,
+    tid: usize,
+    click_win_ms: u64,
+    u_batch: [CkUPre; BATCH],
+    u_nb: usize,
+    h_batch: [CkHPre; BATCH],
+    h_nb: usize,
+}
+
+impl<'a> ClickRowParser<'a> {
+    #[inline(always)]
+    unsafe fn flush_all(&mut self) {
+        if self.u_nb > 0 {
+            flush_ck_u_batch(self.dict, self.w, self.pool, &self.u_batch[..self.u_nb]);
+            self.u_nb = 0;
+        }
+        if self.h_nb > 0 {
+            flush_ck_h_batch(
+                self.dict,
+                self.w,
+                self.pool,
+                self.tid,
+                &self.h_batch[..self.h_nb],
+            );
+            self.h_nb = 0;
+        }
+    }
+}
+
+impl<'a> RowHandler for ClickRowParser<'a> {
+    #[inline(always)]
+    unsafe fn before_refill(&mut self) {
+        self.flush_all();
+    }
+
+    #[inline(always)]
+    unsafe fn on_row<R: CsvRow>(&mut self, row: R) {
+        let (p0, l0) = row.field(0);
+        let (p1, l1) = row.field(1);
+        if l0 == 0 || l1 == 0 {
+            return;
+        }
+        let (p3, l3) = row.field(3);
+        let ts_rel = ts::parse_ts_rel(p3, l3, &self.sh.date_lut, &mut self.w.dates, self.sh.base_ms);
+        if (ts_rel as u64) >= self.click_win_ms {
+            return;
+        }
+        let (p2, l2) = row.field(2);
+        let Some(camp) = self.sh.campaign_id(p2, l2) else {
+            return;
+        };
+        let click_id = if l0 <= 9 {
+            let t = ids::pack(p0, l0);
+            if t != 0 {
+                t
+            } else {
+                tok_click_cold(p0, l0, &mut self.w.c_side, self.sh)
+            }
+        } else {
+            tok_click_cold(p0, l0, &mut self.w.c_side, self.sh)
+        };
+        let ts_rel_ms = ts_rel as u32;
+        if let Some(key42) = pack_u_base37(p1, l1) {
+            let u_slot = self.dict.prefetch_u(key42);
+            let pre = self.u_batch.get_unchecked_mut(self.u_nb);
+            pre.click_id = click_id;
+            pre.ts_rel_ms = ts_rel_ms;
+            pre.camp = camp;
+            pre.u_ptr = p1;
+            pre.u_len = l1 as u16;
+            pre.key42 = key42;
+            pre.u_slot = u_slot as u32;
+            self.u_nb += 1;
+            if self.u_nb == BATCH {
+                flush_ck_u_batch(self.dict, self.w, self.pool, &self.u_batch);
+                self.u_nb = 0;
+            }
+        } else if l1 == 33 && *p1 == b'u' {
+            if let Some((_, hi, lo)) = parse_hex33(p1, l1) {
+                let u_slot = self.dict.prefetch_hex(hi, lo);
+                let pre = self.h_batch.get_unchecked_mut(self.h_nb);
+                pre.click_id = click_id;
+                pre.ts_rel_ms = ts_rel_ms;
+                pre.camp = camp;
+                pre.hi = hi;
+                pre.lo = lo;
+                pre.u_slot = u_slot as u32;
+                self.h_nb += 1;
+                if self.h_nb == BATCH {
+                    flush_ck_h_batch(self.dict, self.w, self.pool, self.tid, &self.h_batch);
+                    self.h_nb = 0;
+                }
+                return;
+            }
+            let pid = self
+                .dict
+                .get_or_insert_gen(p1, l1, &mut self.w.lease, self.tid);
+            if pid != 0 {
+                let meta = (((pid as u64) >> 8) << 44)
+                    | ((ts_rel_ms as u64) << 12)
+                    | (camp as u64 & 0xFFF);
+                self.w.c_writer.push(
+                    (pid & 255) as usize,
+                    CompactClick { click_id, meta },
+                    &mut self.w.alloc,
+                    self.pool,
+                );
+            }
+        } else {
+            let pid = self
+                .dict
+                .get_or_insert_gen(p1, l1, &mut self.w.lease, self.tid);
+            if pid != 0 {
+                let meta = (((pid as u64) >> 8) << 44)
+                    | ((ts_rel_ms as u64) << 12)
+                    | (camp as u64 & 0xFFF);
+                self.w.c_writer.push(
+                    (pid & 255) as usize,
+                    CompactClick { click_id, meta },
+                    &mut self.w.alloc,
+                    self.pool,
+                );
+            }
+        }
+    }
+}
+
 #[inline(never)]
 unsafe fn parse_clicks_v6(
     sh: &Shared,
     dict: &UserDict,
     Mapped(data, size): Mapped,
+    fd: Option<RawFd>,
     x: &Extent,
     w: &mut ParseWorker,
     pool: &BlockSlabPool,
     tid: usize,
 ) {
     let click_win_ms = (sh.window_end - sh.base_ms) as u64;
-    let mut batch: [CkPre; BATCH] = [CkPre::default(); BATCH];
-    let mut nb = 0usize;
-
     let mut reader = std::mem::replace(&mut w.reader, Reader::lazy(0));
-    scan4k::scan::<4>(data, size, x.from as usize, x.to as usize, &mut reader, |bptr, s, e| {
-        let l0 = (e[0] - s[0]) as usize;
-        let l1 = (e[1] - s[1]) as usize;
-        if l0 == 0 || l1 == 0 {
-            return;
-        }
-        let p3 = bptr.add(s[3] as usize);
-        let l3 = (e[3] - s[3]) as usize;
-        let ts_rel = ts::parse_ts_rel(p3, l3, &sh.date_lut, &mut w.dates, sh.base_ms);
-        if (ts_rel as u64) >= click_win_ms {
-            return;
-        }
-        let p2 = bptr.add(s[2] as usize);
-        let l2 = (e[2] - s[2]) as usize;
-        let Some(camp) = sh.campaign_id(p2, l2) else { return };
-        let p0 = bptr.add(s[0] as usize);
-        let click_id = if l0 <= 9 {
-            let t = ids::pack(p0, l0);
-            if t != 0 {
-                t
-            } else {
-                tok_click_cold(p0, l0, &mut w.c_side, sh)
-            }
-        } else {
-            tok_click_cold(p0, l0, &mut w.c_side, sh)
+    let mut pbuf = w.pbuf.take();
+    {
+        let mut parser = ClickRowParser {
+            sh,
+            dict,
+            w,
+            pool,
+            tid,
+            click_win_ms,
+            u_batch: [CkUPre::default(); BATCH],
+            u_nb: 0,
+            h_batch: [CkHPre::default(); BATCH],
+            h_nb: 0,
         };
-        let p1 = bptr.add(s[1] as usize);
-        let pre = batch.get_unchecked_mut(nb);
-        pre.click_id = click_id;
-        pre.ts_rel_ms = ts_rel as u32;
-        pre.camp = camp;
-        pre.u_ptr = p1;
-        pre.u_len = l1 as u16;
-        if let Some(key42) = pack_u_base37(p1, l1) {
-            pre.u_kind = 1;
-            pre.u_k1 = key42;
-            pre.u_slot = dict.prefetch_u(key42);
-        } else if l1 == 33 && *p1 == b'u' {
-            if let Some((_, hi, lo)) = parse_hex33(p1, l1) {
-                pre.u_kind = 2;
-                pre.u_k1 = hi;
-                pre.u_k2 = lo;
-                pre.u_slot = dict.prefetch_hex(hi, lo);
-            } else {
-                pre.u_kind = 3;
-            }
+        if let Some(fd) = fd {
+            let pb = pbuf.get_or_insert_with(PreadBuf::new);
+            scan4k::scan_rows_pread::<4, _>(
+                fd,
+                size,
+                x.from as usize,
+                x.to as usize,
+                &mut reader,
+                pb,
+                &mut parser,
+            );
         } else {
-            pre.u_kind = 3;
+            scan4k::scan_rows::<4, _>(
+                data,
+                size,
+                x.from as usize,
+                x.to as usize,
+                &mut reader,
+                &mut parser,
+            );
         }
-        nb += 1;
-        if nb == BATCH {
-            flush_ck_batch(dict, w, pool, tid, &batch);
-            nb = 0;
-        }
-    });
+        parser.flush_all();
+    }
     w.reader = reader;
-    if nb > 0 {
-        flush_ck_batch(dict, w, pool, tid, &batch[..nb]);
+    w.pbuf = pbuf;
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn mix42_exact_bijection_and_invertibility() {
+        const MASK42: u64 = (1u64 << 42) - 1;
+        const MUL: u64 = 0x224B_A937_15B7;
+        // Modular inverse of MUL mod 2^42 via Newton/Hensel lifting
+        let mut inv = 1u64;
+        for _ in 0..6 {
+            inv = inv.wrapping_mul(2u64.wrapping_sub(MUL.wrapping_mul(inv))) & MASK42;
+        }
+        assert_eq!(MUL.wrapping_mul(inv) & MASK42, 1);
+
+        let unmix42 = |mut y: u64| -> u64 {
+            y ^= y >> 21;
+            y = y.wrapping_mul(inv) & MASK42;
+            y ^= y >> 21;
+            y
+        };
+
+        // Test boundary & random values across full 42-bit range
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..500_000u64 {
+            let v = match i {
+                0 => 0,
+                1 => 1,
+                2 => MASK42,
+                3..=44 => 1u64 << (i - 3),
+                _ => rnd() & MASK42,
+            };
+            let h = mix42(v);
+            assert!(h <= MASK42);
+            assert_eq!(unmix42(h), v, "mix42 failed inverse for {v}");
+        }
+
+        // Dense uniqueness check over 1..=200_000
+        let mut seen = std::collections::HashSet::with_capacity(200_000);
+        for v in 1..=200_000u64 {
+            assert!(seen.insert(mix42(v)), "collision at {v}");
+        }
     }
 }
 
@@ -1936,13 +2328,156 @@ pub struct V6Metrics {
     pub clicks: u64,
 }
 
-/// Executes V6 fast path after `links_join`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LinkPre {
+    p0: *const u8,
+    p1: *const u8,
+    a0: u64,
+    b0: u64,
+    a1: u64,
+    b1: u64,
+    s0: u32,
+    s1: u32,
+    l0: u16,
+    l1: u16,
+    k0: u8,
+    k1: u8,
+}
+
+impl Default for LinkPre {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[inline(never)]
+unsafe fn flush_link_batch(
+    dict: &UserDict,
+    lease: &mut PidLease,
+    tid: usize,
+    batch: &[LinkPre],
+    pairs: &mut Vec<(u32, u32)>,
+) {
+    for pre in batch {
+        if dict.is_overflow() {
+            return;
+        }
+        let ua = resolve_user_parts(
+            dict,
+            pre.k0,
+            pre.s0 as usize,
+            pre.a0,
+            pre.b0,
+            pre.p0,
+            pre.l0 as usize,
+            lease,
+            tid,
+        );
+        let ub = resolve_user_parts(
+            dict,
+            pre.k1,
+            pre.s1 as usize,
+            pre.a1,
+            pre.b1,
+            pre.p1,
+            pre.l1 as usize,
+            lease,
+            tid,
+        );
+        if ua == 0 || ub == 0 {
+            return;
+        }
+        if ua != ub {
+            pairs.push((ua, ub));
+        }
+    }
+}
+
+struct LinkRowParser<'a> {
+    dict: &'a UserDict,
+    lease: &'a mut PidLease,
+    tid: usize,
+    pairs: &'a mut Vec<(u32, u32)>,
+    batch: [LinkPre; BATCH],
+    nb: usize,
+}
+
+impl<'a> LinkRowParser<'a> {
+    #[inline(always)]
+    unsafe fn flush_all(&mut self) {
+        if self.nb > 0 {
+            flush_link_batch(
+                self.dict,
+                self.lease,
+                self.tid,
+                &self.batch[..self.nb],
+                self.pairs,
+            );
+            self.nb = 0;
+        }
+    }
+}
+
+impl<'a> RowHandler for LinkRowParser<'a> {
+    #[inline(always)]
+    unsafe fn before_refill(&mut self) {
+        self.flush_all();
+    }
+
+    #[inline(always)]
+    unsafe fn on_row<R: CsvRow>(&mut self, row: R) {
+        let (p0, l0) = row.field(0);
+        let (p1, l1) = row.field(1);
+        if l0 == 0 || l1 == 0 {
+            return;
+        }
+        let (k0, s0, a0, b0, k1, s1, a1, b1) =
+            if let Some((ka, kb)) = pack_pair_base37::<b'u', b'u'>(p0, l0, p1, l1) {
+                (
+                    1u8,
+                    self.dict.prefetch_u(ka),
+                    ka,
+                    0u64,
+                    1u8,
+                    self.dict.prefetch_u(kb),
+                    kb,
+                    0u64,
+                )
+            } else {
+                let (k0, s0, a0, b0) = prep_user_prefetch(self.dict, p0, l0);
+                let (k1, s1, a1, b1) = prep_user_prefetch(self.dict, p1, l1);
+                (k0, s0, a0, b0, k1, s1, a1, b1)
+            };
+        let pre = self.batch.get_unchecked_mut(self.nb);
+        pre.p0 = p0;
+        pre.l0 = l0 as u16;
+        pre.k0 = k0;
+        pre.s0 = s0 as u32;
+        pre.a0 = a0;
+        pre.b0 = b0;
+        pre.p1 = p1;
+        pre.l1 = l1 as u16;
+        pre.k1 = k1;
+        pre.s1 = s1 as u32;
+        pre.a1 = a1;
+        pre.b1 = b1;
+        self.nb += 1;
+        if self.nb == BATCH {
+            flush_link_batch(self.dict, self.lease, self.tid, &self.batch, self.pairs);
+            self.nb = 0;
+        }
+    }
+}
+
+/// Executes V6 fast path directly from `link_input`, `event_input`, and `click_input`.
 /// Returns `Some(metrics)` on success, or `None` if `UserDict` / `SideEvent` overflowed
-/// (after releasing V6 allocations and restoring `LinkTable` for V5 fallback).
+/// (after releasing V6 allocations for V5 fallback).
 pub fn run(
     sh: &Shared,
-    event_input: &Input,
-    click_input: &Input,
+    link_input: &mut Input,
+    event_input: &mut Input,
+    click_input: &mut Input,
     threads: usize,
     read_buf: usize,
     user_daily_dir: &Path,
@@ -1950,49 +2485,155 @@ pub fn run(
     verbose: bool,
     log_mark: &mut dyn FnMut(&'static str),
 ) -> Option<V6Metrics> {
-    let dict = UserDict::new(event_input.bytes as usize);
+    for i in 0..link_input.files.len() {
+        link_input.end_line(i);
+    }
+
+    // Guardrail C5: all mmap()s (UserDict + BlockSlabPool) completed BEFORE any MADV_POPULATE_WRITE.
+    let dict = UserDict::new_with_links(event_input.bytes as usize, link_input.bytes as usize);
     let est_ev = (event_input.bytes as usize / 72).max(1);
     let est_ck = (click_input.bytes as usize / 45).max(1);
     let init_pool_bytes = est_ev * 18 + est_ck * 16;
     let (pool, pool_reg) = BlockSlabPool::with_initial(init_pool_bytes);
-    // Guardrail C5: all mmap()s (UserDict + BlockSlabPool) completed before MADV_POPULATE_WRITE.
-    {
+
+    let pop_pieces: Vec<(usize, usize)> = {
         const PIECE: usize = 4 << 20;
         let dict_regs = dict.populate_regions();
         let all_regs = [dict_regs[0], dict_regs[1], dict_regs[2], pool_reg];
-        let mut pieces = Vec::new();
-        for &(base, len) in &all_regs {
-            for at in (0..len).step_by(PIECE) {
-                pieces.push((base + at, PIECE.min(len - at)));
+        let max_len = all_regs.iter().map(|&(_, n)| n).max().unwrap_or(0);
+        let mut pieces =
+            Vec::with_capacity(all_regs.iter().map(|&(_, n)| n.div_ceil(PIECE)).sum());
+        for at in (0..max_len).step_by(PIECE) {
+            for &(b, n) in &all_regs {
+                if at < n {
+                    pieces.push((b + at, PIECE.min(n - at)));
+                }
             }
         }
-        let pop_next = AtomicUsize::new(0);
-        par(threads, |_| loop {
-            let i = pop_next.fetch_add(1, Relaxed);
-            let Some(&(at, n)) = pieces.get(i) else { break };
-            sys::populate(at as *mut u8, n);
-        });
-    }
-    log_mark("populate");
+        pieces
+    };
+    let pop_next = AtomicUsize::new(0);
+    let overlap_pop = std::env::var("SS_OVERLAP_POP").ok().as_deref() != Some("0");
 
-    if !unsafe { dict.seed_from_links(&sh.links, threads) } {
-        unsafe {
-            const SWEEP: usize = 1 << 14;
-            let total = sh.links.slots();
-            let next = AtomicUsize::new(0);
-            par(threads, |_| loop {
-                let from = next.fetch_add(1, Relaxed) * SWEEP;
-                if from >= total {
+    let pread = scan4k::use_pread();
+    let parse_workers = PerThread::new(threads, |_| ParseWorker::new(read_buf, pread));
+    let per_thread_pairs = PerThread::new(threads, |_| Vec::<(u32, u32)>::new());
+
+    // Phase 0: check event/click trailing newlines, parse links directly into UserDict,
+    // and opportunistically drain `pop_pieces` on idle threads.
+    let tails = event_input.files.len() + click_input.files.len();
+    let next_tail = AtomicUsize::new(0);
+    let unended: Vec<AtomicBool> = (0..tails).map(|_| AtomicBool::new(false)).collect();
+    let next_link = AtomicUsize::new(0);
+    let active0 = AtomicUsize::new(threads);
+    par(threads, |t| unsafe {
+        loop {
+            let i = next_tail.fetch_add(1, Relaxed);
+            if i >= tails {
+                break;
+            }
+            let lacks = match i.checked_sub(event_input.files.len()) {
+                None => event_input.lacks_newline(i),
+                Some(k) => click_input.lacks_newline(k),
+            };
+            unended[i].store(lacks, Relaxed);
+        }
+
+        let w = parse_workers.get(t);
+        let pairs = per_thread_pairs.get(t);
+        let mut reader = std::mem::replace(&mut w.reader, Reader::lazy(0));
+        let mut pbuf = w.pbuf.take();
+        {
+            let mut parser = LinkRowParser {
+                dict: &dict,
+                lease: &mut w.lease,
+                tid: t,
+                pairs,
+                batch: [LinkPre::default(); BATCH],
+                nb: 0,
+            };
+            loop {
+                if dict.is_overflow() {
                     break;
                 }
-                sh.links.restore_roots(from, (from + SWEEP).min(total));
-            });
+                let i = next_link.fetch_add(1, Relaxed);
+                let Some(x) = link_input.extents.get(i) else { break };
+                let Mapped(data, size) = link_input.files[x.file];
+                if let Some(fd) = link_input.file_fd(x.file) {
+                    let pb = pbuf.get_or_insert_with(PreadBuf::new);
+                    scan4k::scan_rows_pread::<2, _>(
+                        fd,
+                        size,
+                        x.from as usize,
+                        x.to as usize,
+                        &mut reader,
+                        pb,
+                        &mut parser,
+                    );
+                    parser.flush_all();
+                } else {
+                    scan4k::scan_rows::<2, _>(
+                        data,
+                        size,
+                        x.from as usize,
+                        x.to as usize,
+                        &mut reader,
+                        &mut parser,
+                    );
+                }
+                link_input.done(x);
+            }
+            parser.flush_all();
         }
+        w.reader = reader;
+        w.pbuf = pbuf;
+        w.lease = PidLease::default();
+
+        active0.fetch_sub(1, AcqRel);
+        if overlap_pop {
+            while active0.load(Acquire) > 0 {
+                let i = pop_next.fetch_add(1, Relaxed);
+                let Some(&(at, n)) = pop_pieces.get(i) else { break };
+                sys::populate(at as *mut u8, n);
+            }
+        }
+    });
+
+    for (i, u) in unended.iter().enumerate() {
+        if u.load(Relaxed) {
+            match i.checked_sub(event_input.files.len()) {
+                None => event_input.end_line(i),
+                Some(k) => click_input.end_line(k),
+            }
+        }
+    }
+
+    if dict.is_overflow() {
         pool.release();
         dict.release();
         return None;
     }
-    log_mark("links seed");
+    log_mark("links parse");
+
+    unsafe {
+        let pair_slices: Vec<&[(u32, u32)]> = (0..threads)
+            .map(|t| per_thread_pairs.get(t).as_slice())
+            .collect();
+        dict.resolve_links_dsu(&pair_slices, threads);
+        for t in 0..threads {
+            *per_thread_pairs.get(t) = Vec::new();
+        }
+    }
+    log_mark("links join");
+
+    if pop_next.load(Relaxed) < pop_pieces.len() {
+        par(threads, |_| loop {
+            let i = pop_next.fetch_add(1, Relaxed);
+            let Some(&(at, n)) = pop_pieces.get(i) else { break };
+            sys::populate(at as *mut u8, n);
+        });
+    }
+    log_mark("populate");
 
     let raw_store: PartitionedStore<RawEvent16, 256, RAW_B> = PartitionedStore::new(threads);
     let long_store: PartitionedStore<LongEv32, 128, 128> = PartitionedStore::new(threads);
@@ -2000,7 +2641,6 @@ pub fn run(
     let p_store: PartitionedStore<CompactPersonEv8, 512, 256> = PartitionedStore::new(threads);
     let pu_store: PartitionedStore<CompactPurchase, 256, 256> = PartitionedStore::new(threads);
 
-    let parse_workers = PerThread::new(threads, |_| ParseWorker::new(read_buf));
     let side_overflow = AtomicBool::new(false);
 
     let mut work: Vec<(bool, usize)> = (0..event_input.extents.len())
@@ -2032,15 +2672,27 @@ pub fn run(
                     sh,
                     &dict,
                     event_input.files[x.file],
+                    event_input.file_fd(x.file),
                     x,
                     w,
                     &pool,
                     t,
                     &side_overflow,
                 );
+                event_input.done(x);
             } else {
                 let x = &click_input.extents[idx];
-                parse_clicks_v6(sh, &dict, click_input.files[x.file], x, w, &pool, t);
+                parse_clicks_v6(
+                    sh,
+                    &dict,
+                    click_input.files[x.file],
+                    click_input.file_fd(x.file),
+                    x,
+                    w,
+                    &pool,
+                    t,
+                );
+                click_input.done(x);
             }
         }
         w.raw_writer.finish(&raw_store, t, &mut w.alloc, &pool);
@@ -2049,30 +2701,13 @@ pub fn run(
     });
 
     if dict.is_overflow() || side_overflow.load(Relaxed) {
-        unsafe {
-            const SWEEP: usize = 1 << 14;
-            let total = sh.links.slots();
-            let next = AtomicUsize::new(0);
-            par(threads, |_| loop {
-                let from = next.fetch_add(1, Relaxed) * SWEEP;
-                if from >= total {
-                    break;
-                }
-                sh.links.restore_roots(from, (from + SWEEP).min(total));
-            });
-        }
         pool.release();
         dict.release();
         return None;
     }
 
-    // Release input mappings if SS_UNMAP_PARSE requested it, and mark/release LinkTable cleanly.
-    sh.links.mark_dead();
     let release_mem = std::env::var_os("SS_NORELEASE").is_none()
         && sys::host_profile().thp == sys::ThpPolicy::NoHuge;
-    if release_mem {
-        sh.links.release(0, sh.links.slots());
-    }
     log_mark("parse");
 
     let event_lines: u64 = (0..threads)

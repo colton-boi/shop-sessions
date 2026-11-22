@@ -12,6 +12,15 @@ pub struct Arena<T> {
 unsafe impl<T> Sync for Arena<T> {}
 
 impl<T> Arena<T> {
+    pub fn empty() -> Self {
+        Arena {
+            base: std::ptr::NonNull::dangling().as_ptr(),
+            cap: 0,
+            next: AtomicUsize::new(0),
+            chunk: 0,
+        }
+    }
+
     pub fn new(records: usize, chunk: usize) -> Self {
         let cap = records.div_ceil(chunk) * chunk;
         assert!(cap < u32::MAX as usize, "input too large for 32-bit record indexes");

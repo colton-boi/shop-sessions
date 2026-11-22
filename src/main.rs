@@ -167,6 +167,7 @@ unsafe impl Send for Mapped {}
 
 pub(crate) struct Input {
     pub(crate) files: Vec<Mapped>,
+    pub(crate) fds: Vec<std::fs::File>,
     /// Extents of each file not yet parsed; the last one to finish unmaps the file.
     remaining: Vec<AtomicUsize>,
     unmap_on_done: bool,
@@ -175,6 +176,11 @@ pub(crate) struct Input {
 }
 
 impl Input {
+    pub(crate) fn file_fd(&self, file_idx: usize) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        self.fds.get(file_idx).map(|f| f.as_raw_fd())
+    }
+
     pub(crate) fn done(&self, x: &Extent) {
         if self.unmap_on_done && self.remaining[x.file].fetch_sub(1, Relaxed) == 1 {
             sys::unmap_file(self.files[x.file].0, self.files[x.file].1);
@@ -184,12 +190,14 @@ impl Input {
     /// Makes file `i` end with a newline, as `csv::Reader` needs.
     pub(crate) fn end_line(&mut self, i: usize) {
         let Mapped(data, size) = self.files[i];
-        self.files[i].1 = unsafe { sys::end_line(data, size) };
+        if !data.is_null() {
+            self.files[i].1 = unsafe { sys::end_line(data, size) };
+        }
     }
 
     pub(crate) fn lacks_newline(&self, i: usize) -> bool {
         let Mapped(data, size) = self.files[i];
-        size != 0 && unsafe { *data.add(size - 1) } != b'\n'
+        !data.is_null() && size != 0 && unsafe { *data.add(size - 1) } != b'\n'
     }
 }
 
@@ -220,6 +228,7 @@ fn list_csv_paths(dir: &Path) -> Vec<PathBuf> {
 fn build_input(mapped: &[sys::ContiguousMappedFile], extent: u64, unmap_on_done: bool) -> Input {
     let mut input = Input {
         files: Vec::with_capacity(mapped.len()),
+        fds: Vec::new(),
         remaining: Vec::with_capacity(mapped.len()),
         unmap_on_done,
         extents: Vec::new(),
@@ -241,10 +250,82 @@ fn build_input(mapped: &[sys::ContiguousMappedFile], extent: u64, unmap_on_done:
     input
 }
 
+fn build_input_pread(opened: Vec<(std::fs::File, usize)>, extent: u64) -> Input {
+    let mut input = Input {
+        files: Vec::with_capacity(opened.len()),
+        fds: Vec::with_capacity(opened.len()),
+        remaining: Vec::with_capacity(opened.len()),
+        unmap_on_done: false,
+        extents: Vec::new(),
+        bytes: 0,
+    };
+    for (index, (file, sz)) in opened.into_iter().enumerate() {
+        let size = sz as u64;
+        let mut from = 0;
+        let first = input.extents.len();
+        while from < size {
+            let to = (from + extent).min(size);
+            input.extents.push(Extent { file: index, from, to });
+            from = to;
+        }
+        input.remaining.push(AtomicUsize::new(input.extents.len() - first));
+        input.bytes += size;
+        input.files.push(Mapped(std::ptr::null(), sz));
+        input.fds.push(file);
+    }
+    input
+}
+
+fn open_all_inputs_pread(
+    links_paths: &[PathBuf],
+    events_paths: &[PathBuf],
+    clicks_paths: &[PathBuf],
+    link_extent: u64,
+    extent: u64,
+    threads: usize,
+) -> (Input, Input, Input) {
+    let n_links = links_paths.len();
+    let n_events = events_paths.len();
+    let total = n_links + n_events + clicks_paths.len();
+    let slots: Vec<std::cell::UnsafeCell<Option<(std::fs::File, usize)>>> =
+        (0..total).map(|_| std::cell::UnsafeCell::new(None)).collect();
+    struct SyncPtr<'a>(&'a [std::cell::UnsafeCell<Option<(std::fs::File, usize)>>]);
+    unsafe impl<'a> Sync for SyncPtr<'a> {}
+    let sptr = &SyncPtr(&slots);
+    let path_at = |i: usize| -> &PathBuf {
+        if i < n_links {
+            &links_paths[i]
+        } else if i < n_links + n_events {
+            &events_paths[i - n_links]
+        } else {
+            &clicks_paths[i - n_links - n_events]
+        }
+    };
+    let next = AtomicUsize::new(0);
+    par(threads.min(total).max(1), |_| loop {
+        let i = next.fetch_add(1, Relaxed);
+        if i >= total {
+            break;
+        }
+        let f = std::fs::File::open(path_at(i)).expect("open input file");
+        let sz = f.metadata().expect("stat input file").len() as usize;
+        unsafe { *(&*sptr).0[i].get() = Some((f, sz)) };
+    });
+    let mut all: Vec<(std::fs::File, usize)> =
+        slots.into_iter().map(|c| c.into_inner().unwrap()).collect();
+    let clicks_f = all.split_off(n_links + n_events);
+    let events_f = all.split_off(n_links);
+    (
+        build_input_pread(all, link_extent),
+        build_input_pread(events_f, extent),
+        build_input_pread(clicks_f, extent),
+    )
+}
+
 fn map_all_inputs(
-    links_paths: Vec<PathBuf>,
-    events_paths: Vec<PathBuf>,
-    clicks_paths: Vec<PathBuf>,
+    links_paths: &[PathBuf],
+    events_paths: &[PathBuf],
+    clicks_paths: &[PathBuf],
     link_extent: u64,
     extent: u64,
     threads: usize,
@@ -252,9 +333,9 @@ fn map_all_inputs(
     let n_links = links_paths.len();
     let n_events = events_paths.len();
     let mut all_paths = Vec::with_capacity(n_links + n_events + clicks_paths.len());
-    all_paths.extend(links_paths);
-    all_paths.extend(events_paths);
-    all_paths.extend(clicks_paths);
+    all_paths.extend_from_slice(links_paths);
+    all_paths.extend_from_slice(events_paths);
+    all_paths.extend_from_slice(clicks_paths);
     let region = sys::map_files_contiguous_par(&all_paths, threads);
     let total_input_bytes: usize = region.files.iter().map(|f| f.size).sum();
     let unmap_parse = match std::env::var("SS_UNMAP_PARSE").ok().as_deref() {
@@ -586,36 +667,28 @@ fn main() {
             std::fs::create_dir_all(&campaign_daily_dir).expect("create output");
         },
     );
-    let (mut link_input, mut event_input, mut click_input) = map_all_inputs(
-        links_paths,
-        events_paths,
-        clicks_paths,
-        extent.min(128 << 10),
-        extent,
-        threads,
-    );
+    let pread_mode = scan4k::use_pread() && std::env::var_os("SS_FORCE_V5").is_none();
+    let (mut link_input, mut event_input, mut click_input) = if pread_mode {
+        open_all_inputs_pread(
+            &links_paths,
+            &events_paths,
+            &clicks_paths,
+            extent.min(128 << 10),
+            extent,
+            threads,
+        )
+    } else {
+        map_all_inputs(
+            &links_paths,
+            &events_paths,
+            &clicks_paths,
+            extent.min(128 << 10),
+            extent,
+            threads,
+        )
+    };
     init_hex_user_table((link_input.bytes + event_input.bytes + click_input.bytes) as usize);
 
-    // The links are parsed first; the other files' last bytes are read in parallel during that parse.
-    for i in 0..link_input.files.len() {
-        link_input.end_line(i);
-    }
-
-    // Guardrail C5: finish ALL mmap() allocations (LinkTable and all large arenas) BEFORE any
-    // MADV_POPULATE_WRITE runs.
-    let link_pairs_est = if link_input.bytes <= (2 << 20) {
-        ((link_input.bytes / 4) as usize).max(16)
-    } else {
-        ((link_input.bytes / 20) as usize).max(16)
-    };
-    let links = LinkTable::new(link_pairs_est);
-    let rows_guess = (event_input.bytes / 78) as usize;
-    let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
-    let (d_parts, p_parts) = (parts(16_384), parts(16_384));
-    let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
-    let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
-    let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
-    let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
     const SIDE_CHUNK: usize = 4096;
     let e_side_recs = (event_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
     let c_side_recs = (click_input.bytes as usize / 36).max(1) + threads * SIDE_CHUNK;
@@ -637,15 +710,122 @@ fn main() {
         campaign_ids: dims.campaign_ids,
         direct_camp: dims.direct_camp,
         campaigns: dims.campaigns,
-        links,
-        d_arena: Arena::new(d_recs, D_CHUNK),
-        p_arena: Arena::new(p_recs, P_CHUNK),
-        c_arena: Arena::new(c_recs, C_CHUNK),
+        links: LinkTable::empty(),
+        d_arena: Arena::empty(),
+        p_arena: Arena::empty(),
+        c_arena: Arena::empty(),
         e_side_arena: Arena::new(e_side_recs, SIDE_CHUNK),
         c_side_arena: Arena::new(c_side_recs, SIDE_CHUNK),
-        d_parts,
-        p_parts,
+        d_parts: 0,
+        p_parts: 0,
     };
+
+    let try_v6 = v6::applicable(&sh, event_input.bytes);
+    if verbose { eprintln!("  listed {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
+    let count = || counters.as_ref().map_or([0; 4], |c| c.read());
+    let mark = |name| (name, t0.elapsed().as_secs_f64(), sys::rusage(), count());
+    let mut marks: Vec<Mark> = vec![mark("setup")];
+    log_stage(&marks);
+
+    if try_v6 {
+        let mut push_mark = |name: &'static str| {
+            marks.push((name, t0.elapsed().as_secs_f64(), sys::rusage(), count()));
+            log_stage(&marks);
+        };
+        if let Some(m) = v6::run(
+            &sh,
+            &mut link_input,
+            &mut event_input,
+            &mut click_input,
+            threads,
+            read_buf,
+            &user_daily_dir,
+            &campaign_daily_dir,
+            verbose,
+            &mut push_mark,
+        ) {
+            if verbose {
+                let (mut prev, mut prev_ru, mut prev_n) = (0.0, (0.0, 0.0, 0), marks[0].3);
+                for (name, at, ru, n) in &marks {
+                    let d: Vec<f64> = (0..4).map(|k| (n[k] - prev_n[k]) as f64 / 1e6).collect();
+                    eprintln!(
+                        "{name:12} wall {:7.1} ms  user {:7.1}  sys {:6.1} ms  kfault {:6.0}  Mcyc {:7.1}  Minstr {:7.1}  Mllc {:6.2}  Mbr {:6.2}",
+                        (at - prev) * 1e3,
+                        (ru.0 - prev_ru.0) * 1e3,
+                        (ru.1 - prev_ru.1) * 1e3,
+                        (ru.2 - prev_ru.2) as f64 / 1e3,
+                        d[0],
+                        d[1],
+                        d[2],
+                        d[3]
+                    );
+                    (prev, prev_ru, prev_n) = (*at, *ru, *n);
+                }
+                let ru = sys::rusage();
+                eprintln!(
+                    "total wall {:.1} ms  user {:.1} ms  sys {:.1} ms",
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    ru.0 * 1e3,
+                    ru.1 * 1e3
+                );
+            }
+            let stages: Vec<(&str, f64)> = marks
+                .iter()
+                .scan(0.0, |prev, m| {
+                    let d = m.1 - *prev;
+                    *prev = m.1;
+                    Some((m.0, d))
+                })
+                .collect();
+            let ru = sys::rusage();
+            diag::summary(
+                t0.elapsed().as_secs_f64(),
+                &stages,
+                ru.0,
+                ru.1,
+                [m.event_lines, m.valid_events, m.clicks],
+            );
+            sys::prof::finish();
+            sys::exit_now();
+        }
+    }
+
+    if pread_mode {
+        (link_input, event_input, click_input) = map_all_inputs(
+            &links_paths,
+            &events_paths,
+            &clicks_paths,
+            extent.min(128 << 10),
+            extent,
+            threads,
+        );
+    }
+
+    // The links are parsed first; the other files' last bytes are read in parallel during that parse.
+    for i in 0..link_input.files.len() {
+        link_input.end_line(i);
+    }
+
+    // Guardrail C5: finish ALL mmap() allocations (LinkTable and all large arenas) BEFORE any
+    // MADV_POPULATE_WRITE runs.
+    let link_pairs_est = if link_input.bytes <= (2 << 20) {
+        ((link_input.bytes / 4) as usize).max(16)
+    } else {
+        ((link_input.bytes / 20) as usize).max(16)
+    };
+    let rows_guess = (event_input.bytes / 78) as usize;
+    let parts = |per: usize| (rows_guess / per).next_power_of_two().clamp(1, 1024);
+    let (d_parts, p_parts) = (parts(16_384), parts(16_384));
+    let (d_parts, p_parts) = (knob("SS_DPARTS", d_parts as u64) as usize, knob("SS_PPARTS", p_parts as u64) as usize);
+    let d_recs = event_input.bytes as usize / 8 + (threads * d_parts + 2) * D_CHUNK;
+    let p_recs = event_input.bytes as usize / 32 + (threads * p_parts + 2) * P_CHUNK;
+    let c_recs = click_input.bytes as usize / 8 + (threads * p_parts + 2) * C_CHUNK;
+    sh.links = LinkTable::new(link_pairs_est);
+    sh.d_arena = Arena::new(d_recs, D_CHUNK);
+    sh.p_arena = Arena::new(p_recs, P_CHUNK);
+    sh.c_arena = Arena::new(c_recs, C_CHUNK);
+    sh.d_parts = d_parts;
+    sh.p_parts = p_parts;
 
     // Committing the expected arenas in interleaved 4 MiB blocks overlaps cleanly with the
     // link-stage idle tails and avoids page-by-page faults during parse.
@@ -683,10 +863,8 @@ fn main() {
         pieces
     };
     let pop_next = AtomicUsize::new(0);
-    let try_v6 = v6::applicable(&sh, event_input.bytes);
-    let overlap_pop = !try_v6 && std::env::var("SS_OVERLAP_POP").ok().as_deref() != Some("0");
+    let overlap_pop = std::env::var("SS_OVERLAP_POP").ok().as_deref() != Some("0");
 
-    if verbose { eprintln!("  listed {:.2} ms", t0.elapsed().as_secs_f64()*1e3); }
     let workers = PerThread::new(threads, |_| Worker {
         reader: Reader::lazy(read_buf),
         dates: DateCache::new(),
@@ -698,10 +876,6 @@ fn main() {
         c_side: SideWriter::default(),
         busy: [[0.0; 3]; 8],
     });
-    let count = || counters.as_ref().map_or([0; 4], |c| c.read());
-    let mark = |name| (name, t0.elapsed().as_secs_f64(), sys::rusage(), count());
-    let mut marks: Vec<Mark> = vec![mark("setup")];
-    log_stage(&marks);
     let phase = |stage: usize, f: &(dyn Fn(usize) + Sync)| {
         let begun = Instant::now();
         par(threads, |t| {
@@ -811,68 +985,6 @@ fn main() {
     sweep(&|from, to| unsafe { sh.links.compress_and_resolve(from, to) });
     marks.push(mark("links join"));
     log_stage(&marks);
-
-    if try_v6 {
-        let mut push_mark = |name: &'static str| {
-            marks.push((name, t0.elapsed().as_secs_f64(), sys::rusage(), count()));
-            log_stage(&marks);
-        };
-        if let Some(m) = v6::run(
-            &sh,
-            &event_input,
-            &click_input,
-            threads,
-            read_buf,
-            &user_daily_dir,
-            &campaign_daily_dir,
-            verbose,
-            &mut push_mark,
-        ) {
-            if verbose {
-                let (mut prev, mut prev_ru, mut prev_n) = (0.0, (0.0, 0.0, 0), marks[0].3);
-                for (name, at, ru, n) in &marks {
-                    let d: Vec<f64> = (0..4).map(|k| (n[k] - prev_n[k]) as f64 / 1e6).collect();
-                    eprintln!(
-                        "{name:12} wall {:7.1} ms  user {:7.1}  sys {:6.1} ms  kfault {:6.0}  Mcyc {:7.1}  Minstr {:7.1}  Mllc {:6.2}  Mbr {:6.2}",
-                        (at - prev) * 1e3,
-                        (ru.0 - prev_ru.0) * 1e3,
-                        (ru.1 - prev_ru.1) * 1e3,
-                        (ru.2 - prev_ru.2) as f64 / 1e3,
-                        d[0],
-                        d[1],
-                        d[2],
-                        d[3]
-                    );
-                    (prev, prev_ru, prev_n) = (*at, *ru, *n);
-                }
-                let ru = sys::rusage();
-                eprintln!(
-                    "total wall {:.1} ms  user {:.1} ms  sys {:.1} ms",
-                    t0.elapsed().as_secs_f64() * 1e3,
-                    ru.0 * 1e3,
-                    ru.1 * 1e3
-                );
-            }
-            let stages: Vec<(&str, f64)> = marks
-                .iter()
-                .scan(0.0, |prev, m| {
-                    let d = m.1 - *prev;
-                    *prev = m.1;
-                    Some((m.0, d))
-                })
-                .collect();
-            let ru = sys::rusage();
-            diag::summary(
-                t0.elapsed().as_secs_f64(),
-                &stages,
-                ru.0,
-                ru.1,
-                [m.event_lines, m.valid_events, m.clicks],
-            );
-            sys::prof::finish();
-            sys::exit_now();
-        }
-    }
 
     if pop_next.load(Relaxed) < pop_pieces.len() {
         phase(6, &|_| loop {
